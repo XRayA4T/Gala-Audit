@@ -95,19 +95,19 @@ function renderChecklist(){setTimeout(swAll,0);
    const fxCell=fx==null?'<span class="no">–</span>':fx.length?`<span class="${fxDone===fx.length?'ok':'gwarn'}">${fxDone}/${fx.length}</span>`:'<span class="ok" title="No quick fixes">none ✓</span>';
    const regen=`<div><button type="button" class="sm" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'Write the merge results again from what is already transcribed, with every DQ slip read so far (no scans are read again)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export and the empty merge results export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
    const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="${esc(!s.meet.entries.length?'No entries export':'No empty merge results export')}">waiting</span>`)+regen;
-   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${fxDone===fx.length?`<div class="qfdone">All quick fixes for event ${e.event} are done. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries and the empty merge results export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details${fxDone<fx.length?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} done)${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
+   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${fxDone===fx.length?`<div class="qfdone">All quick fixes for event ${e.event} are done. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries and the empty merge results export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details${fxDone<fx.length?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} done)${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
      <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
       return `<li class="${t?'done':''}">${tickBox(k,'Heat '+f.heat+' lane '+f.lane)}<div><b>Heat ${esc(f.heat)} · Lane ${esc(f.lane)}</b> <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
        ${f.scans.length?`<div class="sm">${f.scans.map(sc=>`<a href="${esc(galaHref('sessions/S'+s.n+'/scans/'+sc.scan))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`).join(' · ')}</div>`:''}
        <form class="qffix" data-fix="${s.n}|${e.event}|${esc(f.heat)}|${esc(f.lane)}" autocomplete="off">
-        ${(()=>{const w=qfWatches(f,hf),sw=qfSwimmer(s,e,f,hf);f._block=!!(w||sw);f._watch=!!w;return w+sw})()}
+        ${(()=>{const w=qfTimes(f,hf),sw=qfSwimmer(s,e,f,hf);f._block=!!(w||sw);f._watch=!!w;return w+sw})()}
         <label>Result <select name="status"><option value="">as audited</option><option value="OK"${hf.status==='OK'?' selected':''}>Swam</option><option value="NS"${hf.status==='NS'?' selected':''}>No-show</option><option value="DQ"${hf.status==='DQ'?' selected':''}>DQ</option></select></label>
         ${f._block&&!hf.time?'':`<label>Time <input name="time" value="${esc(hf.time||'')}" placeholder="m:ss.hh" size="8"></label>`}
         <label class="qfcode"${hf.status==='DQ'?'':' hidden'}>Code <input name="code" value="${esc(hf.code||'')}" list="dqcodes" size="6"></label>
         <label class="qfnote">Note <input name="note" value="${esc(hf.note||'')}" placeholder="what was fixed"></label>
         ${(()=>{const mi=/not in the merge file/i.test(f.checks.join(' ')),wr=!!(f.row&&f.row.writtenIn)||/written in/i.test(f.checks.join(' '));
-          return `<button type="submit"${mi||wr?' class="primary"':''}>${mi||wr?(hf.add?'Confirmed · update':mi?'Confirm swim':'Confirm swimmer'):hf.by?'Update':'Save fix'}</button>`})()}${hf.by?'<button type="button" data-clearfix>Clear</button>':''}
+          return `<button type="submit"${mi||wr||f._watch?' class="primary"':''}>${mi||wr?(hf.add?'Confirmed · update':mi?'Confirm swim':'Confirm swimmer'):f._watch?'Save &amp; recalculate':hf.by?'Update':'Save fix'}</button>`})()}${hf.by?'<button type="button" data-clearfix>Clear</button>':''}
         <span class="sm" data-fixmsg>${hf.by?esc('Fixed by '+hf.by+' · '+agoShort(hf.at)):'Or just tick it if nothing needs changing.'}</span></form>
        ${t?`<div class="sm">done · ticked by ${esc(t.by)} · ${esc(agoShort(t.at))}</div>`:''}</div></li>`}).join('')}</ul></details></td></tr>`:'';
    return `<tr class="${t?'done':''}" data-cldrop="S${s.n}/scans">
@@ -192,9 +192,9 @@ function offerRegen(key,justDone){
 document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.qffix');if(!fm)return;ev.preventDefault();
  const [n,event,heat,lane]=fm.dataset.fix.split('|'),d=Object.fromEntries([...new FormData(fm).entries()].filter(([k])=>!/^(w\d+|wt\d+|swpick|swq)$/.test(k)));
  const watches={};let bad='';
- fm.querySelectorAll('.qfw[data-col]').forEach(w=>{const c=w.dataset.col,ch=(w.querySelector('input[type=radio]:checked')||{}).value,tv=(w.querySelector('input[name=wt'+c+']').value||'').trim();
-  if(ch==='accept')watches[c]={accepted:true};
-  else if(ch==='capture'||tv){if(!/^(\d{1,2}:)?\d{1,2}\.\d{2}$/.test(tv))bad='Timer '+c+': type the time read off the sheet, like 1:05.32';else watches[c]={time:tv}}});
+ fm.querySelectorAll('input[data-swcol]').forEach(i=>{const c=i.dataset.swcol,tv=i.value.trim(),orig=i.dataset.orig||'',acc=fm.querySelector('input[data-swacc="'+c+'"]');
+  if(tv&&tv!==orig){if(!/^(\d{1,2}:)?\d{1,2}\.\d{2}$/.test(tv))bad='SW'+c+': type the time off the sheet, like 1:05.32';else watches[c]={time:tv}}
+  else if(acc&&acc.checked&&orig)watches[c]={accepted:true}});
  if(bad){fm.querySelector('[data-fixmsg]').textContent=bad;return}
  d.watches=watches;
  const pick=fm.querySelector('input[name=swpick]:checked');if(pick&&pick.value)d.swimmer={id:pick.value,name:pick.dataset.name};
@@ -204,6 +204,7 @@ document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.qffix')
  if(d.code&&CODES.codes&&CODES.codes.length&&!CODES.codes.some(c=>c[0]===d.code)&&!confirm(d.code+' is not in '+(CODES.source||'the code list')+'. Save it anyway?'))return;
  galaPost('/api/gala/fix',Object.assign({session:+n,event:+event,heat:+heat,lane:+lane},d)).then(()=>{
   delete fm.dataset.dirty;document.activeElement&&document.activeElement.blur();
+  if(Object.keys(d.watches||{}).length||d.swimmer||fm.querySelector('.qft'))galaPost('/api/gala/recheck',{session:+n,event:+event}).catch(err=>alert('Could not re-check: '+err.message));
   offerRegen('S'+n+':e'+event+':qf:'+heat+'.'+lane,'S'+n+':e'+event+':qf:'+heat+'.'+lane);galaSig='';loadGala()})
   .catch(err=>{fm.querySelector('[data-fixmsg]').textContent='Could not save: '+err.message})});
 document.addEventListener('click',ev=>{const b=ev.target.closest('[data-clearfix]');if(!b)return;const fm=b.closest('form.qffix');
@@ -214,14 +215,19 @@ document.addEventListener('click',ev=>{const b=ev.target.closest('[data-clearfix
 // written in on the sheet (pick the entered swimmer: suggestions from the entries file, or search for another).
 function qfWatches(f,hf){
  const row=f.row;if(!row)return '';
- const flagged=/\bSW timer\b|watch/i.test(f.checks.join(' '));
- const ws=row.watches.filter(w=>!w.normalized||w.confidence!=='HIGH'||w.corrected);
- if(!flagged||!ws.length)return '';
+ const text=f.checks.join(' ');
+ // The watches a check is about: "SW timer N" names one; "In doubt" / "Poor SW" / "SW median" are about them all.
+ const named=new Set([...text.matchAll(/\bSW timer (\d+)/gi)].map(m=>+m[1]));
+ const all=/in doubt|poor sw|sw median|sw times?\b/i.test(text);
+ if(!named.size&&!all&&!/watch/i.test(text))return '';
+ const ws=row.watches.filter(w=>all||named.has(w.column)||!w.normalized||w.confidence!=='HIGH'||w.corrected);
+ if(!ws.length)return '';
  const fixed=hf.watches||{};
- return '<div class="qfws">'+ws.map(w=>{const c=w.column,fx=fixed[c]||{},readable=!!w.normalized;
-  const how=readable?`read as <b>${esc(w.normalized)}</b> (${esc((w.confidence||'').toLowerCase())} confidence${w.corrected?', overwritten on the sheet':''})`:'<b class="gwarn">couldn\'t be read</b>';
+ return '<div class="qfws"><div class="sm">Check the watch times on the sheet; correct any that were misread, save, and the event is checked again.</div>'+ws.map(w=>{const c=w.column,fx=fixed[c]||{},readable=!!w.normalized;
+  const sure=readable&&w.confidence==='HIGH'&&!w.corrected;
+  const how=readable?`read as <b>${esc(w.normalized)}</b>${sure?'':` (${esc((w.confidence||'').toLowerCase())} confidence${w.corrected?', overwritten on the sheet':''})`}`:'<b class="gwarn">couldn\'t be read</b>';
   return `<div class="qfw" data-col="${esc(c)}"><span>Timer ${esc(c)}: written “${esc(w.written||'?')}”, ${how}</span>
-   ${readable?`<label><input type="radio" name="w${esc(c)}" value="accept"${fx.accepted?' checked':''}> accept ${esc(w.normalized)}</label>`:''}
+   ${readable&&!sure?`<label><input type="radio" name="w${esc(c)}" value="accept"${fx.accepted?' checked':''}> accept ${esc(w.normalized)}</label>`:''}
    <label><input type="radio" name="w${esc(c)}" value="capture"${fx.time?' checked':''}> it reads</label>
    <input name="wt${esc(c)}" value="${esc(fx.time||'')}" placeholder="m:ss.hh" size="8">
    ${(fx.accepted||fx.time)?'':`<label class="sm"><input type="radio" name="w${esc(c)}" value="" checked> leave</label>`}</div>`}).join('')+'</div>'}
@@ -252,3 +258,40 @@ let swTimer=null;
 document.addEventListener('input',ev=>{const i=ev.target.closest('.qfsw input[name=swq]');if(!i)return;const box=i.closest('.qfsw');
  clearTimeout(swTimer);swTimer=setTimeout(()=>swFill(box,i.value.trim()||box.dataset.q),300)});
 document.addEventListener('focusin',ev=>{const i=ev.target.closest('.qfw input[name^=wt]');if(i){const r=i.closest('.qfw').querySelector('input[value=capture]');if(r)r.checked=true}});
+
+document.addEventListener('click',ev=>{const b=ev.target.closest('[data-recheck]');if(!b)return;ev.preventDefault();const [n,e]=b.dataset.recheck.split('|');
+ b.disabled=true;b.textContent='re-checking…';galaPost('/api/gala/recheck',{session:+n,event:+e}).then(()=>{galaSig='';setTimeout(loadGala,1500)}).catch(err=>{b.disabled=false;alert(err.message)})});
+
+// ---- the times row at the top of every quick fix: TP, PB, each stopwatch (correctable), median and final.
+// Typing a watch time recalculates the median and the differences here; "Save & recalculate" saves the corrected
+// readings and re-runs the event's check against TP and PB.
+function hund(t){const m=/^(?:(\d{1,2}):)?(\d{1,2})\.(\d{2,3})$/.exec((t||'').trim());return m?((+m[1]||0)*60+(+m[2]))*100+Math.floor(+(m[3]+'0').slice(0,3)/10):null}
+function fmtH(h){if(h==null)return '';const neg=h<0;h=Math.abs(Math.round(h));const m=Math.floor(h/6000),s=Math.floor(h%6000/100),c=h%100;
+ return (neg?'-':'')+(m?m+':'+String(s).padStart(2,'0'):s)+'.'+String(c).padStart(2,'0')}
+function diffH(a,b){if(a==null||b==null)return '';const d=(a-b)/100;return (d>0?'+':'')+d.toFixed(2)+'s'}
+function qfTimes(f,hf){
+ const t=f.times,row=f.row;if(!t&&!row)return '';
+ const fixed=hf.watches||{},tol=Math.round(((t&&t.tolerance)||0.30)*100);
+ const byCol={};(row?row.watches:[]).forEach(w=>byCol[w.column]=w);(t?t.sw:[]).forEach(w=>{byCol[w.column]=Object.assign({normalized:w.time},byCol[w.column]||{},w)});
+ const cols=[1,2,3];
+ const tp=t?hund(t.tp):null,pb=t?hund(t.pb):null;
+ const cell=(label,v,cls)=>`<td class="${cls||''}"><div class="tl">${label}</div><b>${esc(v||'–')}</b></td>`;
+ const swCells=cols.map(c=>{const w=byCol[c]||{},orig=w.normalized||'',val=(fixed[c]&&fixed[c].time)||orig,sure=!w.confidence||(w.confidence==='HIGH'&&!w.corrected);
+  return `<td class="sw${orig?'':' unread'}${sure?'':' unsure'}"><div class="tl">SW${c}${w.written&&w.written!==orig?` <span class="sm">“${esc(w.written)}”</span>`:''}</div>
+   <input data-swcol="${c}" data-orig="${esc(orig)}" value="${esc(val)}" placeholder="${orig?'':'not read'}" size="8">
+   ${orig&&!sure?`<label class="sm"><input type="checkbox" data-swacc="${c}"${fixed[c]&&fixed[c].accepted?' checked':''}> OK as read (${esc((w.confidence||'').toLowerCase())})</label>`:''}
+   <div class="sm" data-swdiff="${c}"></div></td>`}).join('');
+ return `<div class="qft" data-tp="${tp??''}" data-pb="${pb??''}" data-tol="${tol}"><table><tr>
+   ${cell('TP',t&&t.tp)}${cell('PB',t&&t.pb)}${swCells}<td><div class="tl">SW median</div><b data-swmed>${esc(t&&t.median||'–')}</b><div class="sm" data-meddiff></div></td>${cell('Final',t&&t.final,'fin')}</tr></table>
+  <div class="sm">Correct any stopwatch time that was misread on the sheet, then <b>Save &amp; recalculate</b>: the swim is checked again against TP and PB (tolerance ${(tol/100).toFixed(2)}s).</div></div>`}
+function qftUpdate(box){
+ const tp=box.dataset.tp?+box.dataset.tp:null,pb=box.dataset.pb?+box.dataset.pb:null,tol=+box.dataset.tol||30;
+ const vals=[];box.querySelectorAll('input[data-swcol]').forEach(i=>{const v=hund(i.value);i.classList.toggle('bad',!!i.value.trim()&&v==null);
+  const d=box.querySelector('[data-swdiff="'+i.dataset.swcol+'"]');
+  if(v!=null){vals.push(v);const parts=[];if(tp!=null)parts.push(`<span class="${Math.abs(v-tp)>tol?'gwarn':'ok'}">TP ${diffH(v,tp)}</span>`);if(pb!=null)parts.push(`<span class="${Math.abs(v-pb)>tol?'gwarn':'ok'}">PB ${diffH(v,pb)}</span>`);d.innerHTML=parts.join(' ')}else d.innerHTML=''});
+ vals.sort((a,b)=>a-b);const med=vals.length?(vals.length%2?vals[(vals.length-1)/2]:(vals[vals.length/2-1]+vals[vals.length/2])/2):null;
+ const m=box.querySelector('[data-swmed]');if(m)m.textContent=med==null?'–':fmtH(med);
+ const md=box.querySelector('[data-meddiff]');if(md)md.innerHTML=med==null?'':[tp!=null?`<span class="${Math.abs(med-tp)>tol?'gwarn':'ok'}">TP ${diffH(med,tp)}</span>`:'',pb!=null?`<span class="${Math.abs(med-pb)>tol?'gwarn':'ok'}">PB ${diffH(med,pb)}</span>`:''].join(' ')}
+document.addEventListener('input',ev=>{const b=ev.target.closest('.qft');if(b)qftUpdate(b)});
+const _qftObs=new MutationObserver(()=>document.querySelectorAll('.qft:not([data-init])').forEach(b=>{b.dataset.init='1';qftUpdate(b)}));
+_qftObs.observe(document.body,{childList:true,subtree:true});

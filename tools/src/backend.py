@@ -70,7 +70,8 @@ def _read_fixes(path):
             out.append({"heat": x.get("heat"), "lane": x.get("lane"), "inFile": str(x.get("inFile") or ""),
                         "checks": [str(c) for c in x.get("checks") or []][:12],
                         "scans": [{"label": str(sc.get("label") or ""), "scan": str(sc.get("scan") or ""),
-                                   "page": sc.get("page")} for sc in x.get("scans") or [] if isinstance(sc, dict)][:4]})
+                                   "page": sc.get("page")} for sc in x.get("scans") or [] if isinstance(sc, dict)][:4],
+                        "times": x.get("times") if isinstance(x.get("times"), dict) else None})
     return out
 
 
@@ -112,6 +113,7 @@ class Gala:
         self.state.setdefault("log", [])
         self.state.setdefault("asked", {})
         self.state.setdefault("ticks", {})
+        self.rechecks = {}
 
     # ---------------------------------------------------------------- state
     def save(self):
@@ -640,7 +642,7 @@ class Gala:
                            "packs": [p["name"] for p in pk], "printed": printed.get(e, []), "ocrLanes": len(lanes_done.get(e, ())),
                            "report": report["name"] if report else None, "ready": ready, "sig": sig,
                            "status": status, "asked": a, "merge": merge_file, "canMerge": can_merge,
-                           "seeded": seeded, "fixes": fixes, "dqSlips": len(slips_done.get(e, [])),
+                           "seeded": seeded, "fixes": fixes, "recheck": self.rechecks.get((n, e)), "dqSlips": len(slips_done.get(e, [])),
                            "fixesFile": qf_file["name"][:-5] + ".html" if qf_file else None,
                            "handFixes": {k.split("-", 1)[1].replace("-", "."): v for k, v in hand.items()
                                          if k.startswith("%d-" % e)}})
@@ -1083,6 +1085,60 @@ class Gala:
                                                                                          "at": time.time()}
                 self.save()
         self.log("Session %d event %d heat %d lane %d fixed in the portal: %s" % (n, int(e), int(h), int(ln), text))
+
+    # ---------------------------------------------------------------- re-running an event's check in the portal
+    @staticmethod
+    def plugin_script(name):
+        """The newest installed copy of one of the gala-audit skill's scripts, or None."""
+        import glob
+        found = glob.glob(os.path.expanduser("~/.claude/plugins/**/gala-audit/scripts/%s" % name), recursive=True)
+        return max(found, key=os.path.getmtime) if found else None
+
+    def recheck(self, n, e, who=None):
+        """Re-run the event's audit from what is already transcribed, with the fixes made in the portal, and write
+        its Quick Fix list again (no scans are read; the event's audit report is rewritten on its next regenerate).
+        Runs in the background; its state is in self.rechecks[(n, e)]."""
+        script = self.plugin_script("audit_report.py")
+        if not script:
+            raise ValueError("the gala-ocr plugin isn't installed for this user (no gala-audit/scripts/audit_report.py)")
+        if n not in self.sessions():
+            raise ValueError("no such session")
+        s = self.session(n)
+        ev = next((x for x in s["events"] if x["event"] == int(e)), None)
+        if not ev or not ev["ocrLanes"]:
+            raise ValueError("event %s has no transcribed lane sheets" % e)
+        key = (n, int(e))
+        if self.rechecks.get(key, {}).get("state") == "running":
+            return
+        self.rechecks[key] = {"state": "running", "at": time.time(), "by": who}
+        threading.Thread(target=self._recheck, args=(n, int(e), ev, script, who), daemon=True).start()
+
+    def _recheck(self, n, e, ev, script, who):
+        key = (n, e)
+        rep = self.sdir(n, "reports")
+        qf = os.path.join(rep, ev["fixesFile"]) if ev.get("fixesFile") else os.path.join(rep, "Event %02d quick fixes.html" % e)
+        tmp = tempfile.mkdtemp(prefix="gala-recheck-")
+        cmd = [sys.executable, "-I", script, self.sdir(n, "ocr"), self.sdir(n, "gen7"), os.path.join(tmp, "audit.html"),
+               "--events", str(e), "--scans", tmp, "--quick-fixes", qf]
+        if ev.get("merge"):
+            cmd += ["--merge", os.path.join(rep, ev["merge"])]
+        if os.path.exists(self.fixes_file(n)):
+            cmd += ["--fixes", self.fixes_file(n)]
+        own = self.meet_files(n)["codes"]
+        if own:
+            cmd += ["--codes", os.path.join(self.sdir(n, "meet"), own[-1]["name"])]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            ok = r.returncode == 0
+            out = (r.stdout + r.stderr).strip().splitlines()
+            msg = next((ln for ln in out if "Quick Fix" in ln), out[-1] if out else "")
+        except (OSError, subprocess.SubprocessError) as ex:
+            ok, msg = False, str(ex)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.rechecks[key] = {"state": "done" if ok else "failed", "at": time.time(), "by": who, "msg": msg[-300:]}
+        self.log("Session %d event %d re-checked%s: %s" % (n, e, " by " + who if who else "", msg[-200:] if msg else
+                                                          ("done" if ok else "failed")))
 
     def code_list(self, n):
         """The DQ codes to choose from: the meet's own list in meet/ if there is one, else the plugin's FINA list."""

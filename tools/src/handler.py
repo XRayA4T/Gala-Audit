@@ -108,6 +108,8 @@
                 return self._json(200, {"ok": True, "question": row["id"]})
             elif path == "/api/gala/move":
                 g.move(str(d.get("path") or ""), int(d.get("session") or 0), str(d.get("folder") or ""))
+            elif path == "/api/gala/recheck":
+                g.recheck(int(d.get("session") or 0), int(d.get("event") or 0), who)
             elif path == "/api/gala/fix":
                 g.set_fix(int(d.get("session") or 0), d.get("event"), d.get("heat"), d.get("lane"), d, who)
             elif path == "/api/gala/session":

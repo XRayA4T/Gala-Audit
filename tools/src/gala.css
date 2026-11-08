@@ -89,3 +89,16 @@ form.qffix button{padding:2px 10px}
 .qfw label,.swopt{display:inline-flex!important;align-items:center;gap:6px;white-space:nowrap;justify-content:flex-start!important;text-align:left}
 .qfsw .swlist{align-items:flex-start}
 .qfsw label.sm{display:inline-flex;gap:6px;align-items:center}
+.qft{flex-basis:100%;padding:6px 8px;border-left:3px solid var(--accent);background:var(--drop,rgba(0,0,0,.03));border-radius:4px}
+.qft table{border-collapse:collapse;margin-bottom:4px}
+.qft td{padding:2px 12px 2px 0;vertical-align:top;color:var(--fg)}
+.qft .tl{font-size:.8em;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+.qft td b{font-size:1.05em;font-variant-numeric:tabular-nums}
+.qft input[data-swcol]{width:6.5em!important;font-variant-numeric:tabular-nums;font-weight:600}
+.qft input.bad{outline:2px solid #b45309}
+.qft td.unsure input[data-swcol]{border-color:#b45309}
+.qft td.unread input[data-swcol]{border-style:dashed}
+.qft td.fin b{color:var(--accent)}
+.qft label.sm{display:flex!important;gap:4px;align-items:center;white-space:nowrap}
+.qft input[type=checkbox]{width:auto!important}
+.qft [data-swdiff] span,.qft [data-meddiff] span{font-size:.82rem;font-weight:600}

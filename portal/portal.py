@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.6.0"
+VERSION = "0.8.0"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 STATUSES = ("open", "answered", "resolved", "on_hold")
 
@@ -607,7 +607,8 @@ def _read_fixes(path):
             out.append({"heat": x.get("heat"), "lane": x.get("lane"), "inFile": str(x.get("inFile") or ""),
                         "checks": [str(c) for c in x.get("checks") or []][:12],
                         "scans": [{"label": str(sc.get("label") or ""), "scan": str(sc.get("scan") or ""),
-                                   "page": sc.get("page")} for sc in x.get("scans") or [] if isinstance(sc, dict)][:4]})
+                                   "page": sc.get("page")} for sc in x.get("scans") or [] if isinstance(sc, dict)][:4],
+                        "times": x.get("times") if isinstance(x.get("times"), dict) else None})
     return out
 
 
@@ -649,6 +650,7 @@ class Gala:
         self.state.setdefault("log", [])
         self.state.setdefault("asked", {})
         self.state.setdefault("ticks", {})
+        self.rechecks = {}
 
     # ---------------------------------------------------------------- state
     def save(self):
@@ -1177,7 +1179,7 @@ class Gala:
                            "packs": [p["name"] for p in pk], "printed": printed.get(e, []), "ocrLanes": len(lanes_done.get(e, ())),
                            "report": report["name"] if report else None, "ready": ready, "sig": sig,
                            "status": status, "asked": a, "merge": merge_file, "canMerge": can_merge,
-                           "seeded": seeded, "fixes": fixes, "dqSlips": len(slips_done.get(e, [])),
+                           "seeded": seeded, "fixes": fixes, "recheck": self.rechecks.get((n, e)), "dqSlips": len(slips_done.get(e, [])),
                            "fixesFile": qf_file["name"][:-5] + ".html" if qf_file else None,
                            "handFixes": {k.split("-", 1)[1].replace("-", "."): v for k, v in hand.items()
                                          if k.startswith("%d-" % e)}})
@@ -1620,6 +1622,60 @@ class Gala:
                                                                                          "at": time.time()}
                 self.save()
         self.log("Session %d event %d heat %d lane %d fixed in the portal: %s" % (n, int(e), int(h), int(ln), text))
+
+    # ---------------------------------------------------------------- re-running an event's check in the portal
+    @staticmethod
+    def plugin_script(name):
+        """The newest installed copy of one of the gala-audit skill's scripts, or None."""
+        import glob
+        found = glob.glob(os.path.expanduser("~/.claude/plugins/**/gala-audit/scripts/%s" % name), recursive=True)
+        return max(found, key=os.path.getmtime) if found else None
+
+    def recheck(self, n, e, who=None):
+        """Re-run the event's audit from what is already transcribed, with the fixes made in the portal, and write
+        its Quick Fix list again (no scans are read; the event's audit report is rewritten on its next regenerate).
+        Runs in the background; its state is in self.rechecks[(n, e)]."""
+        script = self.plugin_script("audit_report.py")
+        if not script:
+            raise ValueError("the gala-ocr plugin isn't installed for this user (no gala-audit/scripts/audit_report.py)")
+        if n not in self.sessions():
+            raise ValueError("no such session")
+        s = self.session(n)
+        ev = next((x for x in s["events"] if x["event"] == int(e)), None)
+        if not ev or not ev["ocrLanes"]:
+            raise ValueError("event %s has no transcribed lane sheets" % e)
+        key = (n, int(e))
+        if self.rechecks.get(key, {}).get("state") == "running":
+            return
+        self.rechecks[key] = {"state": "running", "at": time.time(), "by": who}
+        threading.Thread(target=self._recheck, args=(n, int(e), ev, script, who), daemon=True).start()
+
+    def _recheck(self, n, e, ev, script, who):
+        key = (n, e)
+        rep = self.sdir(n, "reports")
+        qf = os.path.join(rep, ev["fixesFile"]) if ev.get("fixesFile") else os.path.join(rep, "Event %02d quick fixes.html" % e)
+        tmp = tempfile.mkdtemp(prefix="gala-recheck-")
+        cmd = [sys.executable, "-I", script, self.sdir(n, "ocr"), self.sdir(n, "gen7"), os.path.join(tmp, "audit.html"),
+               "--events", str(e), "--scans", tmp, "--quick-fixes", qf]
+        if ev.get("merge"):
+            cmd += ["--merge", os.path.join(rep, ev["merge"])]
+        if os.path.exists(self.fixes_file(n)):
+            cmd += ["--fixes", self.fixes_file(n)]
+        own = self.meet_files(n)["codes"]
+        if own:
+            cmd += ["--codes", os.path.join(self.sdir(n, "meet"), own[-1]["name"])]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            ok = r.returncode == 0
+            out = (r.stdout + r.stderr).strip().splitlines()
+            msg = next((ln for ln in out if "Quick Fix" in ln), out[-1] if out else "")
+        except (OSError, subprocess.SubprocessError) as ex:
+            ok, msg = False, str(ex)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.rechecks[key] = {"state": "done" if ok else "failed", "at": time.time(), "by": who, "msg": msg[-300:]}
+        self.log("Session %d event %d re-checked%s: %s" % (n, e, " by " + who if who else "", msg[-200:] if msg else
+                                                          ("done" if ok else "failed")))
 
     def code_list(self, n):
         """The DQ codes to choose from: the meet's own list in meet/ if there is one, else the plugin's FINA list."""
@@ -2334,6 +2390,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "question": row["id"]})
             elif path == "/api/gala/move":
                 g.move(str(d.get("path") or ""), int(d.get("session") or 0), str(d.get("folder") or ""))
+            elif path == "/api/gala/recheck":
+                g.recheck(int(d.get("session") or 0), int(d.get("event") or 0), who)
             elif path == "/api/gala/fix":
                 g.set_fix(int(d.get("session") or 0), d.get("event"), d.get("heat"), d.get("lane"), d, who)
             elif path == "/api/gala/session":
@@ -2425,7 +2483,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
-            if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix"):
+            if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck"):
                 return self._gala_post(path, q)
             if path == "/api/live":   # console snapshot from the board watcher
                 d = self._body(2 * 1024 * 1024)
@@ -2890,6 +2948,19 @@ form.qffix button{padding:2px 10px}
 .qfw label,.swopt{display:inline-flex!important;align-items:center;gap:6px;white-space:nowrap;justify-content:flex-start!important;text-align:left}
 .qfsw .swlist{align-items:flex-start}
 .qfsw label.sm{display:inline-flex;gap:6px;align-items:center}
+.qft{flex-basis:100%;padding:6px 8px;border-left:3px solid var(--accent);background:var(--drop,rgba(0,0,0,.03));border-radius:4px}
+.qft table{border-collapse:collapse;margin-bottom:4px}
+.qft td{padding:2px 12px 2px 0;vertical-align:top;color:var(--fg)}
+.qft .tl{font-size:.8em;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+.qft td b{font-size:1.05em;font-variant-numeric:tabular-nums}
+.qft input[data-swcol]{width:6.5em!important;font-variant-numeric:tabular-nums;font-weight:600}
+.qft input.bad{outline:2px solid #b45309}
+.qft td.unsure input[data-swcol]{border-color:#b45309}
+.qft td.unread input[data-swcol]{border-style:dashed}
+.qft td.fin b{color:var(--accent)}
+.qft label.sm{display:flex!important;gap:4px;align-items:center;white-space:nowrap}
+.qft input[type=checkbox]{width:auto!important}
+.qft [data-swdiff] span,.qft [data-meddiff] span{font-size:.82rem;font-weight:600}
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -3117,19 +3188,19 @@ function renderChecklist(){setTimeout(swAll,0);
    const fxCell=fx==null?'<span class="no">–</span>':fx.length?`<span class="${fxDone===fx.length?'ok':'gwarn'}">${fxDone}/${fx.length}</span>`:'<span class="ok" title="No quick fixes">none ✓</span>';
    const regen=`<div><button type="button" class="sm" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'Write the merge results again from what is already transcribed, with every DQ slip read so far (no scans are read again)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export and the empty merge results export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
    const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="${esc(!s.meet.entries.length?'No entries export':'No empty merge results export')}">waiting</span>`)+regen;
-   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${fxDone===fx.length?`<div class="qfdone">All quick fixes for event ${e.event} are done. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries and the empty merge results export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details${fxDone<fx.length?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} done)${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
+   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${fxDone===fx.length?`<div class="qfdone">All quick fixes for event ${e.event} are done. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries and the empty merge results export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details${fxDone<fx.length?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} done)${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
      <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
       return `<li class="${t?'done':''}">${tickBox(k,'Heat '+f.heat+' lane '+f.lane)}<div><b>Heat ${esc(f.heat)} · Lane ${esc(f.lane)}</b> <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
        ${f.scans.length?`<div class="sm">${f.scans.map(sc=>`<a href="${esc(galaHref('sessions/S'+s.n+'/scans/'+sc.scan))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`).join(' · ')}</div>`:''}
        <form class="qffix" data-fix="${s.n}|${e.event}|${esc(f.heat)}|${esc(f.lane)}" autocomplete="off">
-        ${(()=>{const w=qfWatches(f,hf),sw=qfSwimmer(s,e,f,hf);f._block=!!(w||sw);f._watch=!!w;return w+sw})()}
+        ${(()=>{const w=qfTimes(f,hf),sw=qfSwimmer(s,e,f,hf);f._block=!!(w||sw);f._watch=!!w;return w+sw})()}
         <label>Result <select name="status"><option value="">as audited</option><option value="OK"${hf.status==='OK'?' selected':''}>Swam</option><option value="NS"${hf.status==='NS'?' selected':''}>No-show</option><option value="DQ"${hf.status==='DQ'?' selected':''}>DQ</option></select></label>
         ${f._block&&!hf.time?'':`<label>Time <input name="time" value="${esc(hf.time||'')}" placeholder="m:ss.hh" size="8"></label>`}
         <label class="qfcode"${hf.status==='DQ'?'':' hidden'}>Code <input name="code" value="${esc(hf.code||'')}" list="dqcodes" size="6"></label>
         <label class="qfnote">Note <input name="note" value="${esc(hf.note||'')}" placeholder="what was fixed"></label>
         ${(()=>{const mi=/not in the merge file/i.test(f.checks.join(' ')),wr=!!(f.row&&f.row.writtenIn)||/written in/i.test(f.checks.join(' '));
-          return `<button type="submit"${mi||wr?' class="primary"':''}>${mi||wr?(hf.add?'Confirmed · update':mi?'Confirm swim':'Confirm swimmer'):hf.by?'Update':'Save fix'}</button>`})()}${hf.by?'<button type="button" data-clearfix>Clear</button>':''}
+          return `<button type="submit"${mi||wr||f._watch?' class="primary"':''}>${mi||wr?(hf.add?'Confirmed · update':mi?'Confirm swim':'Confirm swimmer'):f._watch?'Save &amp; recalculate':hf.by?'Update':'Save fix'}</button>`})()}${hf.by?'<button type="button" data-clearfix>Clear</button>':''}
         <span class="sm" data-fixmsg>${hf.by?esc('Fixed by '+hf.by+' · '+agoShort(hf.at)):'Or just tick it if nothing needs changing.'}</span></form>
        ${t?`<div class="sm">done · ticked by ${esc(t.by)} · ${esc(agoShort(t.at))}</div>`:''}</div></li>`}).join('')}</ul></details></td></tr>`:'';
    return `<tr class="${t?'done':''}" data-cldrop="S${s.n}/scans">
@@ -3214,9 +3285,9 @@ function offerRegen(key,justDone){
 document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.qffix');if(!fm)return;ev.preventDefault();
  const [n,event,heat,lane]=fm.dataset.fix.split('|'),d=Object.fromEntries([...new FormData(fm).entries()].filter(([k])=>!/^(w\d+|wt\d+|swpick|swq)$/.test(k)));
  const watches={};let bad='';
- fm.querySelectorAll('.qfw[data-col]').forEach(w=>{const c=w.dataset.col,ch=(w.querySelector('input[type=radio]:checked')||{}).value,tv=(w.querySelector('input[name=wt'+c+']').value||'').trim();
-  if(ch==='accept')watches[c]={accepted:true};
-  else if(ch==='capture'||tv){if(!/^(\d{1,2}:)?\d{1,2}\.\d{2}$/.test(tv))bad='Timer '+c+': type the time read off the sheet, like 1:05.32';else watches[c]={time:tv}}});
+ fm.querySelectorAll('input[data-swcol]').forEach(i=>{const c=i.dataset.swcol,tv=i.value.trim(),orig=i.dataset.orig||'',acc=fm.querySelector('input[data-swacc="'+c+'"]');
+  if(tv&&tv!==orig){if(!/^(\d{1,2}:)?\d{1,2}\.\d{2}$/.test(tv))bad='SW'+c+': type the time off the sheet, like 1:05.32';else watches[c]={time:tv}}
+  else if(acc&&acc.checked&&orig)watches[c]={accepted:true}});
  if(bad){fm.querySelector('[data-fixmsg]').textContent=bad;return}
  d.watches=watches;
  const pick=fm.querySelector('input[name=swpick]:checked');if(pick&&pick.value)d.swimmer={id:pick.value,name:pick.dataset.name};
@@ -3226,6 +3297,7 @@ document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.qffix')
  if(d.code&&CODES.codes&&CODES.codes.length&&!CODES.codes.some(c=>c[0]===d.code)&&!confirm(d.code+' is not in '+(CODES.source||'the code list')+'. Save it anyway?'))return;
  galaPost('/api/gala/fix',Object.assign({session:+n,event:+event,heat:+heat,lane:+lane},d)).then(()=>{
   delete fm.dataset.dirty;document.activeElement&&document.activeElement.blur();
+  if(Object.keys(d.watches||{}).length||d.swimmer||fm.querySelector('.qft'))galaPost('/api/gala/recheck',{session:+n,event:+event}).catch(err=>alert('Could not re-check: '+err.message));
   offerRegen('S'+n+':e'+event+':qf:'+heat+'.'+lane,'S'+n+':e'+event+':qf:'+heat+'.'+lane);galaSig='';loadGala()})
   .catch(err=>{fm.querySelector('[data-fixmsg]').textContent='Could not save: '+err.message})});
 document.addEventListener('click',ev=>{const b=ev.target.closest('[data-clearfix]');if(!b)return;const fm=b.closest('form.qffix');
@@ -3236,14 +3308,19 @@ document.addEventListener('click',ev=>{const b=ev.target.closest('[data-clearfix
 // written in on the sheet (pick the entered swimmer: suggestions from the entries file, or search for another).
 function qfWatches(f,hf){
  const row=f.row;if(!row)return '';
- const flagged=/\bSW timer\b|watch/i.test(f.checks.join(' '));
- const ws=row.watches.filter(w=>!w.normalized||w.confidence!=='HIGH'||w.corrected);
- if(!flagged||!ws.length)return '';
+ const text=f.checks.join(' ');
+ // The watches a check is about: "SW timer N" names one; "In doubt" / "Poor SW" / "SW median" are about them all.
+ const named=new Set([...text.matchAll(/\bSW timer (\d+)/gi)].map(m=>+m[1]));
+ const all=/in doubt|poor sw|sw median|sw times?\b/i.test(text);
+ if(!named.size&&!all&&!/watch/i.test(text))return '';
+ const ws=row.watches.filter(w=>all||named.has(w.column)||!w.normalized||w.confidence!=='HIGH'||w.corrected);
+ if(!ws.length)return '';
  const fixed=hf.watches||{};
- return '<div class="qfws">'+ws.map(w=>{const c=w.column,fx=fixed[c]||{},readable=!!w.normalized;
-  const how=readable?`read as <b>${esc(w.normalized)}</b> (${esc((w.confidence||'').toLowerCase())} confidence${w.corrected?', overwritten on the sheet':''})`:'<b class="gwarn">couldn\'t be read</b>';
+ return '<div class="qfws"><div class="sm">Check the watch times on the sheet; correct any that were misread, save, and the event is checked again.</div>'+ws.map(w=>{const c=w.column,fx=fixed[c]||{},readable=!!w.normalized;
+  const sure=readable&&w.confidence==='HIGH'&&!w.corrected;
+  const how=readable?`read as <b>${esc(w.normalized)}</b>${sure?'':` (${esc((w.confidence||'').toLowerCase())} confidence${w.corrected?', overwritten on the sheet':''})`}`:'<b class="gwarn">couldn\'t be read</b>';
   return `<div class="qfw" data-col="${esc(c)}"><span>Timer ${esc(c)}: written “${esc(w.written||'?')}”, ${how}</span>
-   ${readable?`<label><input type="radio" name="w${esc(c)}" value="accept"${fx.accepted?' checked':''}> accept ${esc(w.normalized)}</label>`:''}
+   ${readable&&!sure?`<label><input type="radio" name="w${esc(c)}" value="accept"${fx.accepted?' checked':''}> accept ${esc(w.normalized)}</label>`:''}
    <label><input type="radio" name="w${esc(c)}" value="capture"${fx.time?' checked':''}> it reads</label>
    <input name="wt${esc(c)}" value="${esc(fx.time||'')}" placeholder="m:ss.hh" size="8">
    ${(fx.accepted||fx.time)?'':`<label class="sm"><input type="radio" name="w${esc(c)}" value="" checked> leave</label>`}</div>`}).join('')+'</div>'}
@@ -3274,6 +3351,43 @@ let swTimer=null;
 document.addEventListener('input',ev=>{const i=ev.target.closest('.qfsw input[name=swq]');if(!i)return;const box=i.closest('.qfsw');
  clearTimeout(swTimer);swTimer=setTimeout(()=>swFill(box,i.value.trim()||box.dataset.q),300)});
 document.addEventListener('focusin',ev=>{const i=ev.target.closest('.qfw input[name^=wt]');if(i){const r=i.closest('.qfw').querySelector('input[value=capture]');if(r)r.checked=true}});
+
+document.addEventListener('click',ev=>{const b=ev.target.closest('[data-recheck]');if(!b)return;ev.preventDefault();const [n,e]=b.dataset.recheck.split('|');
+ b.disabled=true;b.textContent='re-checking…';galaPost('/api/gala/recheck',{session:+n,event:+e}).then(()=>{galaSig='';setTimeout(loadGala,1500)}).catch(err=>{b.disabled=false;alert(err.message)})});
+
+// ---- the times row at the top of every quick fix: TP, PB, each stopwatch (correctable), median and final.
+// Typing a watch time recalculates the median and the differences here; "Save & recalculate" saves the corrected
+// readings and re-runs the event's check against TP and PB.
+function hund(t){const m=/^(?:(\d{1,2}):)?(\d{1,2})\.(\d{2,3})$/.exec((t||'').trim());return m?((+m[1]||0)*60+(+m[2]))*100+Math.floor(+(m[3]+'0').slice(0,3)/10):null}
+function fmtH(h){if(h==null)return '';const neg=h<0;h=Math.abs(Math.round(h));const m=Math.floor(h/6000),s=Math.floor(h%6000/100),c=h%100;
+ return (neg?'-':'')+(m?m+':'+String(s).padStart(2,'0'):s)+'.'+String(c).padStart(2,'0')}
+function diffH(a,b){if(a==null||b==null)return '';const d=(a-b)/100;return (d>0?'+':'')+d.toFixed(2)+'s'}
+function qfTimes(f,hf){
+ const t=f.times,row=f.row;if(!t&&!row)return '';
+ const fixed=hf.watches||{},tol=Math.round(((t&&t.tolerance)||0.30)*100);
+ const byCol={};(row?row.watches:[]).forEach(w=>byCol[w.column]=w);(t?t.sw:[]).forEach(w=>{byCol[w.column]=Object.assign({normalized:w.time},byCol[w.column]||{},w)});
+ const cols=[1,2,3];
+ const tp=t?hund(t.tp):null,pb=t?hund(t.pb):null;
+ const cell=(label,v,cls)=>`<td class="${cls||''}"><div class="tl">${label}</div><b>${esc(v||'–')}</b></td>`;
+ const swCells=cols.map(c=>{const w=byCol[c]||{},orig=w.normalized||'',val=(fixed[c]&&fixed[c].time)||orig,sure=!w.confidence||(w.confidence==='HIGH'&&!w.corrected);
+  return `<td class="sw${orig?'':' unread'}${sure?'':' unsure'}"><div class="tl">SW${c}${w.written&&w.written!==orig?` <span class="sm">“${esc(w.written)}”</span>`:''}</div>
+   <input data-swcol="${c}" data-orig="${esc(orig)}" value="${esc(val)}" placeholder="${orig?'':'not read'}" size="8">
+   ${orig&&!sure?`<label class="sm"><input type="checkbox" data-swacc="${c}"${fixed[c]&&fixed[c].accepted?' checked':''}> OK as read (${esc((w.confidence||'').toLowerCase())})</label>`:''}
+   <div class="sm" data-swdiff="${c}"></div></td>`}).join('');
+ return `<div class="qft" data-tp="${tp??''}" data-pb="${pb??''}" data-tol="${tol}"><table><tr>
+   ${cell('TP',t&&t.tp)}${cell('PB',t&&t.pb)}${swCells}<td><div class="tl">SW median</div><b data-swmed>${esc(t&&t.median||'–')}</b><div class="sm" data-meddiff></div></td>${cell('Final',t&&t.final,'fin')}</tr></table>
+  <div class="sm">Correct any stopwatch time that was misread on the sheet, then <b>Save &amp; recalculate</b>: the swim is checked again against TP and PB (tolerance ${(tol/100).toFixed(2)}s).</div></div>`}
+function qftUpdate(box){
+ const tp=box.dataset.tp?+box.dataset.tp:null,pb=box.dataset.pb?+box.dataset.pb:null,tol=+box.dataset.tol||30;
+ const vals=[];box.querySelectorAll('input[data-swcol]').forEach(i=>{const v=hund(i.value);i.classList.toggle('bad',!!i.value.trim()&&v==null);
+  const d=box.querySelector('[data-swdiff="'+i.dataset.swcol+'"]');
+  if(v!=null){vals.push(v);const parts=[];if(tp!=null)parts.push(`<span class="${Math.abs(v-tp)>tol?'gwarn':'ok'}">TP ${diffH(v,tp)}</span>`);if(pb!=null)parts.push(`<span class="${Math.abs(v-pb)>tol?'gwarn':'ok'}">PB ${diffH(v,pb)}</span>`);d.innerHTML=parts.join(' ')}else d.innerHTML=''});
+ vals.sort((a,b)=>a-b);const med=vals.length?(vals.length%2?vals[(vals.length-1)/2]:(vals[vals.length/2-1]+vals[vals.length/2])/2):null;
+ const m=box.querySelector('[data-swmed]');if(m)m.textContent=med==null?'–':fmtH(med);
+ const md=box.querySelector('[data-meddiff]');if(md)md.innerHTML=med==null?'':[tp!=null?`<span class="${Math.abs(med-tp)>tol?'gwarn':'ok'}">TP ${diffH(med,tp)}</span>`:'',pb!=null?`<span class="${Math.abs(med-pb)>tol?'gwarn':'ok'}">PB ${diffH(med,pb)}</span>`:''].join(' ')}
+document.addEventListener('input',ev=>{const b=ev.target.closest('.qft');if(b)qftUpdate(b)});
+const _qftObs=new MutationObserver(()=>document.querySelectorAll('.qft:not([data-init])').forEach(b=>{b.dataset.init='1';qftUpdate(b)}));
+_qftObs.observe(document.body,{childList:true,subtree:true});
 
 // ---- views
 let view=['#gala','#checklist','#questions','#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'gala');
