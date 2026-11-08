@@ -615,7 +615,8 @@ class Gala:
             if can_merge:
                 inputs = inputs + merge_inputs
             ev_rx = re.compile(r"(?i)\bevent\s*0*%d\b" % e)
-            merge_file = next((f["name"] for f in reports if f["name"].lower().endswith(".hy3") and ev_rx.search(f["name"])), None)
+            merge_f = next((f for f in reports if f["name"].lower().endswith(".hy3") and ev_rx.search(f["name"])), None)
+            merge_file = merge_f["name"] if merge_f else None
             qf_file = next((f for f in reports if f["name"].lower().endswith(".json") and "quick" in f["name"].lower()
                             and ev_rx.search(f["name"])), None)
             fixes = None
@@ -642,7 +643,8 @@ class Gala:
                            "expected": bool(x), "lanes": len(x.get("lanes", [])) or len(print_lanes.get(e, ())) or None,
                            "packs": [p["name"] for p in pk], "printed": printed.get(e, []), "ocrLanes": len(lanes_done.get(e, ())),
                            "report": report["name"] if report else None, "ready": ready, "sig": sig,
-                           "status": status, "asked": a, "merge": merge_file, "canMerge": can_merge,
+                           "status": status, "asked": a, "merge": merge_file, "mergeAt": merge_f["mtime"] if merge_f else None,
+                           "canMerge": can_merge,
                            "seeded": seeded, "fixes": fixes, "recheck": self.rechecks.get((n, e)), "dqSlips": len(slips_done.get(e, [])),
                            "fixesFile": qf_file["name"][:-5] + ".html" if qf_file else None,
                            "handFixes": {k.split("-", 1)[1].replace("-", "."): v for k, v in hand.items()
@@ -1024,6 +1026,15 @@ class Gala:
         hist = self.state.setdefault("qf", {}).setdefault("S%d:e%d" % (n, e), {})
         before = json.dumps(hist, sort_keys=True)
         now = time.time()
+        # Quick fixes ticked before this history was kept: known only by their tick (heat and lane).
+        for tk, tv in self.state["ticks"].items():
+            m = re.fullmatch(r"S%d:e%d:qf:(\d+)\.(\d+)" % (n, e), tk)
+            if m and "%s.%s" % m.groups() not in hist:
+                hist["%s.%s" % m.groups()] = {"event": e, "heat": int(m.group(1)), "lane": int(m.group(2)),
+                                              "inFile": "", "checks": ["(what it said wasn't kept: it was ticked before "
+                                                                       "the portal kept a history of quick fixes)"],
+                                              "scans": [], "times": None, "cleared": True,
+                                              "clearedAt": tv.get("at"), "seen": tv.get("at")}
         keys = set()
         for f in current:
             k = "%s.%s" % (f["heat"], f["lane"])
