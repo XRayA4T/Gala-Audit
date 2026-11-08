@@ -310,10 +310,12 @@ function galaDialog(o){
  return new Promise(res=>{
   let d=$('#gdlg');if(!d){d=document.createElement('div');d.id='gdlg';d.className='gdlg';d.setAttribute('role','dialog');d.setAttribute('aria-modal','true');document.body.appendChild(d)}
   d.innerHTML=`<div class="gdlg-box"><h3>${esc(o.title||'')}</h3>${o.text?`<p>${esc(o.text)}</p>`:''}
+   ${o.check?`<label class="gdlg-ck"><input type="checkbox"${o.checked?' checked':''}> ${esc(o.check)}</label>`:''}
    ${o.input!==undefined?`<input class="gdlg-in" value="${esc(o.input)}" placeholder="${esc(o.placeholder||'')}"><div class="sm gwarn gdlg-err"></div>`:''}
    <div class="gdlg-btns">${o.cancel===false?'':`<button type="button" data-no>${esc(o.cancel||'Cancel')}</button>`}<button type="button" class="primary" data-yes>${esc(o.ok||'OK')}</button></div></div>`;
   d.hidden=false;const inp=d.querySelector('.gdlg-in');(inp||d.querySelector('[data-yes]')).focus();
   const done=v=>{if(o.input!==undefined&&v!==false&&o.validate){const err=o.validate(v);if(err){d.querySelector('.gdlg-err').textContent=err;return}}
+   if(o.check){const c=d.querySelector('.gdlg-ck input');o.checked=!!(c&&c.checked)}   // read back by the caller
    d.hidden=true;d.innerHTML='';document.removeEventListener('keydown',key,true);res(v)};
   const key=ev=>{if(ev.key==='Escape'){ev.preventDefault();done(o.input!==undefined?null:false)}else if(ev.key==='Enter'&&(inp||document.activeElement.closest('#gdlg'))){ev.preventDefault();done(inp?inp.value:true)}};
   document.addEventListener('keydown',key,true);
@@ -330,7 +332,7 @@ function renderRestart(){
  $('#rs-sum').innerHTML=stat(s.sessions,'sessions')+stat(s.files,'files')+stat(size(s.bytes),'on disk')+stat(s.questions,'questions')+stat(s.documents,'documents')
   +(s.linked.length?`<div class="meta" style="align-self:center">Linked inbox folders, left alone: ${esc(s.linked.join(', '))}</div>`:'');
  const a=GALA.archives||[];
- $('#rs-arch').innerHTML=a.length?'<table>'+a.map(x=>`<tr><td><code>data/archive/${esc(x.name)}</code></td><td>${x.files} files · ${size(x.bytes)}</td><td style="text-align:right"><button type="button" data-rsdel="${esc(x.name)}">Delete for good</button></td></tr>`).join('')+'</table>':'None yet.'}
+ $('#rs-arch').innerHTML=a.length?'<table>'+a.map(x=>`<tr><td><code>data/archive/${esc(x.name)}</code></td><td>${x.sessions} session${x.sessions===1?'':'s'} · ${x.files} files · ${size(x.bytes)}${x.questions?' · with questions':''}</td><td style="text-align:right;white-space:nowrap"><button type="button" data-rsres="${esc(x.name)}" data-q="${x.questions?1:''}">Restore</button> <button type="button" data-rsdel="${esc(x.name)}">Delete for good</button></td></tr>`).join('')+'</table>':'None yet.'}
 function rsCheck(){const mode=(document.querySelector('input[name=rsmode]:checked')||{}).value,w=mode==='delete'?'DELETE':'RESTART';
  $('#rs-word').textContent=w;$('#rs-btn').disabled=$('#rs-confirm').value.trim().toUpperCase()!==w;$('#rs-btn').textContent=mode==='delete'?'Delete and restart':'Archive and restart'}
 $('#v-restart').addEventListener('input',rsCheck);$('#v-restart').addEventListener('change',rsCheck);
@@ -344,7 +346,8 @@ $('#rs-btn').addEventListener('click',async()=>{
   $('#rs-confirm').value='';rsCheck();$('#rs-msg').textContent='';galaNotice(j.archive?'Archived to data/archive/'+j.archive+'. The portal is empty and ready for the next gala.':'Deleted. The portal is empty and ready for the next gala.');
   try{localStorage.removeItem('qa-drafts')}catch(e){}GSESS=0;galaSig='';loadGala()}
  catch(err){$('#rs-msg').textContent='';galaNotice(err.message,'error');rsCheck()}});
-$('#rs-arch').addEventListener('click',async ev=>{const b=ev.target.closest('[data-rsdel]');if(!b)return;
+$('#rs-arch').addEventListener('click',async ev=>{const r=ev.target.closest('[data-rsres]');if(r){rsRestore(r.dataset.rsres,!!r.dataset.q);return}
+ const b=ev.target.closest('[data-rsdel]');if(!b)return;
  if(!await galaDialog({title:'Delete archive '+b.dataset.rsdel+' for good?',text:'Its files are deleted and can\'t be brought back.',ok:'Delete for good',cancel:'Keep it'}))return;
  galaPost('/api/gala/archive-delete',{name:b.dataset.rsdel}).then(()=>{galaNotice('Archive deleted.');galaSig='';loadGala()}).catch(err=>galaNotice(err.message,'error'))});
 
@@ -379,3 +382,14 @@ $('#up-go').addEventListener('click',async()=>{const claude=$('#up-claude').chec
   setTimeout(poll,3000)};setTimeout(poll,4000)});
 // check when the Restart tab is shown (every 10 minutes at most)
 setInterval(()=>{if(!document.hidden&&view==='restart'&&Date.now()-updAt>600000)loadUpdate(false)},5000);
+
+async function rsRestore(name,hasQ){const s=(GALA&&GALA.summary)||{};
+ const busy=s.sessions||s.files;
+ const o={title:'Restore '+name+'?',text:'Its sessions, files, checklist ticks, quick fixes and activity log come back into the portal, and the archive is emptied.'
+  +(busy?' What is in the portal now ('+s.sessions+' session'+(s.sessions===1?'':'s')+', '+s.files+' files) is archived first, so nothing is lost.':'')
+  +' Claude isn\'t asked again about events it already did.',ok:'Restore',cancel:'Cancel'};
+ if(hasQ){o.check='Also restore its Questions, answers and Documents (those in the portal now are archived with the rest)';o.checked=true}
+ if(!await galaDialog(o))return;
+ try{const j=await galaPost('/api/gala/archive-restore',{name,questions:!!o.checked});
+  galaNotice('Restored '+name+'.'+(j.archive?' What was here is in data/archive/'+j.archive+'.':''));GSESS=0;galaSig='';loadGala()}
+ catch(err){galaNotice(err.message,'error')}}

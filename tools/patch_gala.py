@@ -8,7 +8,7 @@ import re
 import sys
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 s = open(sys.argv[1], encoding="utf-8").read()
 piece = lambda name: open(os.path.join(SRC, name), encoding="utf-8").read()  # noqa: E731
 
@@ -59,7 +59,7 @@ sub('''        store = self.server.store
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
             if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck",
-                        "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/update"):
+                        "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update"):
                 return self._gala_post(path, q)
             if path == "/api/live":''')
 # quieter log: the page and the watcher poll every few seconds

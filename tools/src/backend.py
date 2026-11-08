@@ -1274,8 +1274,12 @@ class Gala:
         out = []
         for f in _ls(os.path.join(self.root, "archive")):
             if f["dir"]:
-                n, b = self._size(os.path.join(self.root, "archive", f["name"]))
-                out.append({"name": f["name"], "files": n, "bytes": b, "mtime": f["mtime"]})
+                a = os.path.join(self.root, "archive", f["name"])
+                n, b = self._size(a)
+                ss = os.path.join(a, "sessions")
+                out.append({"name": f["name"], "files": n, "bytes": b, "mtime": f["mtime"],
+                            "sessions": len([x for x in os.listdir(ss) if re.fullmatch(r"S\d+", x)]) if os.path.isdir(ss) else 0,
+                            "questions": os.path.exists(os.path.join(a, "portal-questions.db"))})
         return sorted(out, key=lambda a: a["name"], reverse=True)
 
     def restart(self, mode, questions, reimport, label, who):
@@ -1334,6 +1338,76 @@ class Gala:
         self.log("Restarted by %s: the gala's files and the portal's state %s%s" % (
             who or "someone", what, "; questions and documents cleared" if questions else ""))
         return {"archive": name if mode == "archive" else None}
+
+    def restore_archive(self, name, questions, who):
+        """Bring an archived gala back: its sessions, unsorted and inbox files and the portal's state (ticks, quick-fix
+        history, log), and with questions its Questions, answers, documents and deployments. Whatever is in the portal
+        now is archived first (nothing is deleted), so a restore can itself be undone the same way."""
+        src = os.path.join(self.root, "archive", name or "")
+        if not re.fullmatch(r"[\w -]{1,80}", name or "") or not os.path.isdir(src):
+            raise ValueError("no such archive")
+        qdb = os.path.join(src, "portal-questions.db")
+        questions = bool(questions) and os.path.exists(qdb)
+        with self.lock:
+            # 1. set aside what is here now
+            now = self.summary()
+            saved = None
+            if now["sessions"] or now["files"] or (questions and (now["questions"] or now["documents"])):
+                saved = self.restart("archive", questions, False, "before a restore", who)["archive"]
+            elif questions:
+                self.restart("delete", True, False, "", who)   # nothing here but empty tables: just clear them
+            copied = self.state.get("copied", {})
+            # 2. the files
+            for d in ("sessions", "unsorted"):
+                dst = os.path.join(self.root, d)
+                if os.path.isdir(os.path.join(src, d)):
+                    if os.path.isdir(dst) and not os.listdir(dst):
+                        os.rmdir(dst)
+                    shutil.move(os.path.join(src, d), dst)
+            inbox_src = os.path.join(src, "inbox")
+            if os.path.isdir(inbox_src):
+                for f in os.listdir(inbox_src):
+                    dst = os.path.join(self.inbox, f)
+                    if os.path.lexists(dst):   # e.g. a linked folder of the same name: keep it, park the file
+                        dst = os.path.join(self.root, "unsorted", f)
+                    shutil.move(os.path.join(inbox_src, f), dst)
+                shutil.rmtree(inbox_src, ignore_errors=True)
+            # 3. the state
+            try:
+                with open(os.path.join(src, "state.json"), encoding="utf-8") as f:
+                    st = json.load(f)
+            except (OSError, ValueError):
+                st = {}
+            for k, v in (("auto", True), ("log", []), ("asked", {}), ("ticks", {}), ("qf", {}), ("copied", {})):
+                st.setdefault(k, v)
+            st["copied"] = dict(st["copied"], **copied)   # files already copied from linked folders stay copied
+            self.state = st
+            self.rechecks, self.cache, self.seen = {}, {}, {}
+            for d in (self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
+                os.makedirs(d, exist_ok=True)
+            self.save()
+            # 4. the questions, answers and documents
+            if questions:
+                stq = self.store
+                with stq.lock:
+                    stq.db.execute("ATTACH DATABASE ? AS arc", (qdb,))
+                    try:
+                        for t in ("questions", "answers", "documents", "document_versions", "deployments"):
+                            have = [r[1] for r in stq.db.execute("PRAGMA arc.table_info(%s)" % t)]
+                            cols = [c for c in (r[1] for r in stq.db.execute("PRAGMA main.table_info(%s)" % t)) if c in have]
+                            if cols:
+                                stq.db.execute("INSERT OR REPLACE INTO main.%s(%s) SELECT %s FROM arc.%s"
+                                               % (t, ",".join(cols), ",".join(cols), t))
+                        stq.db.commit()
+                    finally:
+                        stq.db.execute("DETACH DATABASE arc")
+                    docs = os.path.join(src, "documents")
+                    if os.path.isdir(docs):
+                        shutil.copytree(docs, stq.docdir, dirs_exist_ok=True)
+            shutil.rmtree(src)   # it is back in the portal now
+        self.log("Archive %s restored by %s%s%s" % (name, who or "someone", " with its questions and documents" if questions else "",
+                                                     "; what was here is in data/archive/%s" % saved if saved else ""))
+        return {"restored": name, "archive": saved}
 
     def delete_archive(self, name):
         p = os.path.join(self.root, "archive", name)

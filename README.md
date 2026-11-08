@@ -151,8 +151,10 @@ shared. Drop a file on a row to add it.
 **Restart tab:** clears the gala out to start the next one: every session's files, files not sorted or still in
 the inbox, the ticks, quick-fix history, fixes and the activity log, and optionally the Questions, answers and
 Documents. Either **archive** it all (to `data/archive/<date time name>`, which can be deleted later from the same
-tab) or **delete it for good**. Linked inbox folders are left alone, and files already copied from them aren't
+tab, or **restored**) or **delete it for good**. Linked inbox folders are left alone, and files already copied from them aren't
 copied in again unless you ask. Type RESTART (or DELETE) to confirm.
+
+**Restore** (beside an archive) brings that gala back: its sessions, files, ticks, quick fixes and log, and, if it was archived with them, its Questions, answers and Documents. What is in the portal at the time is archived first (as `… before a restore`), so a restore can be undone by restoring that. Claude isn't asked again about events it already did.
 
 Watch Claude work on the **Live** tab; long jobs show a progress bar under the tabs.
 

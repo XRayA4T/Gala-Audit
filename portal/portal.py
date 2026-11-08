@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 STATUSES = ("open", "answered", "resolved", "on_hold")
 
@@ -1811,8 +1811,12 @@ class Gala:
         out = []
         for f in _ls(os.path.join(self.root, "archive")):
             if f["dir"]:
-                n, b = self._size(os.path.join(self.root, "archive", f["name"]))
-                out.append({"name": f["name"], "files": n, "bytes": b, "mtime": f["mtime"]})
+                a = os.path.join(self.root, "archive", f["name"])
+                n, b = self._size(a)
+                ss = os.path.join(a, "sessions")
+                out.append({"name": f["name"], "files": n, "bytes": b, "mtime": f["mtime"],
+                            "sessions": len([x for x in os.listdir(ss) if re.fullmatch(r"S\d+", x)]) if os.path.isdir(ss) else 0,
+                            "questions": os.path.exists(os.path.join(a, "portal-questions.db"))})
         return sorted(out, key=lambda a: a["name"], reverse=True)
 
     def restart(self, mode, questions, reimport, label, who):
@@ -1871,6 +1875,76 @@ class Gala:
         self.log("Restarted by %s: the gala's files and the portal's state %s%s" % (
             who or "someone", what, "; questions and documents cleared" if questions else ""))
         return {"archive": name if mode == "archive" else None}
+
+    def restore_archive(self, name, questions, who):
+        """Bring an archived gala back: its sessions, unsorted and inbox files and the portal's state (ticks, quick-fix
+        history, log), and with questions its Questions, answers, documents and deployments. Whatever is in the portal
+        now is archived first (nothing is deleted), so a restore can itself be undone the same way."""
+        src = os.path.join(self.root, "archive", name or "")
+        if not re.fullmatch(r"[\w -]{1,80}", name or "") or not os.path.isdir(src):
+            raise ValueError("no such archive")
+        qdb = os.path.join(src, "portal-questions.db")
+        questions = bool(questions) and os.path.exists(qdb)
+        with self.lock:
+            # 1. set aside what is here now
+            now = self.summary()
+            saved = None
+            if now["sessions"] or now["files"] or (questions and (now["questions"] or now["documents"])):
+                saved = self.restart("archive", questions, False, "before a restore", who)["archive"]
+            elif questions:
+                self.restart("delete", True, False, "", who)   # nothing here but empty tables: just clear them
+            copied = self.state.get("copied", {})
+            # 2. the files
+            for d in ("sessions", "unsorted"):
+                dst = os.path.join(self.root, d)
+                if os.path.isdir(os.path.join(src, d)):
+                    if os.path.isdir(dst) and not os.listdir(dst):
+                        os.rmdir(dst)
+                    shutil.move(os.path.join(src, d), dst)
+            inbox_src = os.path.join(src, "inbox")
+            if os.path.isdir(inbox_src):
+                for f in os.listdir(inbox_src):
+                    dst = os.path.join(self.inbox, f)
+                    if os.path.lexists(dst):   # e.g. a linked folder of the same name: keep it, park the file
+                        dst = os.path.join(self.root, "unsorted", f)
+                    shutil.move(os.path.join(inbox_src, f), dst)
+                shutil.rmtree(inbox_src, ignore_errors=True)
+            # 3. the state
+            try:
+                with open(os.path.join(src, "state.json"), encoding="utf-8") as f:
+                    st = json.load(f)
+            except (OSError, ValueError):
+                st = {}
+            for k, v in (("auto", True), ("log", []), ("asked", {}), ("ticks", {}), ("qf", {}), ("copied", {})):
+                st.setdefault(k, v)
+            st["copied"] = dict(st["copied"], **copied)   # files already copied from linked folders stay copied
+            self.state = st
+            self.rechecks, self.cache, self.seen = {}, {}, {}
+            for d in (self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
+                os.makedirs(d, exist_ok=True)
+            self.save()
+            # 4. the questions, answers and documents
+            if questions:
+                stq = self.store
+                with stq.lock:
+                    stq.db.execute("ATTACH DATABASE ? AS arc", (qdb,))
+                    try:
+                        for t in ("questions", "answers", "documents", "document_versions", "deployments"):
+                            have = [r[1] for r in stq.db.execute("PRAGMA arc.table_info(%s)" % t)]
+                            cols = [c for c in (r[1] for r in stq.db.execute("PRAGMA main.table_info(%s)" % t)) if c in have]
+                            if cols:
+                                stq.db.execute("INSERT OR REPLACE INTO main.%s(%s) SELECT %s FROM arc.%s"
+                                               % (t, ",".join(cols), ",".join(cols), t))
+                        stq.db.commit()
+                    finally:
+                        stq.db.execute("DETACH DATABASE arc")
+                    docs = os.path.join(src, "documents")
+                    if os.path.isdir(docs):
+                        shutil.copytree(docs, stq.docdir, dirs_exist_ok=True)
+            shutil.rmtree(src)   # it is back in the portal now
+        self.log("Archive %s restored by %s%s%s" % (name, who or "someone", " with its questions and documents" if questions else "",
+                                                     "; what was here is in data/archive/%s" % saved if saved else ""))
+        return {"restored": name, "archive": saved}
 
     def delete_archive(self, name):
         p = os.path.join(self.root, "archive", name)
@@ -2628,6 +2702,8 @@ class Handler(BaseHTTPRequestHandler):
                                                       str(d.get("label") or ""), who), ok=True))
             elif path == "/api/gala/update":
                 g.start_update(who, bool(d.get("claude")))
+            elif path == "/api/gala/archive-restore":
+                return self._json(200, dict(g.restore_archive(str(d.get("name") or ""), bool(d.get("questions")), who), ok=True))
             elif path == "/api/gala/archive-delete":
                 g.delete_archive(str(d.get("name") or ""))
             elif path == "/api/gala/recheck":
@@ -2727,7 +2803,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
             if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck",
-                        "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/update"):
+                        "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update"):
                 return self._gala_post(path, q)
             if path == "/api/live":   # console snapshot from the board watcher
                 d = self._body(2 * 1024 * 1024)
@@ -3231,6 +3307,8 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .up-list{margin:4px 0 0 18px;padding:0}
 .up-log{max-height:260px;overflow:auto;font-size:12px;background:var(--bg);padding:8px;border-radius:6px;white-space:pre-wrap}
 #up-card .bad{color:#cd2529}
+.gdlg-ck{display:flex;gap:8px;align-items:flex-start;margin:4px 0 10px}
+.gdlg-ck input{width:auto!important;margin-top:3px;accent-color:var(--accent)}
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -3696,10 +3774,12 @@ function galaDialog(o){
  return new Promise(res=>{
   let d=$('#gdlg');if(!d){d=document.createElement('div');d.id='gdlg';d.className='gdlg';d.setAttribute('role','dialog');d.setAttribute('aria-modal','true');document.body.appendChild(d)}
   d.innerHTML=`<div class="gdlg-box"><h3>${esc(o.title||'')}</h3>${o.text?`<p>${esc(o.text)}</p>`:''}
+   ${o.check?`<label class="gdlg-ck"><input type="checkbox"${o.checked?' checked':''}> ${esc(o.check)}</label>`:''}
    ${o.input!==undefined?`<input class="gdlg-in" value="${esc(o.input)}" placeholder="${esc(o.placeholder||'')}"><div class="sm gwarn gdlg-err"></div>`:''}
    <div class="gdlg-btns">${o.cancel===false?'':`<button type="button" data-no>${esc(o.cancel||'Cancel')}</button>`}<button type="button" class="primary" data-yes>${esc(o.ok||'OK')}</button></div></div>`;
   d.hidden=false;const inp=d.querySelector('.gdlg-in');(inp||d.querySelector('[data-yes]')).focus();
   const done=v=>{if(o.input!==undefined&&v!==false&&o.validate){const err=o.validate(v);if(err){d.querySelector('.gdlg-err').textContent=err;return}}
+   if(o.check){const c=d.querySelector('.gdlg-ck input');o.checked=!!(c&&c.checked)}   // read back by the caller
    d.hidden=true;d.innerHTML='';document.removeEventListener('keydown',key,true);res(v)};
   const key=ev=>{if(ev.key==='Escape'){ev.preventDefault();done(o.input!==undefined?null:false)}else if(ev.key==='Enter'&&(inp||document.activeElement.closest('#gdlg'))){ev.preventDefault();done(inp?inp.value:true)}};
   document.addEventListener('keydown',key,true);
@@ -3716,7 +3796,7 @@ function renderRestart(){
  $('#rs-sum').innerHTML=stat(s.sessions,'sessions')+stat(s.files,'files')+stat(size(s.bytes),'on disk')+stat(s.questions,'questions')+stat(s.documents,'documents')
   +(s.linked.length?`<div class="meta" style="align-self:center">Linked inbox folders, left alone: ${esc(s.linked.join(', '))}</div>`:'');
  const a=GALA.archives||[];
- $('#rs-arch').innerHTML=a.length?'<table>'+a.map(x=>`<tr><td><code>data/archive/${esc(x.name)}</code></td><td>${x.files} files · ${size(x.bytes)}</td><td style="text-align:right"><button type="button" data-rsdel="${esc(x.name)}">Delete for good</button></td></tr>`).join('')+'</table>':'None yet.'}
+ $('#rs-arch').innerHTML=a.length?'<table>'+a.map(x=>`<tr><td><code>data/archive/${esc(x.name)}</code></td><td>${x.sessions} session${x.sessions===1?'':'s'} · ${x.files} files · ${size(x.bytes)}${x.questions?' · with questions':''}</td><td style="text-align:right;white-space:nowrap"><button type="button" data-rsres="${esc(x.name)}" data-q="${x.questions?1:''}">Restore</button> <button type="button" data-rsdel="${esc(x.name)}">Delete for good</button></td></tr>`).join('')+'</table>':'None yet.'}
 function rsCheck(){const mode=(document.querySelector('input[name=rsmode]:checked')||{}).value,w=mode==='delete'?'DELETE':'RESTART';
  $('#rs-word').textContent=w;$('#rs-btn').disabled=$('#rs-confirm').value.trim().toUpperCase()!==w;$('#rs-btn').textContent=mode==='delete'?'Delete and restart':'Archive and restart'}
 $('#v-restart').addEventListener('input',rsCheck);$('#v-restart').addEventListener('change',rsCheck);
@@ -3730,7 +3810,8 @@ $('#rs-btn').addEventListener('click',async()=>{
   $('#rs-confirm').value='';rsCheck();$('#rs-msg').textContent='';galaNotice(j.archive?'Archived to data/archive/'+j.archive+'. The portal is empty and ready for the next gala.':'Deleted. The portal is empty and ready for the next gala.');
   try{localStorage.removeItem('qa-drafts')}catch(e){}GSESS=0;galaSig='';loadGala()}
  catch(err){$('#rs-msg').textContent='';galaNotice(err.message,'error');rsCheck()}});
-$('#rs-arch').addEventListener('click',async ev=>{const b=ev.target.closest('[data-rsdel]');if(!b)return;
+$('#rs-arch').addEventListener('click',async ev=>{const r=ev.target.closest('[data-rsres]');if(r){rsRestore(r.dataset.rsres,!!r.dataset.q);return}
+ const b=ev.target.closest('[data-rsdel]');if(!b)return;
  if(!await galaDialog({title:'Delete archive '+b.dataset.rsdel+' for good?',text:'Its files are deleted and can\'t be brought back.',ok:'Delete for good',cancel:'Keep it'}))return;
  galaPost('/api/gala/archive-delete',{name:b.dataset.rsdel}).then(()=>{galaNotice('Archive deleted.');galaSig='';loadGala()}).catch(err=>galaNotice(err.message,'error'))});
 
@@ -3765,6 +3846,17 @@ $('#up-go').addEventListener('click',async()=>{const claude=$('#up-claude').chec
   setTimeout(poll,3000)};setTimeout(poll,4000)});
 // check when the Restart tab is shown (every 10 minutes at most)
 setInterval(()=>{if(!document.hidden&&view==='restart'&&Date.now()-updAt>600000)loadUpdate(false)},5000);
+
+async function rsRestore(name,hasQ){const s=(GALA&&GALA.summary)||{};
+ const busy=s.sessions||s.files;
+ const o={title:'Restore '+name+'?',text:'Its sessions, files, checklist ticks, quick fixes and activity log come back into the portal, and the archive is emptied.'
+  +(busy?' What is in the portal now ('+s.sessions+' session'+(s.sessions===1?'':'s')+', '+s.files+' files) is archived first, so nothing is lost.':'')
+  +' Claude isn\'t asked again about events it already did.',ok:'Restore',cancel:'Cancel'};
+ if(hasQ){o.check='Also restore its Questions, answers and Documents (those in the portal now are archived with the rest)';o.checked=true}
+ if(!await galaDialog(o))return;
+ try{const j=await galaPost('/api/gala/archive-restore',{name,questions:!!o.checked});
+  galaNotice('Restored '+name+'.'+(j.archive?' What was here is in data/archive/'+j.archive+'.':''));GSESS=0;galaSig='';loadGala()}
+ catch(err){galaNotice(err.message,'error')}}
 
 // ---- views
 let view=['#gala','#checklist','#restart','#questions','#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'gala');

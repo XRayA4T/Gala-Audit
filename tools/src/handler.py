@@ -116,6 +116,8 @@
                                                       str(d.get("label") or ""), who), ok=True))
             elif path == "/api/gala/update":
                 g.start_update(who, bool(d.get("claude")))
+            elif path == "/api/gala/archive-restore":
+                return self._json(200, dict(g.restore_archive(str(d.get("name") or ""), bool(d.get("questions")), who), ok=True))
             elif path == "/api/gala/archive-delete":
                 g.delete_archive(str(d.get("name") or ""))
             elif path == "/api/gala/recheck":
