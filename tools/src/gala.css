@@ -102,3 +102,4 @@ form.qffix button{padding:2px 10px}
 .qft label.sm{display:flex!important;gap:4px;align-items:center;white-space:nowrap}
 .qft input[type=checkbox]{width:auto!important}
 .qft [data-swdiff] span,.qft [data-meddiff] span{font-size:.82rem;font-weight:600}
+ul.qf>li.cleared>div>ul{opacity:.75}

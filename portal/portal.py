@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 STATUSES = ("open", "answered", "resolved", "on_hold")
 
@@ -1158,7 +1158,8 @@ class Gala:
             fixes = None
             if qf_file:
                 fixes = self._cached("qf", os.path.join(self.sdir(n, "reports"), qf_file["name"]), _read_fixes)
-                fixes = [dict(f, row=self.sheet_row(n, e, f["heat"], f["lane"], ocr)) for f in fixes or []]
+                fixes = [dict(f, row=self.sheet_row(n, e, f["heat"], f["lane"], ocr))
+                         for f in self.qf_history(n, e, fixes or [])]
             sig = hashlib.sha1(json.dumps(sorted(inputs)).encode()).hexdigest()[:12]
             newest = max([t for _, t in inputs] or [0])
             ready = bool(pk) and heats > 0 and all(h in have for h in range(1, heats + 1))
@@ -1554,6 +1555,25 @@ class Gala:
         out.sort(key=lambda x: -x[0])
         return [dict(x, score=round(sc, 2)) for sc, x in out[:limit]]
 
+    def qf_history(self, n, e, current):
+        """Every quick fix the event has ever had, so none is lost when a re-check or regenerate settles it: the
+        current ones, and the ones no longer listed ("cleared": True, with when). Kept in state.json."""
+        hist = self.state.setdefault("qf", {}).setdefault("S%d:e%d" % (n, e), {})
+        before = json.dumps(hist, sort_keys=True)
+        now = time.time()
+        keys = set()
+        for f in current:
+            k = "%s.%s" % (f["heat"], f["lane"])
+            keys.add(k)
+            old = hist.get(k) or {}
+            hist[k] = dict(f, cleared=False, seen=old.get("seen") or now)
+        for k, f in hist.items():
+            if k not in keys and not f.get("cleared"):
+                f["cleared"], f["clearedAt"] = True, now
+        if json.dumps(hist, sort_keys=True) != before:
+            self.save()
+        return sorted(hist.values(), key=lambda f: (int(f["heat"]), int(f["lane"])))
+
     def fixes_file(self, n):
         return os.path.join(self.sdir(n), "fixes.json")
 
@@ -1617,10 +1637,7 @@ class Gala:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(d, f, indent=1, sort_keys=True)
             os.replace(tmp, self.fixes_file(n))
-            if key in d:
-                self.state["ticks"]["S%d:e%d:qf:%d.%d" % (n, int(e), int(h), int(ln))] = {"by": str(who or "someone")[:60],
-                                                                                         "at": time.time()}
-                self.save()
+            # A fix doesn't tick the quick fix: a person ticks it once it is checked (and done in Meet Manager).
         self.log("Session %d event %d heat %d lane %d fixed in the portal: %s" % (n, int(e), int(h), int(ln), text))
 
     # ---------------------------------------------------------------- re-running an event's check in the portal
@@ -1668,7 +1685,8 @@ class Gala:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             ok = r.returncode == 0
             out = (r.stdout + r.stderr).strip().splitlines()
-            msg = next((ln for ln in out if "Quick Fix" in ln), out[-1] if out else "")
+            m = re.search(r"(\d+) swims? in Quick Fix", "\n".join(out))
+            msg = ("%s still flagged" % m.group(1)) if m else (out[-1] if out else "")
         except (OSError, subprocess.SubprocessError) as ex:
             ok, msg = False, str(ex)
         finally:
@@ -2961,6 +2979,7 @@ form.qffix button{padding:2px 10px}
 .qft label.sm{display:flex!important;gap:4px;align-items:center;white-space:nowrap}
 .qft input[type=checkbox]{width:auto!important}
 .qft [data-swdiff] span,.qft [data-meddiff] span{font-size:.82rem;font-weight:600}
+ul.qf>li.cleared>div>ul{opacity:.75}
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -3188,9 +3207,9 @@ function renderChecklist(){setTimeout(swAll,0);
    const fxCell=fx==null?'<span class="no">–</span>':fx.length?`<span class="${fxDone===fx.length?'ok':'gwarn'}">${fxDone}/${fx.length}</span>`:'<span class="ok" title="No quick fixes">none ✓</span>';
    const regen=`<div><button type="button" class="sm" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'Write the merge results again from what is already transcribed, with every DQ slip read so far (no scans are read again)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export and the empty merge results export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
    const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="${esc(!s.meet.entries.length?'No entries export':'No empty merge results export')}">waiting</span>`)+regen;
-   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${fxDone===fx.length?`<div class="qfdone">All quick fixes for event ${e.event} are done. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries and the empty merge results export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details${fxDone<fx.length?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} done)${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
+   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${fxDone===fx.length?`<div class="qfdone">All quick fixes for event ${e.event} are done. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries and the empty merge results export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details data-qfd="S${s.n}:e${e.event}"${(QF_OPEN['S'+s.n+':e'+e.event]??(fxDone<fx.length))?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} ticked${fx.some(x=>x.cleared)?', '+fx.filter(x=>x.cleared).length+' settled by the re-check':''})${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
      <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
-      return `<li class="${t?'done':''}">${tickBox(k,'Heat '+f.heat+' lane '+f.lane)}<div><b>Heat ${esc(f.heat)} · Lane ${esc(f.lane)}</b> <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
+      return `<li class="${t?'done':''}${f.cleared?' cleared':''}">${tickBox(k,'Heat '+f.heat+' lane '+f.lane)}<div><b>Heat ${esc(f.heat)} · Lane ${esc(f.lane)}</b>${f.cleared?` <span class="st audited" title="${esc('No longer flagged since '+agoShort(f.clearedAt))}">settled by the re-check</span>`:''} <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
        ${f.scans.length?`<div class="sm">${f.scans.map(sc=>`<a href="${esc(galaHref('sessions/S'+s.n+'/scans/'+sc.scan))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`).join(' · ')}</div>`:''}
        <form class="qffix" data-fix="${s.n}|${e.event}|${esc(f.heat)}|${esc(f.lane)}" autocomplete="off">
@@ -3388,6 +3407,10 @@ function qftUpdate(box){
 document.addEventListener('input',ev=>{const b=ev.target.closest('.qft');if(b)qftUpdate(b)});
 const _qftObs=new MutationObserver(()=>document.querySelectorAll('.qft:not([data-init])').forEach(b=>{b.dataset.init='1';qftUpdate(b)}));
 _qftObs.observe(document.body,{childList:true,subtree:true});
+
+// Remember which quick-fix lists are open, so a refresh doesn't fold one you are looking at (or unfold one you closed).
+const QF_OPEN={};
+document.addEventListener('toggle',ev=>{const d=ev.target;if(d.matches&&d.matches('details[data-qfd]'))QF_OPEN[d.dataset.qfd]=d.open},true);
 
 // ---- views
 let view=['#gala','#checklist','#questions','#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'gala');

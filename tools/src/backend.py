@@ -621,7 +621,8 @@ class Gala:
             fixes = None
             if qf_file:
                 fixes = self._cached("qf", os.path.join(self.sdir(n, "reports"), qf_file["name"]), _read_fixes)
-                fixes = [dict(f, row=self.sheet_row(n, e, f["heat"], f["lane"], ocr)) for f in fixes or []]
+                fixes = [dict(f, row=self.sheet_row(n, e, f["heat"], f["lane"], ocr))
+                         for f in self.qf_history(n, e, fixes or [])]
             sig = hashlib.sha1(json.dumps(sorted(inputs)).encode()).hexdigest()[:12]
             newest = max([t for _, t in inputs] or [0])
             ready = bool(pk) and heats > 0 and all(h in have for h in range(1, heats + 1))
@@ -1017,6 +1018,25 @@ class Gala:
         out.sort(key=lambda x: -x[0])
         return [dict(x, score=round(sc, 2)) for sc, x in out[:limit]]
 
+    def qf_history(self, n, e, current):
+        """Every quick fix the event has ever had, so none is lost when a re-check or regenerate settles it: the
+        current ones, and the ones no longer listed ("cleared": True, with when). Kept in state.json."""
+        hist = self.state.setdefault("qf", {}).setdefault("S%d:e%d" % (n, e), {})
+        before = json.dumps(hist, sort_keys=True)
+        now = time.time()
+        keys = set()
+        for f in current:
+            k = "%s.%s" % (f["heat"], f["lane"])
+            keys.add(k)
+            old = hist.get(k) or {}
+            hist[k] = dict(f, cleared=False, seen=old.get("seen") or now)
+        for k, f in hist.items():
+            if k not in keys and not f.get("cleared"):
+                f["cleared"], f["clearedAt"] = True, now
+        if json.dumps(hist, sort_keys=True) != before:
+            self.save()
+        return sorted(hist.values(), key=lambda f: (int(f["heat"]), int(f["lane"])))
+
     def fixes_file(self, n):
         return os.path.join(self.sdir(n), "fixes.json")
 
@@ -1080,10 +1100,7 @@ class Gala:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(d, f, indent=1, sort_keys=True)
             os.replace(tmp, self.fixes_file(n))
-            if key in d:
-                self.state["ticks"]["S%d:e%d:qf:%d.%d" % (n, int(e), int(h), int(ln))] = {"by": str(who or "someone")[:60],
-                                                                                         "at": time.time()}
-                self.save()
+            # A fix doesn't tick the quick fix: a person ticks it once it is checked (and done in Meet Manager).
         self.log("Session %d event %d heat %d lane %d fixed in the portal: %s" % (n, int(e), int(h), int(ln), text))
 
     # ---------------------------------------------------------------- re-running an event's check in the portal
@@ -1131,7 +1148,8 @@ class Gala:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             ok = r.returncode == 0
             out = (r.stdout + r.stderr).strip().splitlines()
-            msg = next((ln for ln in out if "Quick Fix" in ln), out[-1] if out else "")
+            m = re.search(r"(\d+) swims? in Quick Fix", "\n".join(out))
+            msg = ("%s still flagged" % m.group(1)) if m else (out[-1] if out else "")
         except (OSError, subprocess.SubprocessError) as ex:
             ok, msg = False, str(ex)
         finally:
