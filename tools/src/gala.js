@@ -330,7 +330,9 @@ function galaDialog(o){
    ${o.check?`<label class="gdlg-ck"><input type="checkbox"${o.checked?' checked':''}> ${esc(o.check)}</label>`:''}
    ${o.input!==undefined?`<input class="gdlg-in" value="${esc(o.input)}" placeholder="${esc(o.placeholder||'')}"><div class="sm gwarn gdlg-err"></div>`:''}
    <div class="gdlg-btns">${o.cancel===false?'':`<button type="button" data-no>${esc(o.cancel||'Cancel')}</button>`}<button type="button" class="primary" data-yes>${esc(o.ok||'OK')}</button></div></div>`;
-  d.hidden=false;const inp=d.querySelector('.gdlg-in');(inp||d.querySelector('[data-yes]')).focus();
+  d.hidden=false;const inp=d.querySelector('.gdlg-in'),tgt=inp||d.querySelector('[data-yes]');
+  // the keyboard may still be in the terminal (an iframe): take it back, or typing goes to the terminal
+  const af=document.activeElement;if(af&&af.tagName==='IFRAME')af.blur();window.focus();tgt.focus();setTimeout(()=>tgt.focus(),50);
   const done=v=>{if(o.input!==undefined&&v!==false&&o.validate){const err=o.validate(v);if(err){d.querySelector('.gdlg-err').textContent=err;return}}
    if(o.check){const c=d.querySelector('.gdlg-ck input');o.checked=!!(c&&c.checked)}   // read back by the caller
    d.hidden=true;d.innerHTML='';document.removeEventListener('keydown',key,true);res(v)};
