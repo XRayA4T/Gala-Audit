@@ -560,6 +560,10 @@ OCR_SLIP = re.compile(r"-event0*(\d+)-heat\d+-lane\d+-p\d+\.json$", re.I)
 OCR_PAGE = re.compile(r"-p(\d{3,4})\.json$", re.I)
 MEET_EXT = (".zip", ".hy3", ".cl2", ".ev3", ".hyv")
 CLAUDE_WHO = "gala-claude"
+# Merge results files carry the date and time they were written in their name; the questions tell Claude so.
+STAMP = "<YYYY-MM-DD_HHMM>"
+STAMP_NOTE = ("Put the date and time you write it in the file name in place of `%s` (e.g. `2026-11-08_1532`, from "
+              "`date +%%Y-%%m-%%d_%%H%%M`), and use that same file name below." % STAMP)
 SETTLE = 6   # seconds a new file's size and time must stay the same before it is taken (it may still be copying)
 
 
@@ -610,6 +614,16 @@ def _read_fixes(path):
                                    "page": sc.get("page")} for sc in x.get("scans") or [] if isinstance(sc, dict)][:4],
                         "times": x.get("times") if isinstance(x.get("times"), dict) else None})
     return out
+
+
+def _read_times(path):
+    """audit_report.py --times: [{event, heat, lane, tp, pb, sw, median, final, ...}] -> {"heat.lane": times}."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {"%s.%s" % (x.get("heat"), x.get("lane")): x for x in d if isinstance(x, dict)} if isinstance(d, list) else {}
 
 
 def _same_file(a, b):
@@ -1152,15 +1166,26 @@ class Gala:
             if can_merge:
                 inputs = inputs + merge_inputs
             ev_rx = re.compile(r"(?i)\bevent\s*0*%d\b" % e)
-            merge_f = next((f for f in reports if f["name"].lower().endswith(".hy3") and ev_rx.search(f["name"])), None)
+            merge_f = max((f for f in reports if f["name"].lower().endswith(".hy3") and ev_rx.search(f["name"])),
+                          key=lambda f: f["mtime"], default=None)   # the newest: each one is named with its time
             merge_file = merge_f["name"] if merge_f else None
             qf_file = next((f for f in reports if f["name"].lower().endswith(".json") and "quick" in f["name"].lower()
                             and ev_rx.search(f["name"])), None)
             fixes = None
             if qf_file:
                 fixes = self._cached("qf", os.path.join(self.sdir(n, "reports"), qf_file["name"]), _read_fixes)
-                fixes = [dict(f, row=self.sheet_row(n, e, f["heat"], f["lane"], ocr))
+                tf = os.path.join(self.sdir(n, "reports"), "Event %02d times.json" % e)
+                tmap = self._cached("times", tf, _read_times) if os.path.exists(tf) else None
+                fixes = [dict(f, row=self.sheet_row(n, e, f["heat"], f["lane"], ocr),
+                              times=(tmap or {}).get("%s.%s" % (f["heat"], f["lane"])) or f.get("times"))
                          for f in self.qf_history(n, e, fixes or [])]
+                # Times for every swim (TP, PB...) come from a check run by the portal: run one if there are none yet.
+                if tmap is None and fixes and (n, e) not in self.rechecks and self.plugin_script("audit_report.py") \
+                        and lanes_done.get(e):
+                    try:
+                        self.recheck(n, e, "portal")
+                    except ValueError:
+                        pass
             sig = hashlib.sha1(json.dumps(sorted(inputs)).encode()).hexdigest()[:12]
             newest = max([t for _, t in inputs] or [0])
             ready = bool(pk) and heats > 0 and all(h in have for h in range(1, heats + 1))
@@ -1186,7 +1211,8 @@ class Gala:
                            "fixesFile": qf_file["name"][:-5] + ".html" if qf_file else None,
                            "handFixes": {k.split("-", 1)[1].replace("-", "."): v for k, v in hand.items()
                                          if k.startswith("%d-" % e)}})
-        merged = [f["name"] for f in reports if f["name"].lower().endswith(".hy3") and not re.search(r"(?i)\bevent\b", f["name"])]
+        merged = [f["name"] for f in sorted(reports, key=lambda f: f["mtime"])
+                  if f["name"].lower().endswith(".hy3") and not re.search(r"(?i)\bevent\b", f["name"])]
         finals = [f["name"] for f in reports if f["name"].lower().endswith(".html") and "final" in f["name"].lower()]
         sess_report = next((f["name"] for f in reports if f["name"].lower().endswith(".html")
                             and re.search(r"(?i)session", f["name"]) and "final" not in f["name"].lower()), None)
@@ -1223,6 +1249,10 @@ class Gala:
         q = self._question(key, n)
         if not q:
             return q
+        q = (q[0], q[1].replace("{STAMPNOTE}", STAMP_NOTE))
+        q = (q[0], re.sub(r"(`audit_report\.py [^`]*--events (\d+) [^`]*)`",
+                          lambda m: '%s --times "data/sessions/S%d/reports/Event %02d times.json"`'
+                          % (m.group(1), n, int(m.group(2))), q[1]))
         if os.path.exists(self.fixes_file(n)) and self.fixes(n):
             fx = "data/sessions/S%d/fixes.json" % n
             body = re.sub(r"(`(?:merge_results|audit_report)\.py [^`]*)`", lambda m: '%s --fixes "%s"`' % (m.group(1), fx), q[1])
@@ -1267,13 +1297,13 @@ class Gala:
                         "(and say so in your answer).")
             missing = ("\n\nGen7 heats not in yet: %s. Audit what is there and say which heats are missing."
                        % ", ".join(map(str, ev["gen7Missing"]))) if ev["gen7Missing"] else ""
-            mfile = "%s/Event %02d merge results.hy3" % (rep, e)
+            mfile = "%s/Event %02d merge results %s.hy3" % (rep, e, STAMP)
             qfile = "%s/Event %02d quick fixes.html" % (rep, e)
             if ev["canMerge"]:
                 ent = self.P(n, "meet", s["meet"]["entries"][-1])
                 tpl = self.P(n, "meet", s["meet"]["results"][-1])
                 merge_step = ("2. **Write the event's merge results** for Meet Manager with the **gala-audit** skill "
-                              "(unzip the `Hfile*.hy3` from `%s` into a temp folder if it's a zip):\n"
+                              "(unzip the `Hfile*.hy3` from `%s` into a temp folder if it's a zip). {STAMPNOTE}\n"
                               "   `merge_results.py %s %s <entries>.hy3 \"%s\" \"%s\" --events %d`\n"
                               % (ent, ocr, gen7, tpl, mfile, e))
                 merge_opt = ' --merge "%s"' % mfile
@@ -1331,7 +1361,7 @@ class Gala:
                     "1. Check every event of the session has been transcribed and audited and every DQ slip has a code "
                     "(`%s/dq-codes.json`); list anything missing.\n"
                     "2. Write the merge results with the **gala-audit** skill (unzip the entries' Hfile*.hy3 into a temp "
-                    "folder if it's a zip):\n   `merge_results.py %s %s <entries>.hy3 %s \"%s/Merge Meet Results-S%d-audit.hy3\"`\n"
+                    "folder if it's a zip). {STAMPNOTE}\n   `merge_results.py %s %s <entries>.hy3 %s \"%s/Merge Meet Results-S%d-audit <YYYY-MM-DD_HHMM>.hy3\"`\n"
                     "3. Run the session audit again with `--merge` and `--quick-fixes \"%s/Session %d quick fixes.html\"`.\n"
                     "4. Answer with what was written, the Quick Fix list and anything you were unsure of."
                     % (n, res, ent, ocr, ocr, gen7, res, rep, n, rep, n))
@@ -1351,7 +1381,7 @@ class Gala:
                 return None
             ent = self.P(n, "meet", s["meet"]["entries"][-1])
             tpl = self.P(n, "meet", s["meet"]["results"][-1])
-            mfile = "%s/Event %02d merge results.hy3" % (rep, e)
+            mfile = "%s/Event %02d merge results %s.hy3" % (rep, e, STAMP)
             unread = [x["name"] for x in s["scans"] if x["kind"] == "dq" and x["pages"] and x["done"] < x["pages"]]
             codes = "%s/dq-codes.json" % ocr
             return ("Session %d · Event %d: regenerate the merge results" % (n, e),
@@ -1363,7 +1393,7 @@ class Gala:
                      "without one its code from the transcribed infraction and the DQ code list below. "
                      "Don't change codes already given.\n"
                      "2. **Write the merge results** with the **gala-audit** skill (unzip the `Hfile*.hy3` from `%s` "
-                     "into a temp folder if it's a zip), replacing the old file:\n"
+                     "into a temp folder if it's a zip), as a new file (the older ones stay). {STAMPNOTE}\n"
                      "   `merge_results.py %s %s <entries>.hy3 \"%s\" \"%s\" --events %d`\n"
                      "3. **Refresh the audit and quick fixes:**\n"
                      "   `audit_report.py %s %s \"%s/Event %02d audit.html\" --events %d --scans %s --merge \"%s\" "
@@ -1668,14 +1698,19 @@ class Gala:
             raise ValueError("the gala-ocr plugin isn't installed for this user (no gala-audit/scripts/audit_report.py)")
         if n not in self.sessions():
             raise ValueError("no such session")
-        s = self.session(n)
-        ev = next((x for x in s["events"] if x["event"] == int(e)), None)
-        if not ev or not ev["ocrLanes"]:
-            raise ValueError("event %s has no transcribed lane sheets" % e)
         key = (n, int(e))
         if self.rechecks.get(key, {}).get("state") == "running":
             return
-        self.rechecks[key] = {"state": "running", "at": time.time(), "by": who}
+        prev = self.rechecks.get(key)
+        self.rechecks[key] = {"state": "running", "at": time.time(), "by": who}   # before session(): it may ask again
+        s = self.session(n)
+        ev = next((x for x in s["events"] if x["event"] == int(e)), None)
+        if not ev or not ev["ocrLanes"]:
+            if prev:
+                self.rechecks[key] = prev
+            else:
+                self.rechecks.pop(key, None)
+            raise ValueError("event %s has no transcribed lane sheets" % e)
         threading.Thread(target=self._recheck, args=(n, int(e), ev, script, who), daemon=True).start()
 
     def _recheck(self, n, e, ev, script, who):
@@ -1684,7 +1719,8 @@ class Gala:
         qf = os.path.join(rep, ev["fixesFile"]) if ev.get("fixesFile") else os.path.join(rep, "Event %02d quick fixes.html" % e)
         tmp = tempfile.mkdtemp(prefix="gala-recheck-")
         cmd = [sys.executable, "-I", script, self.sdir(n, "ocr"), self.sdir(n, "gen7"), os.path.join(tmp, "audit.html"),
-               "--events", str(e), "--scans", tmp, "--quick-fixes", qf]
+               "--events", str(e), "--scans", tmp, "--quick-fixes", qf,
+               "--times", os.path.join(rep, "Event %02d times.json" % e)]
         if ev.get("merge"):
             cmd += ["--merge", os.path.join(rep, ev["merge"])]
         if os.path.exists(self.fixes_file(n)):

@@ -24,7 +24,7 @@ each one into its session:
 | `data/sessions/S<n>/gen7/` | **Gen7 race PDFs**, one per race (a reprint replaces the earlier copy) | people |
 | `data/sessions/S<n>/scans/` | **Lane sheet packs, one per event** (`Event 03 Lane Sheets.pdf`), DQ slip batches (`DQ…`), the ETD programme (`ETD…`) | people |
 | `data/sessions/S<n>/ocr/` | Your gala-ocr output for the session, and `dq-codes.json` | **you** |
-| `data/sessions/S<n>/reports/` | Your reports: `Event NN audit.html`, `Event NN merge results.hy3`, `Event NN quick fixes.html/.json`, `Session N audit.html`, the session merge results `.hy3`, the final audit | **you** |
+| `data/sessions/S<n>/reports/` | Your reports: `Event NN audit.html`, `Event NN merge results YYYY-MM-DD_HHMM.hy3`, `Event NN quick fixes.html/.json`, `Session N audit.html`, the session merge results `.hy3`, the final audit | **you** |
 
 Use these paths instead of the skills' defaults (`pdf/scanned`, `data/ocr`, ...). Use one session's folders
 together: its `ocr`, its `gen7` folder (give the **folder** to the scripts: the plugin reads race-by-race PDFs,
@@ -39,7 +39,8 @@ The event questions name the print to use.
 **The portal asks you for the work, as questions on the board** (when "Ask Claude automatically" is on):
 
 - **An event is ready** (its lane sheet pack and every heat's Gen7 race are in): transcribe the pack, write the
-  event's **merge results** (`reports/Event NN merge results.hy3`, `merge_results.py … --events N`, from the
+  event's **merge results** (`reports/Event NN merge results YYYY-MM-DD_HHMM.hy3`, named with the date and time
+  you write it; older ones stay, `merge_results.py … --events N`, from the
   session's entries export and Meet Manager's **empty merge results export**; a pre-gala entries export with no
   seeding is fine, merge_results seeds each swim from the lane sheets, plugin 1.6.1+), audit the event with
   `--merge` that file and `--quick-fixes "reports/Event NN quick fixes.html"` (the portal shows the `.json` it
