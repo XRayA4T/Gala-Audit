@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 STATUSES = ("open", "answered", "resolved", "on_hold")
 
@@ -1005,9 +1005,59 @@ class Gala:
                 except OSError:
                     pass
 
+    def entry_events(self):
+        """Every event in the meet's entries exports (all sessions); empty until an entries export is in."""
+        out = set()
+        for n in self.sessions():
+            f = self.meet_files(n)["entries"]
+            if f:
+                out |= set(self.hy3(os.path.join(self.sdir(n, "meet"), f[-1]["name"])))
+        return out
+
+    def stray_gen7(self, path):
+        """The events of a Gen7 PDF whose races are all for events not in the entries (a test or warm-up race,
+        e.g. Gen7's own "Event 1 100 Meter"), or None if it belongs to the meet (or there are no entries yet)."""
+        races = self.gen7(path)["races"]
+        known = self.entry_events()
+        evs = sorted({r["event"] for r in races})
+        return evs if races and known and not set(evs) & known else None
+
+    def ignore(self, path, evs, copy=False):
+        d = os.path.join(self.root, "ignored")
+        os.makedirs(d, exist_ok=True)
+        name = os.path.basename(path)
+        dest = os.path.join(d, name)
+        if os.path.exists(dest) and _same_file(path, dest):
+            if not copy:
+                os.unlink(path)
+            return "ignored"
+        dest = os.path.join(d, _unique(d, name))
+        (shutil.copy2 if copy else shutil.move)(path, dest)
+        self.log("%s ignored: event %s isn't in the meet entries (a test race?). It's under Ignored on the Gala tab."
+                 % (name, ", ".join(map(str, evs))), name=name, to="ignored", kind="gen7")
+        return "ignored"
+
+    def ignore_strays(self):
+        """Gen7 races already filed for events not in the entries (e.g. filed before the entries came in) are moved to
+        ignored/, unless someone moved them back into a session by hand."""
+        kept = self.state.get("keptGen7", [])
+        for n in self.sessions():
+            d = self.sdir(n, "gen7")
+            for f in _ls(d):
+                p = os.path.join(d, f["name"])
+                if f["dir"] or not f["name"].lower().endswith(".pdf") or "S%d/%s" % (n, f["name"]) in kept:
+                    continue
+                evs = self.stray_gen7(p)
+                if evs:
+                    self.ignore(p, evs)
+
     def file_one(self, path, force_session=None, force_folder=None, copy=False):
         name = os.path.basename(path)
         kind, folder, sess, event = self.classify(path)
+        if kind == "gen7" and not force_session and not force_folder:
+            evs = self.stray_gen7(path)
+            if evs:
+                return self.ignore(path, evs, copy)
         if force_folder:
             folder = force_folder
         if not folder:
@@ -1059,6 +1109,11 @@ class Gala:
         dest_dir = self.sdir(int(session), folder)
         dest = os.path.join(dest_dir, _unique(dest_dir, os.path.basename(src)))
         shutil.move(src, dest)
+        if folder == "gen7":
+            with self.lock:
+                kept = self.state.setdefault("keptGen7", [])
+                kept.append("S%d/%s" % (int(session), os.path.basename(dest)))
+                self.save()
         self.log("%s → S%d/%s (by hand)" % (os.path.basename(src), int(session), folder),
                  name=os.path.basename(dest), to="S%d/%s" % (int(session), folder))
 
@@ -1186,9 +1241,13 @@ class Gala:
                         self.recheck(n, e, "portal")
                     except ValueError:
                         pass
+            ns = self.state.get("notSwum", {}).get("S%d:e%d" % (n, e)) or {}
+            not_swum = [h for h in ns.get("heats", []) if h not in have]
+            if not_swum:   # confirmed on the checklist: part of what the event is audited from
+                inputs = inputs + [("not swum %s" % ",".join(map(str, not_swum)), ns.get("at", 0))]
             sig = hashlib.sha1(json.dumps(sorted(inputs)).encode()).hexdigest()[:12]
             newest = max([t for _, t in inputs] or [0])
-            ready = bool(pk) and heats > 0 and all(h in have for h in range(1, heats + 1))
+            ready = bool(pk) and heats > 0 and all(h in have or h in not_swum for h in range(1, heats + 1))
             a = asked.get("S%d:e%d" % (n, e))
             if report and report["mtime"] >= newest:
                 status = "audited"
@@ -1201,7 +1260,8 @@ class Gala:
             else:
                 status = "waiting"
             events.append({"event": e, "desc": desc.get(e, ""), "heats": heats, "gen7": have,
-                           "gen7Missing": [h for h in range(1, heats + 1) if h not in have],
+                           "gen7Missing": [h for h in range(1, heats + 1) if h not in have and h not in not_swum],
+                           "notSwum": not_swum, "notSwumBy": ns.get("by") if not_swum else None,
                            "expected": bool(x), "lanes": len(x.get("lanes", [])) or len(print_lanes.get(e, ())) or None,
                            "packs": [p["name"] for p in pk], "printed": printed.get(e, []), "ocrLanes": len(lanes_done.get(e, ())),
                            "report": report["name"] if report else None, "ready": ready, "sig": sig,
@@ -1232,6 +1292,7 @@ class Gala:
                     "log": self.state["log"][-40:][::-1],
                     "waiting": [os.path.relpath(p, self.inbox) for p in self.seen],
                     "unsorted": _ls(os.path.join(self.root, "unsorted")),
+                    "ignored": _ls(os.path.join(self.root, "ignored")),
                     "sessions": [self.session(n) for n in self.sessions()],
                     "ticks": self.state["ticks"],
                     "tools": {t: bool(shutil.which(t)) for t in ("pdfinfo", "pdftoppm", "pdftotext")},
@@ -1298,6 +1359,13 @@ class Gala:
                         "(and say so in your answer).")
             missing = ("\n\nGen7 heats not in yet: %s. Audit what is there and say which heats are missing."
                        % ", ".join(map(str, ev["gen7Missing"]))) if ev["gen7Missing"] else ""
+            if ev.get("notSwum"):
+                missing += ("\n\nHeat%s %s %s **not swum** (confirmed on the checklist by %s): there is no Gen7 race "
+                            "for %s. Don't report %s as missing; if the lane sheets have swims in %s, say so."
+                            % ("s" if len(ev["notSwum"]) > 1 else "", ", ".join(map(str, ev["notSwum"])),
+                               "were" if len(ev["notSwum"]) > 1 else "was", ev.get("notSwumBy") or "an official",
+                               "them" if len(ev["notSwum"]) > 1 else "it", "them" if len(ev["notSwum"]) > 1 else "it",
+                               "them" if len(ev["notSwum"]) > 1 else "it"))
             mfile = "%s/Event %02d merge results %s.hy3" % (rep, e, STAMP)
             qfile = "%s/Event %02d quick fixes.html" % (rep, e)
             if ev["canMerge"]:
@@ -1490,6 +1558,7 @@ class Gala:
                 if not getattr(self, "_refiled", False):
                     self.refile()
                     self._refiled = True
+                self.ignore_strays()
                 self.auto_ask()
             except Exception as e:
                 sys.stderr.write("gala loop: %r\n" % (e,))
@@ -1798,7 +1867,7 @@ class Gala:
 
     def summary(self):
         files, size = 0, 0
-        for p in [os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")] + self._inbox_own():
+        for p in [os.path.join(self.root, d) for d in ("sessions", "unsorted", "ignored")] + self._inbox_own():
             if os.path.exists(p):
                 f, b = self._size(p)
                 files, size = files + f, size + b
@@ -1830,7 +1899,7 @@ class Gala:
             stamp = time.strftime("%Y-%m-%d_%H%M%S")
             name = stamp + ("_" + re.sub(r"[^\w -]", "", label or "").strip()[:40] if (label or "").strip() else "")
             dest = os.path.join(self.root, "archive", name)
-            moving = [os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted"),
+            moving = [os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted"), os.path.join(self.root, "ignored"),
                       self.state_file] + self._inbox_own()
             for p in moving:
                 if not os.path.exists(p):
@@ -1895,7 +1964,7 @@ class Gala:
                 self.restart("delete", True, False, "", who)   # nothing here but empty tables: just clear them
             copied = self.state.get("copied", {})
             # 2. the files
-            for d in ("sessions", "unsorted"):
+            for d in ("sessions", "unsorted", "ignored"):
                 dst = os.path.join(self.root, d)
                 if os.path.isdir(os.path.join(src, d)):
                     if os.path.isdir(dst) and not os.listdir(dst):
@@ -2006,15 +2075,26 @@ class Gala:
                          stdin=subprocess.DEVNULL, start_new_session=True)
         self.log("Update started by %s; the portal restarts in a minute" % who)
 
-    def tick(self, key, checked, who):
+    def tick(self, key, checked, who, not_swum=None):
+        """Tick a checklist item. For an event (S1:e105) ticked complete while heats have no Gen7 race, not_swum is the
+        list of those heats, confirmed as not swum: the event then counts as having all its races."""
         if not re.fullmatch(r"S\d{1,2}:[\w.:=() \-]{1,200}", key or ""):
             raise ValueError("bad checklist key")
         with self.lock:
+            ns = self.state.setdefault("notSwum", {})
             if checked:
                 self.state["ticks"][key] = {"by": str(who or "someone")[:60], "at": time.time()}
+                heats = sorted({int(h) for h in (not_swum or []) if str(h).isdigit() and 0 < int(h) < 100})
+                if heats and re.fullmatch(r"S\d{1,2}:e\d{1,4}", key):
+                    ns[key] = {"heats": heats, "by": str(who or "someone")[:60], "at": time.time()}
             else:
                 self.state["ticks"].pop(key, None)
+                ns.pop(key, None)
             self.save()
+        if checked and not_swum and key in self.state.get("notSwum", {}):
+            self.log("Event %s ticked complete by %s: heat%s %s confirmed not swum" % (
+                key.split(":e")[1], who or "someone", "s" if len(ns[key]["heats"]) > 1 else "",
+                ", ".join(map(str, ns[key]["heats"]))))
 
     def set_auto(self, on):
         with self.lock:
@@ -2684,7 +2764,7 @@ class Handler(BaseHTTPRequestHandler):
         who = d.get("by") or q.get("who") or "someone"
         try:
             if path == "/api/gala/tick":
-                g.tick(str(d.get("key") or ""), bool(d.get("checked")), who)
+                g.tick(str(d.get("key") or ""), bool(d.get("checked")), who, d.get("notSwum"))
             elif path == "/api/gala/auto":
                 g.set_auto(bool(d.get("auto")))
             elif path == "/api/gala/ask":
@@ -3309,6 +3389,7 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 #up-card .bad{color:#cd2529}
 .gdlg-ck{display:flex;gap:8px;align-items:flex-start;margin:4px 0 10px}
 .gdlg-ck input{width:auto!important;margin-top:3px;accent-color:var(--accent)}
+.gign{margin:0 0 6px}.gign summary{cursor:pointer}
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -3532,8 +3613,13 @@ function renderActivity(){
   +un.map(f=>`<li><a href="${esc(galaHref('unsorted/'+f.name))}" target="_blank" rel="noopener">${esc(f.name)}</a>
    <select data-mvs>${opts||'<option value="1">Session 1</option>'}</select><select data-mvf>${['scans','gen7','meet'].map(k=>`<option value="${k}">${k}</option>`).join('')}</select>
    <button type="button" data-move="${esc('unsorted/'+f.name)}">Move</button></li>`).join('')+'</ul>':'';
+ const ig=(GALA.ignored||[]).filter(f=>!f.dir);
+ const ignored=ig.length?`<details class="gign"><summary class="meta">Ignored (${ig.length}): Gen7 races for events not in the meet entries, e.g. a test race. Move one into a session if it does belong.</summary><ul class="gfiles">`
+  +ig.map(f=>`<li><a href="${esc(galaHref('ignored/'+f.name))}" target="_blank" rel="noopener">${esc(f.name)}</a>
+   <select data-mvs>${opts||'<option value="1">Session 1</option>'}</select><select data-mvf><option value="gen7">gen7</option><option value="meet">meet</option><option value="scans">scans</option></select>
+   <button type="button" data-move="${esc('ignored/'+f.name)}">Move</button></li>`).join('')+'</ul></details>':'';
  const log=GALA.log.length?'<ul class="glog">'+GALA.log.slice(0,25).map(l=>`<li><span class="meta">${esc(agoShort(l.ts))}</span><span>${esc(l.text)}</span></li>`).join('')+'</ul>':'<div class="meta">Nothing yet.</div>';
- $('#g-activity').innerHTML=unsorted+'<h3 style="margin:'+(un.length?'14px':'0')+' 0 4px">Activity</h3>'+log}
+ $('#g-activity').innerHTML=unsorted+ignored+'<h3 style="margin:'+(un.length||ig.length?'14px':'0')+' 0 4px">Activity</h3>'+log}
 function tickBox(key,label){const t=GALA.ticks[key];return `<input type="checkbox" data-tick="${esc(key)}" ${t?'checked':''} aria-label="Tick off: ${esc(label)}" title="${t?esc('Ticked by '+t.by+' · '+agoShort(t.at)):'Tick off when checked'}">`}
 function clRow(s,key,title,why,found,folder,claude){
  const t=GALA.ticks[key];
@@ -3580,7 +3666,7 @@ function renderChecklist(){setTimeout(swAll,0);
     <td><span class="evname">Event ${e.event}</span>${e.desc?`<div class="sm">${esc(e.desc)}</div>`:''}${!e.expected&&s.meet.entries.length?'<div class="sm gwarn">not in the entries</div>':''}${t?`<div class="sm">ticked by ${esc(t.by)}</div>`:''}</td>
     <td class="c">${e.printed.length?'<span class="ok" title="'+esc(e.printed.map(x=>x.split('/').pop()).join(', '))+'">✓</span>':'<span class="no" title="No printed lane sheets for this event">–</span>'}</td>
     <td>${e.packs.length?e.packs.map(p=>link(s,'scans',p)).join('<br>'):'<span class="no">–</span>'}</td>
-    <td class="c">${g7}${e.gen7Missing.length&&e.gen7.length?`<div class="sm">missing ${esc(e.gen7Missing.join(', '))}</div>`:''}</td>
+    <td class="c">${g7}${e.gen7Missing.length&&e.gen7.length?`<div class="sm">missing ${esc(e.gen7Missing.join(', '))}</div>`:''}${(e.notSwum||[]).length?`<div class="sm" title="${esc('Confirmed by '+(e.notSwumBy||'someone'))}">not swum ${esc(e.notSwum.join(', '))}</div>`:''}</td>
     <td class="c">${e.ocrLanes?e.ocrLanes+(e.lanes?'/'+e.lanes:''):'–'}</td>
     <td>${e.report?link(s,'reports',e.report):'–'}</td>
     <td>${mergeCell}</td><td class="c">${fxCell}</td>
@@ -3632,8 +3718,20 @@ function galaClicks(e){
 function galaChange(e){
  const fm=e.target.closest('form.qffix');if(fm){fm.dataset.dirty='1';if(e.target.name==='status')fm.querySelector('.qfcode').hidden=e.target.value!=='DQ';return}
  const up=e.target.closest('[data-gup]');if(up&&up.files.length){galaUpload(up.dataset.gup,[...up.files],up.closest('[data-gfolder],.cl-row,tr,.drop')||up.parentElement);return}
- const tk=e.target.closest('[data-tick]');if(tk){galaPost('/api/gala/tick',{key:tk.dataset.tick,checked:tk.checked}).then(()=>{if(tk.checked)offerRegen(tk.dataset.tick,tk.dataset.tick);galaSig='';loadGala()})
-  .catch(err=>{tk.checked=!tk.checked;galaNotice('Could not save: '+err.message,'error')})}}
+ const tk=e.target.closest('[data-tick]');if(tk)galaTick(tk)}
+// Ticking an event complete while heats have no Gen7 race: confirm those races weren't swum.
+async function galaTick(tk){const key=tk.dataset.tick,body={key,checked:tk.checked};
+ const m=/^S(\d+):e(\d+)$/.exec(key);
+ if(m&&tk.checked){const s=GALA.sessions.find(x=>x.n===+m[1]),ev=s&&s.events.find(x=>x.event===+m[2]),miss=ev?ev.gen7Missing:[];
+  if(miss.length){const many=miss.length>1;
+   const ok=await galaDialog({title:'Event '+ev.event+' is short of results',
+    text:'There is no Gen7 result for heat'+(many?'s ':' ')+miss.join(', ')+' (of '+ev.heats+'). Were '+(many?'these races':'this race')+' not swum? '
+     +'Ticking the event complete records '+(many?'them':'it')+' as not swum, and Claude audits the event without '+(many?'them':'it')+'.',
+    ok:'Not swum · tick complete',cancel:'Keep it open'});
+   if(!ok){tk.checked=false;return}
+   body.notSwum=miss}}
+ galaPost('/api/gala/tick',body).then(()=>{if(tk.checked)offerRegen(key,key);galaSig='';loadGala()})
+  .catch(err=>{tk.checked=!tk.checked;galaNotice('Could not save: '+err.message,'error')})}
 for(const sec of ['#v-gala','#v-checklist']){const el=$(sec);el.addEventListener('click',galaClicks);el.addEventListener('change',galaChange);
  el.addEventListener('dragover',e=>{const c=e.target.closest('[data-gfolder],[data-cldrop],#g-inbox');if(!c)return;e.preventDefault();c.classList.add('over')});
  el.addEventListener('dragleave',e=>{const c=e.target.closest('[data-gfolder],[data-cldrop],#g-inbox');if(c&&!c.contains(e.relatedTarget))c.classList.remove('over')});

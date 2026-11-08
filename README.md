@@ -116,7 +116,9 @@ To mount it at every start, put the same in `/etc/fstab` with a credentials file
 the file manager (`/run/user/<uid>/gvfs/smb-share:server=…,share=…`) works too, but is slower.
 
 Files the portal can't place are listed under **Not sorted**, with a
-Move button.
+Move button. A Gen7 race for an event that isn't in the meet entries (e.g. Gen7's own test race, "Event 1 100 Meter")
+is **ignored**: it goes to `data/ignored` and is listed under **Ignored** on the Gala tab, where it can be moved into a
+session if it does belong.
 
 **Claude works event by event.** From the session's entries export the portal knows the events and heats. When
 an event's lane sheet pack and every heat's Gen7 race are in, it asks `gala-claude` (a question on the
@@ -146,7 +148,8 @@ waiting), OCR progress per scan, its folders, and the activity log.
 names, ages, teams and seed times from them rather than reading them off the scans); a row per event (printed ✓, lane sheets, Gen7 heats in and
 missing, OCR lanes, audit report, status, Ask Claude); then DQ slips, ETD, DQ codes, the merge results export,
 our merge results, the final export and the final audit. Tick items off once you've checked them; ticks are
-shared. Drop a file on a row to add it.
+shared. Ticking an event complete while some of its heats have no Gen7 race asks you to confirm those races weren't
+swum; Claude then audits the event without them. Drop a file on a row to add it.
 
 **Restart tab:** clears the gala out to start the next one: every session's files, files not sorted or still in
 the inbox, the ticks, quick-fix history, fixes and the activity log, and optionally the Questions, answers and

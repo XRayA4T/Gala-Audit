@@ -98,7 +98,7 @@
         who = d.get("by") or q.get("who") or "someone"
         try:
             if path == "/api/gala/tick":
-                g.tick(str(d.get("key") or ""), bool(d.get("checked")), who)
+                g.tick(str(d.get("key") or ""), bool(d.get("checked")), who, d.get("notSwum"))
             elif path == "/api/gala/auto":
                 g.set_auto(bool(d.get("auto")))
             elif path == "/api/gala/ask":

@@ -68,8 +68,13 @@ function renderActivity(){
   +un.map(f=>`<li><a href="${esc(galaHref('unsorted/'+f.name))}" target="_blank" rel="noopener">${esc(f.name)}</a>
    <select data-mvs>${opts||'<option value="1">Session 1</option>'}</select><select data-mvf>${['scans','gen7','meet'].map(k=>`<option value="${k}">${k}</option>`).join('')}</select>
    <button type="button" data-move="${esc('unsorted/'+f.name)}">Move</button></li>`).join('')+'</ul>':'';
+ const ig=(GALA.ignored||[]).filter(f=>!f.dir);
+ const ignored=ig.length?`<details class="gign"><summary class="meta">Ignored (${ig.length}): Gen7 races for events not in the meet entries, e.g. a test race. Move one into a session if it does belong.</summary><ul class="gfiles">`
+  +ig.map(f=>`<li><a href="${esc(galaHref('ignored/'+f.name))}" target="_blank" rel="noopener">${esc(f.name)}</a>
+   <select data-mvs>${opts||'<option value="1">Session 1</option>'}</select><select data-mvf><option value="gen7">gen7</option><option value="meet">meet</option><option value="scans">scans</option></select>
+   <button type="button" data-move="${esc('ignored/'+f.name)}">Move</button></li>`).join('')+'</ul></details>':'';
  const log=GALA.log.length?'<ul class="glog">'+GALA.log.slice(0,25).map(l=>`<li><span class="meta">${esc(agoShort(l.ts))}</span><span>${esc(l.text)}</span></li>`).join('')+'</ul>':'<div class="meta">Nothing yet.</div>';
- $('#g-activity').innerHTML=unsorted+'<h3 style="margin:'+(un.length?'14px':'0')+' 0 4px">Activity</h3>'+log}
+ $('#g-activity').innerHTML=unsorted+ignored+'<h3 style="margin:'+(un.length||ig.length?'14px':'0')+' 0 4px">Activity</h3>'+log}
 function tickBox(key,label){const t=GALA.ticks[key];return `<input type="checkbox" data-tick="${esc(key)}" ${t?'checked':''} aria-label="Tick off: ${esc(label)}" title="${t?esc('Ticked by '+t.by+' · '+agoShort(t.at)):'Tick off when checked'}">`}
 function clRow(s,key,title,why,found,folder,claude){
  const t=GALA.ticks[key];
@@ -116,7 +121,7 @@ function renderChecklist(){setTimeout(swAll,0);
     <td><span class="evname">Event ${e.event}</span>${e.desc?`<div class="sm">${esc(e.desc)}</div>`:''}${!e.expected&&s.meet.entries.length?'<div class="sm gwarn">not in the entries</div>':''}${t?`<div class="sm">ticked by ${esc(t.by)}</div>`:''}</td>
     <td class="c">${e.printed.length?'<span class="ok" title="'+esc(e.printed.map(x=>x.split('/').pop()).join(', '))+'">✓</span>':'<span class="no" title="No printed lane sheets for this event">–</span>'}</td>
     <td>${e.packs.length?e.packs.map(p=>link(s,'scans',p)).join('<br>'):'<span class="no">–</span>'}</td>
-    <td class="c">${g7}${e.gen7Missing.length&&e.gen7.length?`<div class="sm">missing ${esc(e.gen7Missing.join(', '))}</div>`:''}</td>
+    <td class="c">${g7}${e.gen7Missing.length&&e.gen7.length?`<div class="sm">missing ${esc(e.gen7Missing.join(', '))}</div>`:''}${(e.notSwum||[]).length?`<div class="sm" title="${esc('Confirmed by '+(e.notSwumBy||'someone'))}">not swum ${esc(e.notSwum.join(', '))}</div>`:''}</td>
     <td class="c">${e.ocrLanes?e.ocrLanes+(e.lanes?'/'+e.lanes:''):'–'}</td>
     <td>${e.report?link(s,'reports',e.report):'–'}</td>
     <td>${mergeCell}</td><td class="c">${fxCell}</td>
@@ -168,8 +173,20 @@ function galaClicks(e){
 function galaChange(e){
  const fm=e.target.closest('form.qffix');if(fm){fm.dataset.dirty='1';if(e.target.name==='status')fm.querySelector('.qfcode').hidden=e.target.value!=='DQ';return}
  const up=e.target.closest('[data-gup]');if(up&&up.files.length){galaUpload(up.dataset.gup,[...up.files],up.closest('[data-gfolder],.cl-row,tr,.drop')||up.parentElement);return}
- const tk=e.target.closest('[data-tick]');if(tk){galaPost('/api/gala/tick',{key:tk.dataset.tick,checked:tk.checked}).then(()=>{if(tk.checked)offerRegen(tk.dataset.tick,tk.dataset.tick);galaSig='';loadGala()})
-  .catch(err=>{tk.checked=!tk.checked;galaNotice('Could not save: '+err.message,'error')})}}
+ const tk=e.target.closest('[data-tick]');if(tk)galaTick(tk)}
+// Ticking an event complete while heats have no Gen7 race: confirm those races weren't swum.
+async function galaTick(tk){const key=tk.dataset.tick,body={key,checked:tk.checked};
+ const m=/^S(\d+):e(\d+)$/.exec(key);
+ if(m&&tk.checked){const s=GALA.sessions.find(x=>x.n===+m[1]),ev=s&&s.events.find(x=>x.event===+m[2]),miss=ev?ev.gen7Missing:[];
+  if(miss.length){const many=miss.length>1;
+   const ok=await galaDialog({title:'Event '+ev.event+' is short of results',
+    text:'There is no Gen7 result for heat'+(many?'s ':' ')+miss.join(', ')+' (of '+ev.heats+'). Were '+(many?'these races':'this race')+' not swum? '
+     +'Ticking the event complete records '+(many?'them':'it')+' as not swum, and Claude audits the event without '+(many?'them':'it')+'.',
+    ok:'Not swum · tick complete',cancel:'Keep it open'});
+   if(!ok){tk.checked=false;return}
+   body.notSwum=miss}}
+ galaPost('/api/gala/tick',body).then(()=>{if(tk.checked)offerRegen(key,key);galaSig='';loadGala()})
+  .catch(err=>{tk.checked=!tk.checked;galaNotice('Could not save: '+err.message,'error')})}
 for(const sec of ['#v-gala','#v-checklist']){const el=$(sec);el.addEventListener('click',galaClicks);el.addEventListener('change',galaChange);
  el.addEventListener('dragover',e=>{const c=e.target.closest('[data-gfolder],[data-cldrop],#g-inbox');if(!c)return;e.preventDefault();c.classList.add('over')});
  el.addEventListener('dragleave',e=>{const c=e.target.closest('[data-gfolder],[data-cldrop],#g-inbox');if(c&&!c.contains(e.relatedTarget))c.classList.remove('over')});

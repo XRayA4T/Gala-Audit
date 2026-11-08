@@ -130,3 +130,4 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 #up-card .bad{color:#cd2529}
 .gdlg-ck{display:flex;gap:8px;align-items:flex-start;margin:4px 0 10px}
 .gdlg-ck input{width:auto!important;margin-top:3px;accent-color:var(--accent)}
+.gign{margin:0 0 6px}.gign summary{cursor:pointer}
