@@ -1,9 +1,11 @@
 # CGA Gala Audit Portal
 
-A local web page for auditing a swimming gala with Claude Code. You drop the gala's files on the page,
-click what you want done, and a Claude Code session on this computer does it with the
-[gala-ocr plugin](https://github.com/XRayA4T/Gala-AI-Plugins/tree/main/plugins/gala-ocr), answering on the
-page as it goes. It is built from the Claude QA Board, so it also has questions and answers, documents, a live
+A local web page for auditing a swimming gala **while it runs**, with Claude Code. As the gala goes on, the
+lane sheet packs, Gen7 race PDFs and Meet Manager exports land in an inbox folder; the portal sorts them by
+session, and as soon as an event's lane sheets and Gen7 races are in, a Claude Code session on this computer
+transcribes and audits that event with the
+[gala-ocr plugin](https://github.com/XRayA4T/Gala-AI-Plugins/tree/main/plugins/gala-ocr) (1.6.0 or later),
+so problems reach the officials while they're still at the pool. It is built from the Claude QA Board, so it also has questions and answers, documents, a live
 view of Claude's screen and progress bars.
 
 Everything stays on this computer. The page only listens on `127.0.0.1`.
@@ -30,38 +32,65 @@ It:
 server, and install the plugin from the `gala-ai-plugins` marketplace. If Claude isn't signed in yet, run
 `claude` once on its own first.
 
-Options: `--port 9000`, `--name "Gala name"`, `--no-browser`, `--no-attach`.
+Options: `--port 9000`, `--inbox DIR` (default `data/inbox`; e.g. a shared folder the scanner and the Gen7
+computer save into), `--name "Gala name"`, `--no-browser`, `--no-attach`.
 Leave the terminal with **Ctrl-b d**; Claude keeps running. Back in: `tmux -L gala-portal attach -t claude`.
 
 ```bash
 bash stop-portal.sh              # stops the page, the watcher and Claude (data/ and the questions are kept)
 ```
 
-## Use
+## During the gala
 
-The **Gala** tab:
+**Files in.** Save the gala's files into the inbox folder (from the scanner, the Gen7 computer, or by dropping
+them on the **Gala** tab). Within a few seconds each one is sorted into its session:
 
-- **Folders.** Drop files on a folder card (or *choose files*). Click a file to open it; ⤓ downloads it.
-- **OCR progress.** Each scan's pages against the JSON files in `data/ocr`, the pages not done yet, and the
-  files the OCR marked for checking.
-- **Steps.** Each button opens the Ask form with a ready request for `gala-claude`, in the usual order:
-  check the files → lane sheets → DQ slips → ETD → Gen7 report → DQ codes → audit report → merged results
-  `.hy3` → final audit. Edit it if you like and **Post**.
+| What | How it's recognised | Goes to |
+|---|---|---|
+| Meet entries export (`Meet Entries-…zip` / `Hfile…hy3`) | `.zip` / `.hy3`, "entr" in the name | `sessions/S<n>/meet` |
+| Merge results export / final export | "result" / "final" in the name | `sessions/S<n>/meet` |
+| Printed lane sheets (Meet Manager's PDF, not the scan) | its text (Event, Lane, Heat) | `sessions/S<n>/meet` |
+| Gen7 race PDF | its text (Event, Heat, Race #, Session) | `sessions/S<n>/gen7` |
+| Lane sheet pack | a scanned PDF, "Event 3" in the name | `sessions/S<n>/scans` |
+| DQ slips / ETD programme | a scanned PDF with "DQ" / "ETD" in the name | `sessions/S<n>/scans` |
 
-Claude answers on the **Questions** tab and asks you there when it can't read something. Long jobs show a
-progress bar under the tabs. Watch it work on the **Live** tab.
+The session comes from "Session 2" or "S2" in the name, the Gen7 PDF's own session, or the session whose
+entries have that event. A file with the same name as one already there replaces it (a rescan or a reprint;
+the old copy is kept in `.replaced`). Files the portal can't place are listed under **Not sorted**, with a
+Move button.
+
+**Claude works event by event.** From the session's entries export the portal knows the events and heats. When
+an event's lane sheet pack and every heat's Gen7 race are in, it asks `gala-claude` (a question on the
+**Questions** tab) to transcribe the pack, audit that event and update the session report, and Claude answers
+with what the officials should look at. DQ slip batches and the ETD programme are handed over as they arrive.
+At the end of the session, once every event is audited and Meet Manager's merge results export is in, Claude
+writes the session's merge results `.hy3`; when the final export arrives, it runs the final audit. Untick
+**Ask Claude automatically** to do it by hand with the **Ask Claude** buttons instead.
+
+**Gala tab:** the inbox drop zone, the sessions, each session's progress (events audited, with Claude, ready,
+waiting), OCR progress per scan, its folders, and the activity log.
+
+**Checklist tab:** per session, in order: the entries export; the printed lane sheets (Claude copies the
+names, ages, teams and seed times from them rather than reading them off the scans); a row per event (printed ✓, lane sheets, Gen7 heats in and
+missing, OCR lanes, audit report, status, Ask Claude); then DQ slips, ETD, DQ codes, the merge results export,
+our merge results, the final export and the final audit. Tick items off once you've checked them; ticks are
+shared. Drop a file on a row to add it.
+
+Watch Claude work on the **Live** tab; long jobs show a progress bar under the tabs.
 
 ## The data folder
 
-| Folder | What goes in it |
-|---|---|
-| `data/pdf/scanned/` | The scans: `Lane Sheets.pdf`, `DQs.pdf`, `ETD.pdf` |
-| `data/pdf/original/` | The Meet Manager print and the Colorado Gen7 session report (`*Session*.pdf`) |
-| `data/meet/` | Meet Manager entries and results `.hy3` (or the `.zip`) |
-| `data/ocr/` | Written by Claude: one JSON per lane sheet, DQ slip or ETD page, plus `dq-codes.json` |
-| `data/reports/` | Written by Claude: the audit report (HTML), merged `.hy3`, CSV |
+```
+data/inbox/                  new files arrive here (or --inbox DIR)
+data/sessions/S1/meet/       Meet Manager exports and prints
+data/sessions/S1/gen7/       Gen7 race PDFs
+data/sessions/S1/scans/      lane sheet packs, DQ slips, ETD
+data/sessions/S1/ocr/        Claude's transcriptions, dq-codes.json
+data/sessions/S1/reports/    Event NN audit.html, Session N audit.html, merge results .hy3, final audit
+data/unsorted/               files the portal couldn't place
+data/state.json              ticks, what Claude was asked, the activity log
+```
 
-Uploading a file that's already there asks first and keeps the old one as a hidden `.NAME.previous`.
 For the next gala, move the contents of `data/` to an archive folder (or use a copy of this folder).
 
 **Privacy.** The files hold children's names, ages and times. They stay in `data/` on this computer.
@@ -73,7 +102,7 @@ For the next gala, move the contents of `data/` to an archive folder (or use a c
 |---|---|
 | `start-portal.sh`, `stop-portal.sh` | Start and stop everything |
 | `CLAUDE.md` | Claude's instructions: its role, the folders, the skills, how to use the portal |
-| `portal/portal.py` | The portal (one Python file, standard library only) |
+| `portal/portal.py` | The portal (one Python file, standard library only; built from the QA Board) |
 | `portal/board-watch.py` | The watcher |
 | `portal/brand/` | The CGA look: `brand.css` (colours, header) and the logo. Edit it to change the look |
 | `portal/claude-loop.sh`, `resume-prompt.txt`, `tmux.conf` | Claude's tmux session and restarts |

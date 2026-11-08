@@ -1,0 +1,68 @@
+/* ---- Gala and Checklist tabs */
+.galahead h2,.clhead h2{margin:0 0 2px;font-size:1.3em}
+.gh-top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start}
+.gh-right{text-align:right}
+.gauto{font-weight:600;display:inline-flex;gap:8px;align-items:center;cursor:pointer}
+.gauto input{width:20px;height:20px;accent-color:var(--accent)}
+.lnk{color:var(--accent);cursor:pointer;text-decoration:underline}
+.gdrop{margin-top:10px;padding:12px;font-size:.95em}
+.ginbox{padding:18px}
+.gdrop.over,.gfolder.over,.cl-row.over{outline:3px dashed var(--accent);outline-offset:-3px}
+.spills{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0 10px;align-items:center}
+.spills button{border-radius:999px;padding:4px 14px;font-weight:600}
+.spills button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.spills .meta{margin-left:6px}
+.gfolders{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:10px}
+.gfolder{margin:0}
+.gfolder h3{margin:0;font-size:1.05em;display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+.gfolder h3 code{font-size:.75em;color:var(--muted);font-weight:400}
+.gfiles{list-style:none;margin:8px 0 0;padding:0;max-height:260px;overflow:auto}
+.gfiles li{display:flex;gap:8px;align-items:baseline;padding:3px 0;border-top:1px solid var(--line)}
+.gfiles li a:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gfiles li .meta{flex:0 0 auto}
+.gbar{height:10px;border-radius:6px;background:var(--line);overflow:hidden;flex:1;min-width:120px}
+.gbar i{display:block;height:100%;background:var(--accent)}
+.gscan{display:flex;gap:12px;align-items:center;padding:6px 0;border-top:1px solid var(--line);flex-wrap:wrap}
+.gscan:first-of-type{border-top:0}
+.gscan .nm{flex:0 0 300px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gscan .ct{flex:0 0 auto;min-width:150px;text-align:right}
+.gscan .miss{flex-basis:100%;font-size:.85em}
+.gwarn{color:#b45309}
+.gstats{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.gstat{border:1px solid var(--line);border-radius:8px;padding:6px 12px;min-width:90px}
+.gstat b{display:block;font-size:1.4em}
+.gask{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.glog{list-style:none;margin:6px 0 0;padding:0;max-height:240px;overflow:auto;font-size:.92em}
+.glog li{padding:3px 0;border-top:1px solid var(--line);display:flex;gap:10px}
+.glog li .meta{flex:0 0 70px}
+.st{display:inline-block;font-size:.78em;font-weight:700;border-radius:999px;padding:1px 9px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.st.ready{border-color:#b45309;color:#b45309}
+.st.asked{border-color:var(--accent);color:var(--accent)}
+.st.audited{border-color:var(--ans);color:var(--ans)}
+.st.changed{border-color:#b45309;background:#b45309;color:#fff}
+/* checklist */
+.clhead .gbar{margin-top:10px;height:8px}
+.cl-sec{margin:14px 0 4px;font-size:.85em;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:700}
+.cl-row{display:grid;grid-template-columns:30px 1fr auto;gap:2px 12px;align-items:start;padding:9px 0;border-top:1px solid var(--line)}
+.cl-sec+.cl-row,.cl-sec+table{border-top:0}
+.cl-row input[type=checkbox],.cl-ev input[type=checkbox]{width:22px;height:22px;margin:2px 0 0;accent-color:var(--accent);cursor:pointer}
+.cl-row.done .cl-t,.cl-ev tr.done .evname{text-decoration:line-through;text-decoration-color:var(--muted);color:var(--muted)}
+.cl-t{font-weight:600}
+.cl-why{font-size:.9em;color:var(--muted)}
+.cl-f{font-size:.9em;margin-top:3px}
+.ok{color:var(--ans);font-weight:600}
+.no{color:var(--muted)}
+.cl-by{font-size:.8em;color:var(--muted)}
+.cl-act{display:flex;gap:8px;align-items:center;font-size:.88em}
+.cl-ev{width:100%;border-collapse:collapse;font-size:.93em}
+.cl-ev th{text-align:left;font-size:.8em;color:var(--muted);font-weight:600;padding:4px 6px;border-bottom:1px solid var(--line)}
+.cl-ev td{padding:6px;border-top:1px solid var(--line);vertical-align:top}
+.cl-ev td.c{text-align:center}
+.cl-ev .evname{font-weight:600}
+.cl-ev .sm{font-size:.85em;color:var(--muted)}
+.cl-ev button{padding:2px 8px;font-size:.85em}
+.tblwrap{overflow-x:auto}
+.spills button.on .meta{color:#fff;opacity:.85}
+.gfiles li select{flex:0 0 auto;width:auto;padding:2px 6px}
+.gfiles li button{flex:0 0 auto;padding:2px 10px}
+button:disabled{opacity:.45;cursor:not-allowed}

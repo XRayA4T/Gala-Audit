@@ -7,17 +7,19 @@
 #   4. starts the portal web page (http://127.0.0.1:PORT), Claude Code in tmux, and the watcher
 #   5. opens the portal in your web browser and attaches this terminal to Claude
 #
-# Options:  --port N (default 9000)   --no-browser   --no-attach   --name "Gala name"
+# Options:  --port N (default 9000)   --inbox DIR (default data/inbox)   --name "Gala name"
+#           --no-browser   --no-attach
 # Stop everything with:  bash stop-portal.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-PORT="${PORTAL_PORT:-9000}"; TERM_PORT=""; BROWSER=1; ATTACH=1; NAME="CGA Gala Audit"
+PORT="${PORTAL_PORT:-9000}"; INBOX="${GALA_INBOX:-data/inbox}"; TERM_PORT=""; BROWSER=1; ATTACH=1; NAME="CGA Gala Audit"
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
     --name) NAME="$2"; shift 2 ;;
+    --inbox) INBOX="$2"; shift 2 ;;
     --no-browser) BROWSER=0; shift ;;
     --no-attach) ATTACH=0; shift ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
@@ -42,7 +44,7 @@ for t in pdfinfo pdftoppm pdftotext; do
 done
 
 # ---- 2. folders and key
-mkdir -p .portal data/pdf/scanned data/pdf/original data/meet data/ocr data/reports
+mkdir -p .portal data/sessions data/unsorted "$INBOX"
 chmod 700 .portal
 [ -s .portal/key ] || python3 -c 'import secrets;print(secrets.token_urlsafe(18))' > .portal/key
 chmod 600 .portal/key
@@ -80,8 +82,9 @@ l.setdefault("enabledMcpjsonServers", [])
 if "portal" not in l["enabledMcpjsonServers"]: l["enabledMcpjsonServers"].append("portal")
 allow = l.setdefault("permissions", {}).setdefault("allow", [])
 for rule in ["mcp__portal", "Bash(pdfinfo:*)", "Bash(pdftoppm:*)", "Bash(pdftotext:*)", "Bash(pdftocairo:*)",
-             "Bash(python3:*)", "Bash(ls:*)", "Bash(mkdir:*)", "Read(./data/**)", "Edit(./data/ocr/**)",
-             "Write(./data/ocr/**)", "Edit(./data/reports/**)", "Write(./data/reports/**)"]:
+             "Bash(python3:*)", "Bash(ls:*)", "Bash(mkdir:*)", "Read(./data/**)",
+             "Edit(./data/sessions/*/ocr/**)", "Write(./data/sessions/*/ocr/**)",
+             "Edit(./data/sessions/*/reports/**)", "Write(./data/sessions/*/reports/**)"]:
     if rule not in allow: allow.append(rule)
 hook = "curl -s --max-time 5 '%s/api/digest?to=%s&key=%s' || true" % (board, who, key)
 l.setdefault("hooks", {})["UserPromptSubmit"] = [{"hooks": [{"type": "command", "command": hook}]}]
@@ -98,6 +101,7 @@ if ! claude plugin list 2>/dev/null | grep -q 'gala-ocr'; then
   claude plugin install gala-ocr@gala-ai-plugins >/dev/null 2>&1 || warn "Couldn't install gala-ocr automatically. In Claude, run:  /plugin install gala-ocr@gala-ai-plugins"
 else
   claude plugin marketplace update gala-ai-plugins >/dev/null 2>&1 || true
+  claude plugin update gala-ocr@gala-ai-plugins >/dev/null 2>&1 || true   # needs 1.6.0+ (Gen7 race PDFs, --events)
 fi
 
 # ---- 4a. the portal (with a link to the web terminal if ttyd is installed)
@@ -108,7 +112,7 @@ if curl -s --max-time 2 "$BOARD/health?key=$KEY" | grep -q '"ok"'; then
 else
   say "Starting the portal on $BOARD"
   nohup python3 portal/portal.py serve --host 127.0.0.1 --port "$PORT" --db .portal/portal.db --key "$KEY" \
-        --max-doc-mb 200 --name "$NAME" --brand-dir portal/brand --gala-data data ${TERM_ARGS[@]+"${TERM_ARGS[@]}"} > .portal/portal.log 2>&1 &
+        --max-doc-mb 200 --name "$NAME" --brand-dir portal/brand --gala-data data --inbox "$INBOX" ${TERM_ARGS[@]+"${TERM_ARGS[@]}"} > .portal/portal.log 2>&1 &
   echo $! > .portal/portal.pid
   for _ in $(seq 1 40); do curl -s --max-time 1 "$BOARD/health?key=$KEY" | grep -q '"ok"' && break; sleep 0.25; done
   curl -s --max-time 2 "$BOARD/health?key=$KEY" | grep -q '"ok"' || die "The portal didn't start - see .portal/portal.log"
@@ -150,7 +154,8 @@ fi
 URL="$BOARD/?key=$KEY&me=$ME"
 echo
 say "Portal:  $URL"
-say "Data:    $HERE/data   (drop files on the Gala tab, or copy them in)"
+say "Inbox:   $(cd "$INBOX" && pwd)   (the scanner / Gen7 computer save here, or drop files on the Gala tab)"
+say "Data:    $HERE/data/sessions"
 say "Claude:  tmux -L $SOCK attach -t $SESSION      (detach: Ctrl-b d)"
 say "Stop:    bash stop-portal.sh"
 echo

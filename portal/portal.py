@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Gala Audit Portal - the QA Board with a Gala tab (data folder, OCR progress, reports) for a local
-Claude Code that runs the gala-ocr plugin.  Based on the QA Board:
+Gala Audit Portal - the QA Board with Gala and Checklist tabs, for auditing a swimming gala while it runs
+with a local Claude Code and the gala-ocr plugin. Files arrive in an inbox folder and are sorted by session;
+each event is handed to Claude as soon as its lane sheets and Gen7 races are in. Based on the QA Board:
 
 QA Board - a tiny shared question & answer board and document store for a small team and their Claudes.
 
@@ -43,7 +44,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.1.0"
+VERSION = "0.3.1"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 STATUSES = ("open", "answered", "resolved", "on_hold")
 
@@ -536,65 +537,33 @@ class Store:
 DEP_STATUSES = ("running", "waiting", "done", "failed")
 
 
-
-# ============================================================== Gala data folder
-# The portal's data folder (--gala-data). Each entry: key, folder under the data folder, title, hint, accepted types.
-GALA_FOLDERS = [
-    ("scanned", "pdf/scanned", "Scanned paper",
-     "The scans: Lane Sheets.pdf, DQs.pdf, ETD.pdf", ".pdf"),
-    ("original", "pdf/original", "Meet Manager and Gen7 PDFs",
-     "The Meet Manager print and the Colorado Gen7 session report (*Session*.pdf)", ".pdf"),
-    ("meet", "meet", "Meet files",
-     "Entries and results from Meet Manager (.hy3, or the .zip)", ".hy3,.zip,.cl2,.ev3"),
-    ("ocr", "ocr", "OCR cache",
-     "JSON written by the gala-ocr skill (one file per lane sheet, DQ slip or ETD page)", ".json"),
-    ("reports", "reports", "Reports",
-     "Audit reports (HTML), merged .hy3 files, CSV and JSON written by Claude", ""),
+# ============================================================== Gala: a gala audited while it runs
+# Files arrive during the gala in an inbox folder (the scanner, the Gen7 computer, or the browser save there).
+# The portal sorts each one into its session: data/sessions/S<n>/{meet,gen7,scans,ocr,reports}. From each session's
+# Meet Manager entries export it knows the events and heats to expect; when an event's lane sheet pack and all its
+# heats' Gen7 race PDFs are in, it asks gala-claude (a question on the board) to transcribe and audit that event.
+SESSION_DIRS = [
+    ("meet", "Meet Manager files", "Entries, merge results and final exports (.zip / .hy3), Meet Manager prints"),
+    ("gen7", "Gen7 race PDFs", "One PDF per race, as Gen7 prints them"),
+    ("scans", "Scans", "Lane sheet packs (one per event), DQ slips, the ETD programme"),
+    ("ocr", "OCR (Claude)", "One JSON per lane sheet, DQ slip or ETD page, and dq-codes.json"),
+    ("reports", "Reports (Claude)", "Event and session audit reports, merge results .hy3, final audit"),
 ]
-GALA_KEYS = {f[0]: f for f in GALA_FOLDERS}
-_GALA_CACHE = {}
-_OCR_PAGE = re.compile(r"-p(\d{3,4})\.json$", re.I)
+SESSION_KEYS = [d[0] for d in SESSION_DIRS]
+SKIP_NAME = re.compile(r"^[.~]|\.(part|partial|tmp|crdownload|download|lock)$|^(thumbs\.db|desktop\.ini)$", re.I)
+SESSION_RX = re.compile(r"(?i)(?:\bsession|\bsess|\bses)\s*[-_#.]?\s*(\d{1,2})(?!\d)|(?<![a-z0-9])s(\d{1,2})(?![0-9])")
+EVENT_RX = re.compile(r"(?i)(?:\bevent|\bevt|\bev|(?<![a-z0-9])e)\s*[-_#.]?\s*(\d{1,3})(?!\d)")
+GEN7_RX = re.compile(r"Event:\s*(\d+)\s+Heat:\s*(\d+)\s+Race\s*#\s*(\d+)")
+GEN7_SESSION = re.compile(r"Session:\s*(\d+)")
+OCR_LANE = re.compile(r"-event0*(\d+)-lane(\d+)-p\d+\.json$", re.I)
+OCR_SLIP = re.compile(r"-event0*(\d+)-heat\d+-lane\d+-p\d+\.json$", re.I)
+OCR_PAGE = re.compile(r"-p(\d{3,4})\.json$", re.I)
+MEET_EXT = (".zip", ".hy3", ".cl2", ".ev3", ".hyv")
+CLAUDE_WHO = "gala-claude"
 
 
-def _cached(kind, path, fn):
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    k = (kind, path)
-    hit = _GALA_CACHE.get(k)
-    if hit and hit[0] == (st.st_mtime, st.st_size):
-        return hit[1]
-    val = fn(path)
-    _GALA_CACHE[k] = ((st.st_mtime, st.st_size), val)
-    return val
-
-
-def _pdf_pages(path):
-    def run(p):
-        try:
-            out = subprocess.run(["pdfinfo", p], capture_output=True, text=True, timeout=30).stdout
-            m = re.search(r"^Pages:\s+(\d+)", out, re.M)
-            return int(m.group(1)) if m else None
-        except (OSError, subprocess.SubprocessError):
-            return None
-    return _cached("pages", path, run)
-
-
-def _ocr_info(path):
-    """(page, back page or None, has 'needsReview'/'unsure' flags) for one OCR JSON file."""
-    def run(p):
-        try:
-            with open(p, encoding="utf-8") as f:
-                d = json.load(f)
-        except (OSError, ValueError):
-            return {"bad": True}
-        if not isinstance(d, dict):
-            return {"bad": True}
-        txt = json.dumps(d)
-        return {"back": d.get("backPage") if isinstance(d.get("backPage"), int) else None,
-                "review": bool(re.search(r'"(needsReview|unsure|uncertain)"\s*:\s*(true|\[[^\]])', txt))}
-    return _cached("ocr", path, run)
+def _first(m):
+    return int(next(g for g in m.groups() if g)) if m else None
 
 
 def _ls(folder):
@@ -615,53 +584,670 @@ def _ls(folder):
     return out
 
 
-def gala_overview(root):
-    folders = []
-    for key, rel, title, hint, types in GALA_FOLDERS:
-        d = os.path.join(root, rel)
-        files = _ls(d)
-        entry = {"key": key, "path": rel, "title": title, "hint": hint, "types": types,
-                 "count": len([f for f in files if not f["dir"]])}
-        if key == "ocr":   # can be thousands: send the newest few only
-            entry["files"] = sorted(files, key=lambda f: -f["mtime"])[:12]
-            entry["latest"] = max([f["mtime"] for f in files] or [0])
-        else:
-            entry["files"] = files
-        folders.append(entry)
+def _unique(folder, name):
+    base, ext = os.path.splitext(name)
+    cand, i = name, 2
+    while os.path.exists(os.path.join(folder, cand)):
+        cand = "%s (%d)%s" % (base, i, ext)
+        i += 1
+    return cand
 
-    # OCR progress per scan: pages in the PDF vs pages with a JSON in ocr/ (a DQ slip's back page counts too)
-    ocr_dir = os.path.join(root, "ocr")
-    ocr_files = [f["name"] for f in _ls(ocr_dir) if f["name"].lower().endswith(".json")]
-    scans = []
-    for f in _ls(os.path.join(root, "pdf", "scanned")):
-        if f["dir"] or not f["name"].lower().endswith(".pdf"):
-            continue
-        stem = f["name"][:-4]
-        pages = _pdf_pages(os.path.join(root, "pdf", "scanned", f["name"]))
-        done, review, bad, nfiles = set(), 0, 0, 0
-        for n in ocr_files:
-            if not n.startswith(stem + "-"):
+
+def _same_file(a, b):
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                x, y = fa.read(1 << 20), fb.read(1 << 20)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+    except OSError:
+        return False
+
+
+class Gala:
+    def __init__(self, root, inbox, store):
+        self.root = os.path.abspath(root)
+        self.inbox = os.path.abspath(inbox or os.path.join(self.root, "inbox"))
+        self.store = store
+        self.lock = threading.RLock()
+        self.cache = {}
+        self.seen = {}          # inbox file -> (size, mtime) at the last look, to wait until it is fully written
+        for d in (self.root, self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
+            os.makedirs(d, exist_ok=True)
+        self.state_file = os.path.join(self.root, "state.json")
+        try:
+            with open(self.state_file, encoding="utf-8") as f:
+                self.state = json.load(f)
+        except (OSError, ValueError):
+            self.state = {}
+        self.state.setdefault("auto", True)
+        self.state.setdefault("log", [])
+        self.state.setdefault("asked", {})
+        self.state.setdefault("ticks", {})
+
+    # ---------------------------------------------------------------- state
+    def save(self):
+        with self.lock:
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, indent=1)
+            os.replace(tmp, self.state_file)
+
+    def log(self, text, **kw):
+        with self.lock:
+            self.state["log"] = (self.state["log"] + [dict(kw, ts=time.time(), text=text)])[-300:]
+            self.save()
+
+    # ---------------------------------------------------------------- reading files (cached by size and mtime)
+    def _cached(self, kind, path, fn):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        key = (kind, path)
+        hit = self.cache.get(key)
+        if hit and hit[0] == (st.st_mtime, st.st_size):
+            return hit[1]
+        val = fn(path)
+        self.cache[key] = ((st.st_mtime, st.st_size), val)
+        return val
+
+    def pdf_pages(self, path):
+        def run(p):
+            try:
+                out = subprocess.run(["pdfinfo", p], capture_output=True, text=True, timeout=30).stdout
+                m = re.search(r"^Pages:\s+(\d+)", out, re.M)
+                return int(m.group(1)) if m else None
+            except (OSError, subprocess.SubprocessError):
+                return None
+        return self._cached("pages", path, run)
+
+    def pdf_text(self, path):
+        def run(p):
+            try:
+                return subprocess.run(["pdftotext", "-l", "6", p, "-"], capture_output=True, text=True,
+                                      timeout=60).stdout
+            except (OSError, subprocess.SubprocessError):
+                return ""
+        return self._cached("text", path, run) or ""
+
+    def lane_print(self, path):
+        """Meet Manager's printed (not scanned) lane sheets: {events: [...], sheets: N}; no events if it isn't one."""
+        def run(p):
+            try:
+                txt = subprocess.run(["pdftotext", "-layout", p, "-"], capture_output=True, text=True,
+                                     timeout=120).stdout
+            except (OSError, subprocess.SubprocessError):
+                return {"events": [], "sheets": 0}
+            events, sheets = set(), 0
+            for page in txt.split("\f"):
+                ev = re.search(r"(?m)^\s*Event (\d+) ", page)
+                if ev and re.search(r"(?m)^\s*Lane \d+\s+Heat \d+", page):
+                    events.add(int(ev.group(1)))
+                    sheets += 1
+            return {"events": sorted(events), "sheets": sheets}
+        return self._cached("lanesprint", path, run) or {"events": [], "sheets": 0}
+
+    def gen7(self, path):
+        """The Gen7 races in a PDF: {session, races: [{race, event, heat, desc}]} (empty races: not a Gen7 PDF)."""
+        def run(p):
+            try:
+                txt = subprocess.run(["pdftotext", p, "-"], capture_output=True, text=True, timeout=60).stdout
+            except (OSError, subprocess.SubprocessError):
+                txt = ""
+            lines = [ln.strip() for ln in txt.splitlines()]
+            races = []
+            for i, ln in enumerate(lines):
+                m = GEN7_RX.search(ln)
+                if m:
+                    desc = next((lines[j] for j in range(i - 1, max(i - 4, -1), -1) if lines[j]), "")
+                    races.append({"event": int(m.group(1)), "heat": int(m.group(2)), "race": int(m.group(3)),
+                                  "desc": "" if GEN7_SESSION.search(desc) else desc[:80]})
+            s = GEN7_SESSION.search(txt)
+            return {"session": int(s.group(1)) if s else None, "races": races}
+        return self._cached("gen7", path, run) or {"session": None, "races": []}
+
+    def hy3(self, path):
+        """Events in a Meet Manager .hy3 (or the .hy3 in a .zip): {event: {heats, lanes, entries}}."""
+        def run(p):
+            data = b""
+            try:
+                if p.lower().endswith(".zip"):
+                    import zipfile
+                    with zipfile.ZipFile(p) as z:
+                        names = [n for n in z.namelist() if n.lower().endswith(".hy3")]
+                        names.sort(key=lambda n: (not os.path.basename(n).lower().startswith("hfile"), n))
+                        if names:
+                            data = z.read(names[0])
+                else:
+                    with open(p, "rb") as f:
+                        data = f.read()
+            except Exception:
+                return {}
+            ev, cur = {}, None
+            for ln in data.decode("latin-1").replace("\r\n", "\n").split("\n"):
+                if ln.startswith("E1") and len(ln) >= 42 and ln[38:42].strip().isdigit():
+                    cur = int(ln[38:42])
+                    e = ev.setdefault(cur, {"heats": 0, "lanes": set(), "entries": 0})
+                    e["entries"] += 1
+                elif ln.startswith("E2") and cur is not None and len(ln) >= 26:
+                    h, l = ln[20:23].strip(), ln[23:26].strip()
+                    if h.isdigit() and int(h) > 0:
+                        ev[cur]["heats"] = max(ev[cur]["heats"], int(h))
+                    if l.isdigit() and int(l) > 0:
+                        ev[cur]["lanes"].add(int(l))
+            return {k: {"heats": v["heats"], "lanes": sorted(v["lanes"]), "entries": v["entries"]} for k, v in ev.items()}
+        return self._cached("hy3", path, run) or {}
+
+    def ocr_info(self, path):
+        def run(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+            except (OSError, ValueError):
+                return {"bad": True}
+            if not isinstance(d, dict):
+                return {"bad": True}
+            txt = json.dumps(d)
+            return {"back": d.get("backPage") if isinstance(d.get("backPage"), int) else None,
+                    "review": bool(re.search(r'"(needsReview|unsure|uncertain)"\s*:\s*(true|\[[^\]])', txt))}
+        return self._cached("ocr", path, run) or {}
+
+    # ---------------------------------------------------------------- sessions
+    def sessions(self):
+        out = []
+        for f in _ls(os.path.join(self.root, "sessions")):
+            m = re.fullmatch(r"S(\d{1,2})", f["name"])
+            if f["dir"] and m:
+                out.append(int(m.group(1)))
+        return sorted(out)
+
+    def sdir(self, n, sub=None):
+        d = os.path.join(self.root, "sessions", "S%d" % n)
+        for k in SESSION_KEYS:
+            os.makedirs(os.path.join(d, k), exist_ok=True)
+        return os.path.join(d, sub) if sub else d
+
+    def meet_files(self, n):
+        """The session's Meet Manager files by kind: entries, results, final, codes, print."""
+        out = {"entries": [], "results": [], "final": [], "codes": [], "lanesprint": [], "print": []}
+        for f in _ls(self.sdir(n, "meet")):
+            if f["dir"]:
                 continue
-            m = _OCR_PAGE.search(n)
-            if not m:
+            out[self.meet_kind(os.path.join(self.sdir(n, "meet"), f["name"]))].append(f)
+        for v in out.values():
+            v.sort(key=lambda f: f["mtime"])
+        return out
+
+    def meet_kind(self, path):
+        name = os.path.basename(path).lower()
+        ext = os.path.splitext(name)[1]
+        if ext in (".txt", ".csv"):
+            return "codes"
+        if ext == ".pdf":
+            return "lanesprint" if self.lane_print(path)["events"] else "print"
+        if "final" in name:
+            return "final"
+        if "result" in name:
+            return "results"
+        if "entr" in name or name.startswith("hfile"):
+            return "entries"
+        if ext == ".zip":
+            try:
+                import zipfile
+                with zipfile.ZipFile(path) as z:
+                    inner = " ".join(os.path.basename(n).lower() for n in z.namelist())
+                if "result" in inner:
+                    return "results"
+            except Exception:
+                pass
+        return "entries"
+
+    def entries(self, n):
+        """Events expected in the session (from its newest entries export): {event: {heats, lanes, entries}}."""
+        files = self.meet_files(n)["entries"]
+        return self.hy3(os.path.join(self.sdir(n, "meet"), files[-1]["name"])) if files else {}
+
+    def scan_kind(self, name):
+        low = name.lower()
+        if re.search(r"dq|disq", low):
+            return "dq"
+        if re.search(r"etd|programme|program", low):
+            return "etd"
+        return "lanes"
+
+    # ---------------------------------------------------------------- sorting the inbox
+    def classify(self, path):
+        """(kind, folder, session or None, event or None) for a new file."""
+        name = os.path.basename(path)
+        low = name.lower()
+        ext = os.path.splitext(low)[1]
+        sess = _first(SESSION_RX.search(name))
+        event = _first(EVENT_RX.search(name))
+        if ext in MEET_EXT or ext in (".txt", ".csv"):
+            return self.meet_kind(path), "meet", sess, None
+        if ext == ".pdf":
+            g = self.gen7(path)
+            if g["races"]:
+                return "gen7", "gen7", g["session"] or sess, g["races"][0]["event"]
+            txt = self.pdf_text(path)
+            if len(re.sub(r"\s+", "", txt)) > 300:      # a generated PDF (e.g. a Meet Manager print), not a scan
+                return self.meet_kind(path), "meet", sess, event
+            return self.scan_kind(name), "scans", sess, event
+        return "unknown", None, sess, event
+
+    def pick_session(self, kind, path, sess, event):
+        have = self.sessions()
+        if sess:
+            return sess
+        if kind == "entries":
+            evs = set(self.hy3(path))
+            best = max(have, key=lambda n: len(evs & {r["event"] for r in self.gen7_races(n)}), default=None)
+            if best and evs & {r["event"] for r in self.gen7_races(best)}:
+                return best
+            free = [n for n in have if not self.meet_files(n)["entries"]]
+            return free[0] if free else (max(have) + 1 if have else 1)
+        if kind in ("results", "final"):
+            evs = set(self.hy3(path))
+            known = lambda n: set(self.entries(n)) | {r["event"] for r in self.gen7_races(n)}  # noqa: E731
+            best = max(have, key=lambda n: len(evs & known(n)), default=None)
+            if best and evs & known(best):
+                return best
+            lacking = [n for n in have if self.meet_files(n)["entries"] and not self.meet_files(n)[kind]]
+            return lacking[0] if lacking else (max(have) if have else 1)
+        if kind == "lanesprint":
+            evs = set(self.lane_print(path)["events"])
+            known = lambda n: set(self.entries(n)) | {r["event"] for r in self.gen7_races(n)}  # noqa: E731
+            best = max(have, key=lambda n: len(evs & known(n)), default=None)
+            if best and evs & known(best):
+                return best
+            return max(have) if have else 1
+        if event is not None:
+            for n in reversed(have):
+                if event in self.entries(n) or event in {r["event"] for r in self.gen7_races(n)}:
+                    return n
+        return max(have) if have else 1
+
+    def sort_inbox(self):
+        """Move every finished file in the inbox to its session. A file is finished once its size and time haven't
+        changed for one look and it is a few seconds old."""
+        now = time.time()
+        found = {}
+        for dirpath, dirs, files in os.walk(self.inbox):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for n in files:
+                if SKIP_NAME.search(n):
+                    continue
+                p = os.path.join(dirpath, n)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                found[p] = (st.st_size, st.st_mtime)
+        ready = [p for p, sig in found.items() if self.seen.get(p) == sig and now - sig[1] > 3 and sig[0] > 0]
+        self.seen = found
+        for p in sorted(ready, key=lambda p: found[p][1]):
+            try:
+                self.file_one(p)
+            except Exception as e:  # never let one bad file stop the rest
+                sys.stderr.write("inbox: %s: %s\n" % (p, e))
+                try:
+                    dest = os.path.join(self.root, "unsorted", _unique(os.path.join(self.root, "unsorted"),
+                                                                       os.path.basename(p)))
+                    shutil.move(p, dest)
+                    self.log("Couldn't sort %s (%s): moved to unsorted" % (os.path.basename(p), e),
+                             name=os.path.basename(p), to="unsorted")
+                except OSError:
+                    pass
+
+    def file_one(self, path, force_session=None, force_folder=None):
+        name = os.path.basename(path)
+        kind, folder, sess, event = self.classify(path)
+        if force_folder:
+            folder = force_folder
+        if not folder:
+            dest_dir = os.path.join(self.root, "unsorted")
+            label = "unsorted (unknown type)"
+        else:
+            n = force_session or self.pick_session(kind, path, sess, event)
+            dest_dir = self.sdir(n, folder)
+            label = "S%d/%s" % (n, folder)
+        dest = os.path.join(dest_dir, name)
+        note = ""
+        if os.path.exists(dest):
+            if _same_file(path, dest):
+                os.unlink(path)
+                self.log("%s was already in %s" % (name, label), name=name, to=label, kind=kind)
+                return label
+            # A file with the same name is a rescan or a reprint: it replaces the old one, which is kept in
+            # .replaced/. For a scan, the OCR of the old scan is set aside too, so its pages are read again.
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            old = os.path.join(dest_dir, ".replaced")
+            os.makedirs(old, exist_ok=True)
+            shutil.move(dest, os.path.join(old, "%s %s" % (stamp, name)))
+            note = " (replaces the earlier copy, kept in .replaced"
+            if folder == "scans" and name.lower().endswith(".pdf"):
+                ocr = os.path.dirname(dest_dir) + os.sep + "ocr"
+                stem = name[:-4] + "-"
+                moved = 0
+                for f in _ls(ocr):
+                    if f["name"].startswith(stem) and f["name"].lower().endswith(".json"):
+                        os.makedirs(os.path.join(ocr, ".replaced", stamp), exist_ok=True)
+                        shutil.move(os.path.join(ocr, f["name"]), os.path.join(ocr, ".replaced", stamp, f["name"]))
+                        moved += 1
+                if moved:
+                    note += "; its %d OCR files were set aside to be read again" % moved
+            note += ")"
+        shutil.move(path, dest)
+        self.log("%s → %s%s" % (name, label, note), name=name, to=label, kind=kind)
+        return label
+
+    def move(self, rel, session, folder):
+        """Move a file from unsorted/ (or anywhere under sessions/) to S<session>/<folder>."""
+        src = gala_path(self.root, rel)
+        if not src or folder not in SESSION_KEYS:
+            raise ValueError("no such file, or unknown folder")
+        dest_dir = self.sdir(int(session), folder)
+        dest = os.path.join(dest_dir, _unique(dest_dir, os.path.basename(src)))
+        shutil.move(src, dest)
+        self.log("%s → S%d/%s (by hand)" % (os.path.basename(src), int(session), folder),
+                 name=os.path.basename(dest), to="S%d/%s" % (int(session), folder))
+
+    # ---------------------------------------------------------------- what each session has
+    def gen7_races(self, n):
+        out = []
+        d = self.sdir(n, "gen7")
+        for f in _ls(d):
+            if not f["dir"] and f["name"].lower().endswith(".pdf"):
+                for r in self.gen7(os.path.join(d, f["name"]))["races"]:
+                    out.append(dict(r, file=f["name"], mtime=f["mtime"]))
+        return out
+
+    def scans(self, n):
+        d, ocr = self.sdir(n, "scans"), self.sdir(n, "ocr")
+        ocr_files = [f["name"] for f in _ls(ocr) if f["name"].lower().endswith(".json")]
+        out = []
+        for f in _ls(d):
+            if f["dir"] or not f["name"].lower().endswith(".pdf"):
                 continue
-            nfiles += 1
-            done.add(int(m.group(1)))
-            info = _ocr_info(os.path.join(ocr_dir, n)) or {}
-            if info.get("bad"):
-                bad += 1
-            if info.get("back"):
-                done.add(info["back"])
-            if info.get("review"):
-                review += 1
-        kind = ("dq" if re.search(r"dq", stem, re.I) else "etd" if re.search(r"etd|programme|program", stem, re.I)
-                else "lanes")
-        missing = [p for p in range(1, (pages or 0) + 1) if p not in done]
-        scans.append({"name": f["name"], "kind": kind, "pages": pages, "done": len([p for p in done if not pages or p <= pages]),
-                      "files": nfiles, "review": review, "bad": bad, "missing": missing[:60],
-                      "missingCount": len(missing)})
-    tools = {t: bool(shutil.which(t)) for t in ("pdfinfo", "pdftoppm", "pdftotext")}
-    return {"root": root, "folders": folders, "scans": scans, "tools": tools}
+            stem = f["name"][:-4]
+            pages = self.pdf_pages(os.path.join(d, f["name"]))
+            done, review, bad, files, events = set(), 0, 0, 0, set()
+            for o in ocr_files:
+                if not o.startswith(stem + "-"):
+                    continue
+                m = OCR_PAGE.search(o)
+                if not m:
+                    continue
+                files += 1
+                done.add(int(m.group(1)))
+                me = OCR_LANE.search(o) or OCR_SLIP.search(o)
+                if me:
+                    events.add(int(me.group(1)))
+                info = self.ocr_info(os.path.join(ocr, o))
+                bad += 1 if info.get("bad") else 0
+                review += 1 if info.get("review") else 0
+                if info.get("back"):
+                    done.add(info["back"])
+            ev = _first(EVENT_RX.search(stem))
+            missing = [p for p in range(1, (pages or 0) + 1) if p not in done]
+            out.append({"name": f["name"], "kind": self.scan_kind(f["name"]), "event": ev,
+                        "events": sorted(events), "pages": pages, "mtime": f["mtime"], "size": f["size"],
+                        "done": len([p for p in done if not pages or p <= pages]), "files": files, "review": review,
+                        "bad": bad, "missing": missing[:40], "missingCount": len(missing)})
+        return out
+
+    def session(self, n):
+        meet = self.meet_files(n)
+        expected = self.entries(n)
+        races = self.gen7_races(n)
+        scans = self.scans(n)
+        ocr = [f["name"] for f in _ls(self.sdir(n, "ocr"))]
+        reports = [f for f in _ls(self.sdir(n, "reports")) if not f["dir"]]
+        lanes_done = {}
+        for o in ocr:
+            m = OCR_LANE.search(o)
+            if m:
+                lanes_done.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+        gen7_by_event, desc = {}, {}
+        for r in races:
+            gen7_by_event.setdefault(r["event"], {}).setdefault(r["heat"], r)
+            if r["desc"]:
+                desc.setdefault(r["event"], r["desc"])
+        printed, prints = {}, []
+        for f in meet["lanesprint"]:
+            info = self.lane_print(os.path.join(self.sdir(n, "meet"), f["name"]))
+            prints.append({"name": f["name"], "events": info["events"], "sheets": info["sheets"]})
+            for e in info["events"]:
+                printed.setdefault(e, []).append(f["name"])
+        packs = {}
+        for s in scans:
+            if s["kind"] == "lanes":
+                for e in ([s["event"]] if s["event"] is not None else s["events"]):
+                    packs.setdefault(e, []).append(s)
+        asked = self.state["asked"]
+        events = []
+        for e in sorted(set(expected) | set(gen7_by_event) | set(packs) | set(lanes_done)):
+            x = expected.get(e, {})
+            heats = x.get("heats") or max(gen7_by_event.get(e, {0: 0}))
+            have = sorted(gen7_by_event.get(e, {}))
+            pk = packs.get(e, [])
+            report = next((f for f in reports if f["name"].lower().endswith(".html")
+                           and re.search(r"(?i)\bevent\s*0*%d\b" % e, f["name"])), None)
+            inputs = [(p["name"], p["mtime"]) for p in pk] + [(r["file"], r["mtime"]) for r in races if r["event"] == e]
+            sig = hashlib.sha1(json.dumps(sorted(inputs)).encode()).hexdigest()[:12]
+            newest = max([t for _, t in inputs] or [0])
+            ready = bool(pk) and heats > 0 and all(h in have for h in range(1, heats + 1))
+            a = asked.get("S%d:e%d" % (n, e))
+            if report and report["mtime"] >= newest:
+                status = "audited"
+            elif report:
+                status = "changed"
+            elif a:
+                status = "asked"
+            elif ready:
+                status = "ready"
+            else:
+                status = "waiting"
+            events.append({"event": e, "desc": desc.get(e, ""), "heats": heats, "gen7": have,
+                           "gen7Missing": [h for h in range(1, heats + 1) if h not in have],
+                           "expected": bool(x), "lanes": len(x.get("lanes", [])) or None,
+                           "packs": [p["name"] for p in pk], "printed": printed.get(e, []), "ocrLanes": len(lanes_done.get(e, ())),
+                           "report": report["name"] if report else None, "ready": ready, "sig": sig,
+                           "status": status, "asked": a})
+        merged = [f["name"] for f in reports if f["name"].lower().endswith(".hy3")]
+        finals = [f["name"] for f in reports if f["name"].lower().endswith(".html") and "final" in f["name"].lower()]
+        sess_report = next((f["name"] for f in reports if f["name"].lower().endswith(".html")
+                            and re.search(r"(?i)session", f["name"]) and "final" not in f["name"].lower()), None)
+        return {"n": n, "meet": {k: [f["name"] for f in v] for k, v in meet.items()}, "lanePrints": prints,
+                "expected": {"events": len(expected), "heats": sum(v["heats"] for v in expected.values())},
+                "races": len(races), "scans": scans, "events": events, "merged": merged, "finalReports": finals,
+                "sessionReport": sess_report, "dqCodes": "dq-codes.json" in ocr,
+                "folders": {k: _ls(self.sdir(n, k)) if k != "ocr" else
+                            sorted(_ls(self.sdir(n, k)), key=lambda f: -f["mtime"])[:12] for k in SESSION_KEYS},
+                "ocrCount": len(ocr)}
+
+    def overview(self):
+        with self.lock:
+            inbox_in_root = os.path.realpath(self.inbox).startswith(os.path.realpath(self.root) + os.sep)
+            return {"root": self.root, "inbox": self.inbox, "inboxRel": os.path.relpath(self.inbox, self.root)
+                    if inbox_in_root else None, "auto": self.state["auto"],
+                    "log": self.state["log"][-40:][::-1],
+                    "waiting": [os.path.relpath(p, self.inbox) for p in self.seen],
+                    "unsorted": _ls(os.path.join(self.root, "unsorted")),
+                    "sessions": [self.session(n) for n in self.sessions()],
+                    "ticks": self.state["ticks"],
+                    "tools": {t: bool(shutil.which(t)) for t in ("pdfinfo", "pdftoppm", "pdftotext")}}
+
+    # ---------------------------------------------------------------- asking Claude
+    def P(self, n, sub, name=""):
+        return "data/sessions/S%d/%s%s" % (n, sub, ("/" + name) if name else "")
+
+    def question(self, key, n):
+        """(title, body) for a piece of work, or None if it doesn't apply (yet)."""
+        s = self.session(n)
+        ocr, gen7, scans, rep = self.P(n, "ocr"), self.P(n, "gen7"), self.P(n, "scans"), self.P(n, "reports")
+        done_events = ",".join(str(e["event"]) for e in s["events"] if e["ocrLanes"] or e["packs"])
+        session_audit = ('`audit_report.py %s %s "%s/Session %d audit.html" --events %s --scans %s`'
+                         % (ocr, gen7, rep, n, done_events or "<events>", scans))
+        kind = key.split(":")[1]
+        if kind.startswith("e") and kind[1:].isdigit():
+            e = int(kind[1:])
+            ev = next((x for x in s["events"] if x["event"] == e), None)
+            if not ev:
+                return None
+            packs = ", ".join("`%s`" % self.P(n, "scans", p) for p in ev["packs"]) or "(no lane sheet pack yet)"
+            redo = ev["status"] in ("changed", "audited") or (ev["asked"] and ev["asked"].get("sig") != ev["sig"])
+            title = "Session %d · Event %d%s: %s" % (n, e, (" " + ev["desc"]) if ev["desc"] else "",
+                                                     "new files, audit it again" if redo else "transcribe and audit it")
+            if ev["printed"]:
+                orig = ("Take the printed fields (names, ages, teams, seed times) from Meet Manager's printed lane sheets "
+                        "%s with the skill's `original_sheets.py` (pass the PDF and the event)."
+                        % ", ".join("`%s`" % self.P(n, "meet", f) for f in ev["printed"]))
+            else:
+                orig = ("There are no printed lane sheets for this event yet, so read the printed fields from the scan "
+                        "(and say so in your answer).")
+            missing = ("\n\nGen7 heats not in yet: %s. Audit what is there and say which heats are missing."
+                       % ", ".join(map(str, ev["gen7Missing"]))) if ev["gen7Missing"] else ""
+            body = (("Event %d is in: lane sheets %s and Gen7 races for heats %s (of %s) in `%s`.%s\n\n"
+                     "1. **Transcribe** the lane sheets with the **gala-ocr** skill into `%s/` (skip pages already done%s). %s\n"
+                     "2. **Audit the event** with the **gala-audit** skill:\n"
+                     "   `audit_report.py %s %s \"%s/Event %02d audit.html\" --events %d --scans %s`\n"
+                     "3. **Update the session report** (every event transcribed so far):\n   %s\n"
+                     "4. **Answer** with what the officials should look at now (pads, times in doubt, DQs, unsigned "
+                     "sheets, anything unreadable), with links to both reports.")
+                    % (e, packs, ", ".join(map(str, ev["gen7"])) or "none", ev["heats"] or "?", gen7, missing,
+                       ocr, "; a rescanned pack replaces the old one and its old OCR has been set aside, so read all its pages"
+                       if redo else "", orig,
+                       ocr, gen7, rep, e, e, scans, session_audit))
+            return title, body
+        if kind == "scan":
+            name = key.split(":", 2)[2]
+            sc = next((x for x in s["scans"] if x["name"] == name), None)
+            if not sc:
+                return None
+            if sc["kind"] == "dq":
+                return ("Session %d: read the DQ slips in %s" % (n, name),
+                        "New DQ slips: `%s`.\n\n1. Read them with the **gala-ocr** skill into `%s/` (skip slips already done).\n"
+                        "2. Give each slip its DQ code in `%s/dq-codes.json` (**gala-audit** skill); ask the referee here "
+                        "about any code you're unsure of.\n3. Update the session report:\n   %s\n"
+                        "4. Answer with the DQs, their codes and anything that doesn't match the lane sheets or Gen7."
+                        % (self.P(n, "scans", name), ocr, ocr, session_audit))
+            if sc["kind"] == "etd":
+                return ("Session %d: read the ETD programme %s" % (n, name),
+                        "The ETD programme is in: `%s`.\n\n1. Read the race numbers with the **gala-ocr** skill into `%s/`.\n"
+                        "2. Check them against the Gen7 races (`check_etd.py %s %s`).\n3. Update the session report:\n   %s\n"
+                        "4. Answer with combined events, re-started heats and race numbers that don't match."
+                        % (self.P(n, "scans", name), ocr, ocr, gen7, session_audit))
+            return None
+        if kind == "merge":
+            if not s["meet"]["results"] or not s["meet"]["entries"]:
+                return None
+            ent, res = self.P(n, "meet", s["meet"]["entries"][-1]), self.P(n, "meet", s["meet"]["results"][-1])
+            return ("Session %d: write the merge results for Meet Manager" % n,
+                    "Meet Manager's merge results export for session %d is in: `%s` (entries: `%s`).\n\n"
+                    "1. Check every event of the session has been transcribed and audited and every DQ slip has a code "
+                    "(`%s/dq-codes.json`); list anything missing.\n"
+                    "2. Write the merge results with the **gala-audit** skill (unzip the entries' Hfile*.hy3 into a temp "
+                    "folder if it's a zip):\n   `merge_results.py %s %s <entries>.hy3 %s \"%s/Merge Meet Results-S%d-audit.hy3\"`\n"
+                    "3. Run the session audit again with `--merge` and `--quick-fixes \"%s/Session %d quick fixes.html\"`.\n"
+                    "4. Answer with what was written, the Quick Fix list and anything you were unsure of."
+                    % (n, res, ent, ocr, ocr, gen7, res, rep, n, rep, n))
+        if kind == "final":
+            if not s["meet"]["final"] or not s["merged"]:
+                return None
+            fin = self.P(n, "meet", s["meet"]["final"][-1])
+            ours = self.P(n, "reports", s["merged"][-1])
+            return ("Session %d: final audit" % n,
+                    "Meet Manager's final merge results for session %d are in: `%s`.\n\nRun the **gala-audit** final audit:\n"
+                    "   `final_audit.py %s %s \"%s/Session %d final audit.html\" --quick-fixes \"%s/Session %d quick fixes.json\"`\n"
+                    "and answer with every manual change and the Quick Fix swims left as they were." % (n, fin, ours, fin, rep, n, rep, n))
+        if kind == "check":
+            return ("Session %d: check the files" % n,
+                    "Look through `data/sessions/S%d/` and the portal's Checklist for session %d: which events and "
+                    "heats are expected (the entries export), which lane sheet packs and Gen7 races are in, what is "
+                    "transcribed and audited, and what is missing. Don't start transcribing; just report." % (n, n))
+        return None
+
+    def ask(self, key, by=None, force=False):
+        """Post the question for a piece of work to gala-claude (once per key and input files, unless forced)."""
+        n = int(key.split(":")[0][1:])
+        q = self.question(key, n)
+        if not q:
+            return None
+        with self.lock:
+            sig = None
+            if re.fullmatch(r"S\d+:e\d+", key):
+                ev = next((x for x in self.session(n)["events"] if "S%d:e%d" % (n, x["event"]) == key), None)
+                sig = ev and ev["sig"]
+            prev = self.state["asked"].get(key)
+            if prev and not force and prev.get("sig") == sig:
+                return None
+            row = self.store.post(q[0], q[1], by or "portal", CLAUDE_WHO)
+            self.state["asked"][key] = {"ts": time.time(), "qid": row["id"], "sig": sig, "by": by or "portal"}
+            self.save()
+            self.log("Asked Claude: %s (question %d)" % (q[0], row["id"]), qid=row["id"])
+            return row
+
+    def auto_ask(self):
+        if not self.state["auto"]:
+            return
+        for n in self.sessions():
+            s = self.session(n)
+            for ev in s["events"]:
+                key = "S%d:e%d" % (n, ev["event"])
+                prev = self.state["asked"].get(key)
+                if ev["ready"] and (not prev or prev.get("sig") != ev["sig"]):
+                    self.ask(key)
+            for sc in s["scans"]:
+                if sc["kind"] in ("dq", "etd"):
+                    key = "S%d:scan:%s" % (n, sc["name"])
+                    if key not in self.state["asked"]:
+                        self.ask(key)
+            all_audited = s["events"] and all(e["status"] == "audited" for e in s["events"])
+            if s["meet"]["results"] and s["meet"]["entries"] and all_audited:   # the end of the session
+                key = "S%d:merge" % n
+                prev = self.state["asked"].get(key)
+                if not prev or prev.get("file") != s["meet"]["results"][-1]:
+                    if self.ask(key, force=True):
+                        self.state["asked"][key]["file"] = s["meet"]["results"][-1]
+                        self.save()
+            if s["meet"]["final"] and s["merged"]:
+                key = "S%d:final" % n
+                prev = self.state["asked"].get(key)
+                if not prev or prev.get("file") != s["meet"]["final"][-1]:
+                    if self.ask(key, force=True):
+                        self.state["asked"][key]["file"] = s["meet"]["final"][-1]
+                        self.save()
+
+    def run(self, every=4):
+        while True:
+            try:
+                self.sort_inbox()
+                self.auto_ask()
+            except Exception as e:
+                sys.stderr.write("gala loop: %r\n" % (e,))
+            time.sleep(every)
+
+    def tick(self, key, checked, who):
+        if not re.fullmatch(r"S\d{1,2}:[\w.:=() \-]{1,200}", key or ""):
+            raise ValueError("bad checklist key")
+        with self.lock:
+            if checked:
+                self.state["ticks"][key] = {"by": str(who or "someone")[:60], "at": time.time()}
+            else:
+                self.state["ticks"].pop(key, None)
+            self.save()
+
+    def set_auto(self, on):
+        with self.lock:
+            self.state["auto"] = bool(on)
+            self.save()
+            self.log("Asking Claude automatically: %s" % ("on" if on else "off"))
 
 
 def gala_path(root, rel):
@@ -1093,6 +1679,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- helpers
     def log_message(self, fmt, *args):
+        if len(args) > 1 and str(args[1]).startswith(("2", "3")) and str(args[0]).startswith("GET "):
+            return
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
 
     def _send(self, code, body=b"", ctype="application/json", extra=None):
@@ -1223,12 +1811,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
 
     # -- verbs
-    def _gala_root(self):
-        return getattr(self.server, "gala_root", None)
+
+    def _gala(self):
+        return getattr(self.server, "gala", None)
 
     def _gala_file(self, q):
-        root = self._gala_root()
-        p = gala_path(root, q.get("path")) if root else None
+        g = self._gala()
+        p = gala_path(g.root, q.get("path")) if g else None
         if not p:
             return self._json(404, {"error": "no such file in the data folder"})
         name = os.path.basename(p)
@@ -1236,25 +1825,26 @@ class Handler(BaseHTTPRequestHandler):
             head = f.read(2048)
         mime = guess_mime(name, head)
         low = name.lower()
-        if low.endswith((".hy3", ".cl2", ".ev3", ".csv", ".log", ".md", ".txt", ".json")):
-            mime = "text/plain" if not low.endswith(".json") else "application/json"
+        if low.endswith((".hy3", ".cl2", ".ev3", ".csv", ".log", ".md", ".txt")):
+            mime = "text/plain"
+        elif low.endswith(".json"):
+            mime = "application/json"
         quoted = urllib.parse.quote(name)
         headers = {"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
         if q.get("dl"):
             ctype = "application/octet-stream"
             headers["Content-Disposition"] = "attachment; filename*=UTF-8''%s" % quoted
         elif mime in ("text/html", "application/xhtml+xml"):
-            # Audit reports are HTML with their own scripts (filters, sorting). They run in a sandbox with
-            # their own empty origin: no access to the portal, no network except images/styles.
+            # Audit reports are HTML with their own scripts (filters, expand/collapse). They run in a sandbox with
+            # their own empty origin: no access to the portal, and no network apart from images and styles.
             ctype = "text/html; charset=utf-8"
             headers["Content-Disposition"] = "inline; filename*=UTF-8''%s" % quoted
             headers["Content-Security-Policy"] = ("sandbox allow-scripts allow-popups allow-modals allow-downloads; "
                                                   "default-src 'none'; script-src 'unsafe-inline'; "
                                                   "style-src 'unsafe-inline' https:; img-src data: blob: https:; "
                                                   "font-src data: https:; connect-src 'none'; form-action 'none'")
-        elif mime in INLINE_SAFE or is_text_mime(mime):
-            ctype = mime if mime in INLINE_SAFE else ("application/json" if mime == "application/json"
-                                                      else "text/plain; charset=utf-8")
+        elif mime in INLINE_SAFE or is_text_mime(mime) or mime == "application/json":
+            ctype = mime if mime in INLINE_SAFE or mime == "application/json" else "text/plain; charset=utf-8"
             headers["Content-Disposition"] = "inline; filename*=UTF-8''%s" % quoted
             if mime != "application/pdf":
                 headers["Content-Security-Policy"] = "sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'"
@@ -1273,11 +1863,17 @@ class Handler(BaseHTTPRequestHandler):
             shutil.copyfileobj(f, self.wfile, 65536)
 
     def _gala_upload(self, q):
-        root = self._gala_root()
-        if not root:
+        """POST /api/gala/upload?folder=inbox|S<n>/<folder>&filename=NAME, the file as the body."""
+        g = self._gala()
+        if not g:
             return self._json(400, {"error": "this portal has no data folder (--gala-data)"})
-        folder = GALA_KEYS.get(q.get("folder", ""))
-        if not folder:
+        folder = q.get("folder") or "inbox"
+        m = re.fullmatch(r"S(\d{1,2})/(\w+)", folder)
+        if folder == "inbox":
+            d = g.inbox
+        elif m and m.group(2) in SESSION_KEYS:
+            d = g.sdir(int(m.group(1)), m.group(2))
+        else:
             return self._json(400, {"error": "unknown folder"})
         name = safe_filename(q.get("filename") or "")
         if not name or name.startswith("."):
@@ -1288,20 +1884,14 @@ class Handler(BaseHTTPRequestHandler):
         if n > self.server.store.max_doc_bytes:
             self.close_connection = True
             return self._json(413, {"error": "file too large (max %d MB)" % (self.server.store.max_doc_bytes // 1048576)})
-        d = os.path.join(root, folder[1])
         os.makedirs(d, exist_ok=True)
-        dest = os.path.join(d, name)
-        if os.path.exists(dest) and not q.get("replace"):
-            for _ in self._chunks(n):
-                pass
-            return self._json(409, {"error": "exists", "name": name})
+        # Written under a dot name, so the inbox sorter doesn't pick it up half written.
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".upload-")
         try:
             with os.fdopen(fd, "wb") as f:
                 for chunk in self._chunks(n):
                     f.write(chunk)
-            if os.path.exists(dest):   # keep the previous copy next to it
-                os.replace(dest, os.path.join(d, ".%s.previous" % name))
+            dest = os.path.join(d, _unique(d, name))
             os.replace(tmp, dest)
         except Exception:
             try:
@@ -1309,7 +1899,38 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
             raise
-        return self._json(200, {"ok": True, "folder": folder[1], "name": name, "size": n})
+        if folder != "inbox":
+            g.log("%s uploaded to %s" % (os.path.basename(dest), folder), name=os.path.basename(dest), to=folder)
+        return self._json(200, {"ok": True, "folder": folder, "name": os.path.basename(dest), "size": n})
+
+    def _gala_post(self, path, q):
+        g = self._gala()
+        if not g:
+            return self._json(400, {"error": "no data folder"})
+        d = self._body(64 * 1024)
+        who = d.get("by") or q.get("who") or "someone"
+        try:
+            if path == "/api/gala/tick":
+                g.tick(str(d.get("key") or ""), bool(d.get("checked")), who)
+            elif path == "/api/gala/auto":
+                g.set_auto(bool(d.get("auto")))
+            elif path == "/api/gala/ask":
+                row = g.ask(str(d.get("key") or ""), who, force=True)
+                if not row:
+                    return self._json(409, {"error": "nothing to ask yet for that (its files aren't in)"})
+                return self._json(200, {"ok": True, "question": row["id"]})
+            elif path == "/api/gala/move":
+                g.move(str(d.get("path") or ""), int(d.get("session") or 0), str(d.get("folder") or ""))
+            elif path == "/api/gala/session":
+                n = max(g.sessions() or [0]) + 1
+                g.sdir(n)
+                g.log("Session %d added by %s" % (n, who))
+            else:
+                return self._json(404, {"error": "not found"})
+        except (ValueError, OSError) as e:
+            return self._json(400, {"error": str(e)})
+        return self._json(200, {"ok": True})
+
 
     def do_GET(self):
         path, q = self._parsed()
@@ -1324,12 +1945,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/":
                 return self._send(200, self._page(), "text/html")
             if path == "/health":
-                return self._json(200, {"ok": True, "version": VERSION, "gala": bool(self._gala_root())})
+                return self._json(200, {"ok": True, "version": VERSION, "gala": bool(self._gala())})
             if path == "/api/gala/overview":
-                root = self._gala_root()
-                if not root:
-                    return self._json(200, {"root": None})
-                return self._json(200, gala_overview(root))
+                g = self._gala()
+                return self._json(200, g.overview() if g else {"root": None})
             if path == "/api/gala/file":
                 return self._gala_file(q)
             if path == "/api/questions":
@@ -1384,6 +2003,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
+            if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session"):
+                return self._gala_post(path, q)
             if path == "/api/live":   # console snapshot from the board watcher
                 d = self._body(2 * 1024 * 1024)
                 text = str(d.get("text") or "")[-400000:]
@@ -1496,11 +2117,11 @@ def serve(args):
     srv.key = args.key
     srv.brand = args.name
     srv.accent = args.accent if re.fullmatch(r"#[0-9a-fA-F]{6}", args.accent or "") else "#3949ab"
-    srv.brand_dir = os.path.abspath(args.brand_dir) if getattr(args, 'brand_dir', None) else None
-    srv.gala_root = os.path.abspath(args.gala_data) if getattr(args, 'gala_data', None) else None
-    if srv.gala_root:
-        for f in GALA_FOLDERS:
-            os.makedirs(os.path.join(srv.gala_root, f[1]), exist_ok=True)
+    srv.brand_dir = os.path.abspath(args.brand_dir) if args.brand_dir else None
+    srv.gala = Gala(args.gala_data, args.inbox, srv.store) if args.gala_data else None
+    if srv.gala:
+        threading.Thread(target=srv.gala.run, daemon=True).start()
+        sys.stderr.write('Gala data: %s, inbox: %s\n' % (srv.gala.root, srv.gala.inbox))
     srv.page = render_page(srv.brand, srv.accent, args.terminal_url)
     sys.stderr.write("QA board v%s on http://%s:%d  (db: %s, docs: %s, max %s MB%s)\n" % (
         VERSION, args.host, args.port, args.db, srv.store.docdir, args.max_doc_mb,
@@ -1756,31 +2377,74 @@ body.termopen{overflow:hidden}
 .warnbox{margin-top:10px;border-left:3px solid var(--open);background:var(--drop);padding:10px 12px;border-radius:0 8px 8px 0;font-size:16.8px}
 .att{margin-top:8px;font-size:16.8px}.att a{margin-right:10px}
 a{color:var(--accent)}
-/* ---- Gala tab */
-.galahead h2{margin:0 0 2px;font-size:1.3em}
+/* ---- Gala and Checklist tabs */
+.galahead h2,.clhead h2{margin:0 0 2px;font-size:1.3em}
 .gh-top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start}
-.steps{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
-.steps button{display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:10px;text-align:left}
-.steps button b{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:var(--accent);color:#fff;font-size:.8em;flex:0 0 auto}
-.steps button small{display:block;color:var(--muted);font-size:.8em}
+.gh-right{text-align:right}
+.gauto{font-weight:600;display:inline-flex;gap:8px;align-items:center;cursor:pointer}
+.gauto input{width:20px;height:20px;accent-color:var(--accent)}
+.lnk{color:var(--accent);cursor:pointer;text-decoration:underline}
+.gdrop{margin-top:10px;padding:12px;font-size:.95em}
+.ginbox{padding:18px}
+.gdrop.over,.gfolder.over,.cl-row.over{outline:3px dashed var(--accent);outline-offset:-3px}
+.spills{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0 10px;align-items:center}
+.spills button{border-radius:999px;padding:4px 14px;font-weight:600}
+.spills button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.spills .meta{margin-left:6px}
 .gfolders{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:10px}
 .gfolder{margin:0}
-.gfolder.over{outline:3px dashed var(--accent);outline-offset:-3px}
 .gfolder h3{margin:0;font-size:1.05em;display:flex;justify-content:space-between;gap:8px;align-items:baseline}
 .gfolder h3 code{font-size:.75em;color:var(--muted);font-weight:400}
 .gfiles{list-style:none;margin:8px 0 0;padding:0;max-height:260px;overflow:auto}
 .gfiles li{display:flex;gap:8px;align-items:baseline;padding:3px 0;border-top:1px solid var(--line)}
-.gfiles li a{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gfiles li a:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .gfiles li .meta{flex:0 0 auto}
-.gdrop{margin-top:8px;padding:10px;font-size:.92em}
 .gbar{height:10px;border-radius:6px;background:var(--line);overflow:hidden;flex:1;min-width:120px}
 .gbar i{display:block;height:100%;background:var(--accent)}
 .gscan{display:flex;gap:12px;align-items:center;padding:6px 0;border-top:1px solid var(--line);flex-wrap:wrap}
 .gscan:first-of-type{border-top:0}
-.gscan .nm{flex:0 0 280px;font-weight:600}
+.gscan .nm{flex:0 0 300px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .gscan .ct{flex:0 0 auto;min-width:150px;text-align:right}
 .gscan .miss{flex-basis:100%;font-size:.85em}
 .gwarn{color:#b45309}
+.gstats{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.gstat{border:1px solid var(--line);border-radius:8px;padding:6px 12px;min-width:90px}
+.gstat b{display:block;font-size:1.4em}
+.gask{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.glog{list-style:none;margin:6px 0 0;padding:0;max-height:240px;overflow:auto;font-size:.92em}
+.glog li{padding:3px 0;border-top:1px solid var(--line);display:flex;gap:10px}
+.glog li .meta{flex:0 0 70px}
+.st{display:inline-block;font-size:.78em;font-weight:700;border-radius:999px;padding:1px 9px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.st.ready{border-color:#b45309;color:#b45309}
+.st.asked{border-color:var(--accent);color:var(--accent)}
+.st.audited{border-color:var(--ans);color:var(--ans)}
+.st.changed{border-color:#b45309;background:#b45309;color:#fff}
+/* checklist */
+.clhead .gbar{margin-top:10px;height:8px}
+.cl-sec{margin:14px 0 4px;font-size:.85em;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:700}
+.cl-row{display:grid;grid-template-columns:30px 1fr auto;gap:2px 12px;align-items:start;padding:9px 0;border-top:1px solid var(--line)}
+.cl-sec+.cl-row,.cl-sec+table{border-top:0}
+.cl-row input[type=checkbox],.cl-ev input[type=checkbox]{width:22px;height:22px;margin:2px 0 0;accent-color:var(--accent);cursor:pointer}
+.cl-row.done .cl-t,.cl-ev tr.done .evname{text-decoration:line-through;text-decoration-color:var(--muted);color:var(--muted)}
+.cl-t{font-weight:600}
+.cl-why{font-size:.9em;color:var(--muted)}
+.cl-f{font-size:.9em;margin-top:3px}
+.ok{color:var(--ans);font-weight:600}
+.no{color:var(--muted)}
+.cl-by{font-size:.8em;color:var(--muted)}
+.cl-act{display:flex;gap:8px;align-items:center;font-size:.88em}
+.cl-ev{width:100%;border-collapse:collapse;font-size:.93em}
+.cl-ev th{text-align:left;font-size:.8em;color:var(--muted);font-weight:600;padding:4px 6px;border-bottom:1px solid var(--line)}
+.cl-ev td{padding:6px;border-top:1px solid var(--line);vertical-align:top}
+.cl-ev td.c{text-align:center}
+.cl-ev .evname{font-weight:600}
+.cl-ev .sm{font-size:.85em;color:var(--muted)}
+.cl-ev button{padding:2px 8px;font-size:.85em}
+.tblwrap{overflow-x:auto}
+.spills button.on .meta{color:#fff;opacity:.85}
+.gfiles li select{flex:0 0 auto;width:auto;padding:2px 6px}
+.gfiles li button{flex:0 0 auto;padding:2px 10px}
+button:disabled{opacity:.45;cursor:not-allowed}
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -1798,20 +2462,26 @@ a{color:var(--accent)}
 <header><div class="brand"><img src="/favicon.svg" alt="" width="34" height="34"><h1>{BRAND_HTML}<span>Gala Audit Portal <small class="ver">v{VERSION}</small></span></h1></div>
 <button class="mini" id="mini" hidden title="Claude's console - open the Live view" aria-label="Open the Live view"><pre id="minipre"></pre><span class="led"></span></button>
 <label class="me">I am <select id="me"><option value="">choose…</option></select></label></header>
-<nav class="views" id="views"><button data-v="gala">Gala</button><button data-v="questions">Questions</button><button data-v="docs">Documents</button><button data-v="live">Live</button><button data-v="deploys">Deploys</button><button data-v="users">Users</button></nav>
+<nav class="views" id="views"><button data-v="gala">Gala</button><button data-v="checklist">Checklist</button><button data-v="questions">Questions</button><button data-v="docs">Documents</button><button data-v="live">Live</button><button data-v="deploys">Deploys</button><button data-v="users">Users</button></nav>
 <div class="deps" id="deps" hidden></div>
 </div>
 
 <section id="v-gala" hidden>
 <div class="card galahead">
  <div class="gh-top"><div><h2>Gala audit</h2><div class="meta" id="g-root"></div></div>
- <div class="meta" id="g-tools"></div></div>
- <div class="steps" id="g-steps"></div>
- <div class="meta" style="margin-top:8px">Each button opens the Ask form with a request for <b>gala-claude</b>; change it as you like, then Post.
- Claude picks it up straight away and answers on the Questions tab. Watch it work on the Live tab.</div>
+  <div class="gh-right"><label class="gauto"><input type="checkbox" id="g-auto"> Ask Claude automatically</label><div class="meta" id="g-tools"></div></div></div>
+ <div class="drop gdrop ginbox" id="g-inbox"><b>Drop the gala's files here</b> (lane sheet packs, DQ slips, Gen7 race PDFs, Meet Manager exports)
+  or <label class="lnk">choose files<input type="file" multiple hidden id="g-inboxfile"></label>.
+  <div class="meta">They go into the inbox and are sorted into their session within a few seconds. The scanner and the Gen7 computer can save straight into the inbox folder too.</div>
+  <div class="meta" data-gmsg></div></div>
 </div>
-<div class="card" id="g-progress"></div>
-<div class="gfolders" id="g-folders"></div>
+<div class="spills" id="g-sess"></div>
+<div id="g-session"></div>
+<div class="card" id="g-activity"></div>
+</section>
+<section id="v-checklist" hidden>
+<div class="spills" id="cl-sess"></div>
+<div id="cl-body"></div>
 </section>
 <section id="v-questions">
 <details class="card new" id="newbox"><summary>Ask a question</summary>
@@ -1906,99 +2576,168 @@ function size(n){return n<1024?n+' B':n<1048576?(n/1024).toFixed(0)+' KB':(n/104
 const me=()=>($('#me').value.trim().toLowerCase().replace(/\s+/g,'-')||'');
 $('#me').onchange=()=>{store('qa-me',$('#me').value);refresh()};
 
-// ---- Gala tab: the data folder, OCR progress and one-click requests for gala-claude
-const GALA_STEPS=[
- ['Check the files','what is here, what is missing',
-  'Check the gala files',
-  'Look through the data folder (data/) and tell me what is there for this gala: which scans, Meet Manager and Gen7 PDFs and meet files you found, how many pages each scan has, how much of the OCR cache is already done (run validate_cache.py), and what is missing before an audit can be run. Do not start transcribing yet.'],
- ['Read the lane sheets','gala-ocr skill',
-  'Transcribe the lane sheets',
-  'Use the gala-ocr skill to transcribe the lane sheet scan(s) in data/pdf/scanned into data/ocr. Skip pages that are already done. Report progress with deployment_progress (one step per event or per 10 pages), validate the cache when finished, and ask me on the board about anything you cannot read.'],
- ['Read the DQ slips','gala-ocr skill',
-  'Read the DQ slips',
-  'Use the gala-ocr skill to read the DQ slips scan in data/pdf/scanned into data/ocr (pair fronts and backs, one JSON per slip). Skip slips already done. Report progress with deployment_progress and ask me about anything unclear.'],
- ['Read the ETD programme','gala-ocr skill',
-  'Read the ETD programme',
-  'Use the gala-ocr skill to read the ETD programme scan in data/pdf/scanned into data/ocr. Skip pages already done.'],
- ['Gen7 session report','gen7-report skill',
-  'Extract the Gen7 session report',
-  'Use the gen7-report skill to turn the Colorado Gen7 session report PDF in data/pdf/original into JSON/CSV in data/reports, and summarise what it contains (sessions, events, heats).'],
- ['Assign DQ codes','gala-audit skill',
-  'Assign the DQ codes',
-  'Use the gala-audit skill to assign FINA DQ codes to the DQ slips (write data/ocr/dq-codes.json). Ask me on the board about any slip where the code is not clear.'],
- ['Build the audit report','gala-audit skill',
-  'Build the audit report',
-  'Use the gala-audit skill to build the HTML audit report from data/ocr and the Gen7 session report, into data/reports/ (name it after the gala and today\'s date). Include the DQ codes and the scans. Then summarise the findings in your answer and link the report.'],
- ['Write the merged results','gala-audit skill',
-  'Write the merged results .hy3',
-  'Use the gala-audit skill (merge_results.py) to write a merged results .hy3 from the OCR, the Gen7 report and the entries/results .hy3 in data/meet, into data/reports/. Tell me exactly what was changed and anything you were unsure of.'],
- ['Final audit','gala-audit skill',
-  'Run the final audit',
-  'Use the gala-audit skill (final_audit.py) to run the final audit of the merged results against the scans and Gen7, write the report to data/reports/ and summarise anything that still needs a person.'],
-];
-function galaAsk(i){
- const s=GALA_STEPS[i];showView('questions');const nb=$('#newbox');nb.open=true;
- $('#title').value=s[2];$('#qbody').value=s[3];draftSet('ask-title',s[2]);draftSet('ask-body',s[3]);
- const c=USERS.find(u=>u.name==='gala-claude');if(c){$('#to').value=c.name;toTouched=true;renderToPills()}
- nb.scrollIntoView({behavior:'smooth',block:'start'});$('#title').focus()}
+// ---- Gala and Checklist tabs: the gala's files by session, sorted from the inbox; per-event progress; ticks
+let GALA=null,galaSig='',GSESS=+(store('qa-gsess')||0);
 function galaHref(rel,dl){const u=url('/api/gala/file');u.searchParams.set('path',rel);if(dl)u.searchParams.set('dl','1');return u.toString()}
-let galaSig='';
+async function galaPost(path,body){return api(path,Object.assign({by:me()||'someone'},body||{}))}
+const ST_TXT={waiting:'waiting',ready:'ready',asked:'with Claude',audited:'audited',changed:'new files'};
+const FOLDER_TXT={meet:['Meet Manager files','Entries, merge results and final exports (.zip / .hy3)'],gen7:['Gen7 race PDFs','One PDF per race'],
+ scans:['Scans','Lane sheet packs (one per event), DQ slips, ETD programme'],ocr:['OCR (Claude)','JSON per lane sheet, DQ slip and ETD page; dq-codes.json'],
+ reports:['Reports (Claude)','Event and session audits, merge results .hy3, final audit']};
+function curSession(){if(!GALA||!GALA.sessions.length)return null;
+ return GALA.sessions.find(s=>s.n===GSESS)||GALA.sessions[GALA.sessions.length-1]}
 async function loadGala(){
- if(!$('#g-steps').childElementCount)$('#g-steps').innerHTML=GALA_STEPS.map((s,i)=>`<button type="button" data-step="${i}"><b>${i+1}</b><span>${esc(s[0])}<small>${esc(s[1])}</small></span></button>`).join('');
  let j;try{j=await api('/api/gala/overview')}catch(e){$('#g-root').textContent='Could not load the data folder: '+e.message;return}
- const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;
+ const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;GALA=j;
  if(!j.root){$('#g-root').textContent='This portal was started without a data folder (--gala-data).';return}
- $('#g-root').innerHTML='Data folder: <code>'+esc(j.root)+'</code>';
- const miss=Object.entries(j.tools||{}).filter(([k,v])=>!v).map(([k])=>k);
- $('#g-tools').innerHTML=miss.length?'<span class="gwarn">Missing: '+esc(miss.join(', '))+' (install poppler-utils)</span>':'poppler ✓';
- // progress
- const sc=j.scans||[];
- $('#g-progress').innerHTML='<h3 style="margin:0 0 6px">OCR progress</h3>'+(sc.length?sc.map(x=>{
-  const pct=x.pages?Math.round(100*x.done/x.pages):0;
-  return `<div class="gscan"><span class="nm">${esc(x.name)} <span class="meta">${x.kind==='dq'?'DQ slips':x.kind==='etd'?'ETD':'lane sheets'}</span></span>
+ const cs=curSession();if(cs)GSESS=cs.n;
+ renderGalaHead();renderPills('#g-sess');renderPills('#cl-sess');renderSession();renderActivity();renderChecklist()}
+function renderGalaHead(){
+ $('#g-root').innerHTML='Data folder: <code>'+esc(GALA.root)+'</code><br>Inbox: <code>'+esc(GALA.inbox)+'</code>'
+  +(GALA.waiting.length?` · <span class="gwarn">${GALA.waiting.length} file${GALA.waiting.length>1?'s':''} arriving</span>`:'');
+ $('#g-auto').checked=!!GALA.auto;
+ const miss=Object.entries(GALA.tools||{}).filter(([k,v])=>!v).map(([k])=>k);
+ $('#g-tools').innerHTML=miss.length?'<span class="gwarn">Missing: '+esc(miss.join(', '))+' (install poppler-utils)</span>':'poppler ✓'}
+function renderPills(sel){
+ const box=$(sel);if(!GALA.sessions.length){box.innerHTML='<span class="meta">No sessions yet: drop the first session\'s entries export or any gala file above.</span> <button type="button" data-newsess>+ Session</button>';return}
+ box.innerHTML=GALA.sessions.map(s=>{const a=s.events.filter(e=>e.status==='audited').length;
+  return `<button type="button" data-sess="${s.n}" class="${s.n===GSESS?'on':''}">Session ${s.n} <span class="meta">${a}/${s.events.length}</span></button>`}).join('')
+  +'<button type="button" data-newsess title="Add an empty session">+</button>'}
+function fileList(s,key,files,limit){
+ if(!files.length)return '<div class="meta" style="margin-top:8px">Empty.</div>';
+ return '<ul class="gfiles">'+files.filter(f=>!f.dir).slice(0,limit||500).map(f=>{const rel='sessions/S'+s.n+'/'+key+'/'+f.name;
+  return `<li><a href="${esc(galaHref(rel))}" target="_blank" rel="noopener" title="${esc(f.name)}">${esc(f.name)}</a><span class="meta">${size(f.size)} · ${agoShort(f.mtime)}</span><a class="meta" href="${esc(galaHref(rel,1))}" title="Download">⤓</a></li>`}).join('')+'</ul>'}
+function renderSession(){
+ const s=curSession(),box=$('#g-session');if(!s){box.innerHTML='';return}
+ const c=k=>s.events.filter(e=>e.status===k).length;
+ const stat=(n,t)=>`<div class="gstat"><b>${n}</b><span class="meta">${t}</span></div>`;
+ const scans=s.scans.length?s.scans.map(x=>{const pct=x.pages?Math.round(100*x.done/x.pages):0;
+  const what=x.kind==='dq'?'DQ slips':x.kind==='etd'?'ETD':'lane sheets'+(x.event!=null?' · event '+x.event:'');
+  return `<div class="gscan"><span class="nm" title="${esc(x.name)}">${esc(x.name)} <span class="meta">${esc(what)}</span></span>
    <span class="gbar" title="${pct}%"><i style="width:${pct}%"></i></span>
-   <span class="ct">${x.pages==null?'? pages':`${x.done} / ${x.pages} pages`} · ${x.files} JSON${x.review?` · <span class="gwarn">${x.review} to check</span>`:''}${x.bad?` · <span class="gwarn">${x.bad} unreadable</span>`:''}</span>
+   <span class="ct">${x.pages==null?'? pages':`${x.done} / ${x.pages} pages`}${x.review?` · <span class="gwarn">${x.review} to check</span>`:''}${x.bad?` · <span class="gwarn">${x.bad} unreadable</span>`:''}</span>
    ${x.missingCount&&x.done?`<span class="miss meta">Not done yet: pages ${esc(x.missing.join(', '))}${x.missingCount>x.missing.length?' …':''}</span>`:''}</div>`}).join('')
-  :'<div class="meta">Drop the scanned PDFs (Lane Sheets.pdf, DQs.pdf, ETD.pdf) on <b>Scanned paper</b> below.</div>');
- // folders
- $('#g-folders').innerHTML=j.folders.map(f=>{
-  const files=f.files.filter(x=>!x.dir);
-  const list=files.length?'<ul class="gfiles">'+files.map(x=>{const rel=f.path+'/'+x.name;
-   return `<li><a href="${esc(galaHref(rel))}" target="_blank" rel="noopener" title="${esc(x.name)}">${esc(x.name)}</a><span class="meta">${size(x.size)} · ${agoShort(x.mtime)}</span><a class="meta" style="flex:0 0 auto" href="${esc(galaHref(rel,1))}" title="Download">⤓</a></li>`}).join('')+'</ul>'
-   :'<div class="meta" style="margin-top:8px">Empty.</div>';
-  const more=f.key==='ocr'&&f.count>files.length?`<div class="meta">Newest ${files.length} of ${f.count} files.</div>`:'';
-  const drop=f.key==='ocr'?'':`<div class="drop gdrop">Drop files here, or <label style="color:var(--accent);cursor:pointer;text-decoration:underline">choose files<input type="file" multiple hidden data-gup="${esc(f.key)}"${f.types?` accept="${esc(f.types)}"`:''}></label><div class="meta" data-gmsg></div></div>`;
-  return `<div class="card gfolder" data-gfolder="${esc(f.key)}"><h3><span>${esc(f.title)} <span class="meta">(${f.count})</span></span><code>data/${esc(f.path)}</code></h3>
-   <div class="meta">${esc(f.hint)}</div>${list}${more}${drop}</div>`}).join('')}
+  :'<div class="meta">No scans in this session yet.</div>';
+ const ent=s.meet.entries.length?`${s.expected.events} events, ${s.expected.heats} heats expected (from ${esc(s.meet.entries[s.meet.entries.length-1])})`:'<span class="gwarn">No entries export yet</span>: events are only known as their files arrive.';
+ box.innerHTML=`<div class="card"><div class="gh-top"><div><h3 style="margin:0">Session ${s.n}</h3><div class="meta">${ent} · ${s.races} Gen7 race${s.races===1?'':'s'}</div></div>
+   <a href="#checklist" data-goto="checklist">Checklist →</a></div>
+  <div class="gstats">${stat(c('audited'),'audited')}${stat(c('asked'),'with Claude')}${stat(c('ready'),'ready')}${stat(c('waiting'),'waiting')}${c('changed')?stat(c('changed'),'new files'):''}</div>
+  <h4 style="margin:10px 0 2px">OCR progress</h4>${scans}
+  <div class="gask"><span class="meta" style="align-self:center">Ask Claude:</span>
+   <button type="button" data-ask="S${s.n}:check">Check the files</button>
+   <button type="button" data-ask="S${s.n}:merge"${s.meet.results.length&&s.meet.entries.length?'':' disabled title="Needs the entries and merge results exports"'}>Merge results</button>
+   <button type="button" data-ask="S${s.n}:final"${s.meet.final.length&&s.merged.length?'':' disabled title="Needs our merge results and Meet Manager\'s final export"'}>Final audit</button>
+   <span class="meta" data-askmsg></span></div></div>
+  <div class="gfolders">${Object.keys(FOLDER_TXT).map(k=>{const f=s.folders[k]||[];const mine=k==='ocr'||k==='reports';
+   return `<div class="card gfolder" data-gfolder="S${s.n}/${k}"><h3><span>${esc(FOLDER_TXT[k][0])} <span class="meta">(${k==='ocr'?s.ocrCount:f.filter(x=>!x.dir).length})</span></span><code>sessions/S${s.n}/${k}</code></h3>
+    <div class="meta">${esc(FOLDER_TXT[k][1])}</div>${fileList(s,k,f)}${k==='ocr'&&s.ocrCount>f.length?`<div class="meta">Newest ${f.length} of ${s.ocrCount}.</div>`:''}
+    ${mine?'':`<div class="drop gdrop">Drop files here, or <label class="lnk">choose files<input type="file" multiple hidden data-gup="S${s.n}/${k}"></label><div class="meta" data-gmsg></div></div>`}</div>`}).join('')}</div>`}
+function renderActivity(){
+ const un=GALA.unsorted.filter(f=>!f.dir);
+ const opts=GALA.sessions.map(s=>`<option value="${s.n}">Session ${s.n}</option>`).join('');
+ const unsorted=un.length?`<h3 style="margin:0 0 4px" class="gwarn">Not sorted (${un.length})</h3><div class="meta">The portal couldn't tell what these are. Choose where each one goes.</div><ul class="gfiles">`
+  +un.map(f=>`<li><a href="${esc(galaHref('unsorted/'+f.name))}" target="_blank" rel="noopener">${esc(f.name)}</a>
+   <select data-mvs>${opts||'<option value="1">Session 1</option>'}</select><select data-mvf>${['scans','gen7','meet'].map(k=>`<option value="${k}">${k}</option>`).join('')}</select>
+   <button type="button" data-move="${esc('unsorted/'+f.name)}">Move</button></li>`).join('')+'</ul>':'';
+ const log=GALA.log.length?'<ul class="glog">'+GALA.log.slice(0,25).map(l=>`<li><span class="meta">${esc(agoShort(l.ts))}</span><span>${esc(l.text)}</span></li>`).join('')+'</ul>':'<div class="meta">Nothing yet.</div>';
+ $('#g-activity').innerHTML=unsorted+'<h3 style="margin:'+(un.length?'14px':'0')+' 0 4px">Activity</h3>'+log}
+function tickBox(key,label){const t=GALA.ticks[key];return `<input type="checkbox" data-tick="${esc(key)}" ${t?'checked':''} aria-label="Tick off: ${esc(label)}" title="${t?esc('Ticked by '+t.by+' · '+agoShort(t.at)):'Tick off when checked'}">`}
+function clRow(s,key,title,why,found,folder,claude){
+ const t=GALA.ticks[key];
+ const f=found&&found.length?'<span class="ok">✓</span> '+found.join(', '):`<span class="no">${claude?'Not made yet':'Not in yet'}</span>`;
+ return `<div class="cl-row${t?' done':''}"${folder?` data-cldrop="${esc(folder)}"`:''}>${tickBox(key,title)}
+  <div><div class="cl-t">${esc(title)}</div><div class="cl-why">${why}</div><div class="cl-f">${f}</div>
+  ${t?`<div class="cl-by">Ticked by ${esc(t.by)} · ${esc(agoShort(t.at))}</div>`:''}<div class="meta" data-gmsg></div></div>
+  <div class="cl-act">${folder?`<label class="lnk">add file<input type="file" multiple hidden data-gup="${esc(folder)}"></label>`:''}</div></div>`}
+function evRange(evs){const out=[];for(let i=0;i<evs.length;i++){let j=i;while(j+1<evs.length&&evs[j+1]===evs[j]+1)j++;out.push(j>i?evs[i]+'–'+evs[j]:''+evs[i]);i=j}return out.join(', ')}
+function link(s,sub,name){return `<a href="${esc(galaHref('sessions/S'+s.n+'/'+sub+'/'+name))}" target="_blank" rel="noopener">${esc(name)}</a>`}
+function renderChecklist(){
+ const s=curSession(),box=$('#cl-body');
+ if(!s){box.innerHTML='<div class="card meta">No sessions yet. Drop the session\'s Meet Manager entries export on the Gala tab (or in the inbox folder) to start.</div>';return}
+ const keys=['entries','lanesprint',...s.events.map(e=>'e'+e.event),'dq','etd','codes','mmresults','merged','mmfinal','final'].map(k=>'S'+s.n+':'+k);
+ const ticked=keys.filter(k=>GALA.ticks[k]).length,pct=Math.round(100*ticked/keys.length);
+ const dq=s.scans.filter(x=>x.kind==='dq'),etd=s.scans.filter(x=>x.kind==='etd');
+ const ev=s.events.length?`<div class="tblwrap"><table class="cl-ev"><tr><th></th><th>Event</th><th class="c">Printed</th><th>Lane sheets</th><th class="c">Gen7 heats</th><th class="c">OCR lanes</th><th>Audit</th><th>Status</th><th></th></tr>`
+  +s.events.map(e=>{const key='S'+s.n+':e'+e.event,t=GALA.ticks[key];
+   const g7=e.heats?`${e.gen7.length}/${e.heats}`:(e.gen7.length||'–');
+   return `<tr class="${t?'done':''}" data-cldrop="S${s.n}/scans">
+    <td>${tickBox(key,'Event '+e.event)}</td>
+    <td><span class="evname">Event ${e.event}</span>${e.desc?`<div class="sm">${esc(e.desc)}</div>`:''}${!e.expected&&s.meet.entries.length?'<div class="sm gwarn">not in the entries</div>':''}${t?`<div class="sm">ticked by ${esc(t.by)}</div>`:''}</td>
+    <td class="c">${e.printed.length?'<span class="ok" title="'+esc(e.printed.join(', '))+'">✓</span>':'<span class="no" title="No printed lane sheets for this event">–</span>'}</td>
+    <td>${e.packs.length?e.packs.map(p=>link(s,'scans',p)).join('<br>'):'<span class="no">–</span>'}</td>
+    <td class="c">${g7}${e.gen7Missing.length&&e.gen7.length?`<div class="sm">missing ${esc(e.gen7Missing.join(', '))}</div>`:''}</td>
+    <td class="c">${e.ocrLanes?e.ocrLanes+(e.lanes?'/'+e.lanes:''):'–'}</td>
+    <td>${e.report?link(s,'reports',e.report):'–'}</td>
+    <td><span class="st ${e.status}">${esc(ST_TXT[e.status]||e.status)}</span></td>
+    <td><button type="button" data-ask="${key}" ${e.packs.length?'':'disabled title="No lane sheet pack yet"'}>${e.asked?'Ask again':'Ask Claude'}</button></td></tr>`}).join('')+'</table></div>'
+  :'<div class="meta" style="padding:8px 0">No events yet. They come from the entries export, or appear as lane sheet packs and Gen7 races arrive.</div>';
+ const scanFound=list=>list.map(x=>link(s,'scans',x.name)+` <span class="meta">(${x.done}/${x.pages??'?'} pages read)</span>`);
+ box.innerHTML=`<div class="card clhead"><div class="gh-top"><div><h2>Session ${s.n} checklist</h2>
+   <div class="meta">What the session's audit needs, in order. Files are found automatically when they arrive; tick each item once you've checked it. Ticks are shared.</div></div>
+   <div style="font-weight:600;white-space:nowrap">${ticked} of ${keys.length} ticked</div></div><div class="gbar"><i style="width:${pct}%"></i></div></div>
+  <div class="card">
+  <div class="cl-sec">Start of the session</div>
+  ${clRow(s,'S'+s.n+':entries','Meet entries export','From Meet Manager, for this session: the events, heats and lanes to expect (<code>Meet Entries-…zip</code> or its <code>Hfile…hy3</code>).',
+    s.meet.entries.map(n=>link(s,'meet',n)+(s.expected.events?` <span class="meta">(${s.expected.events} events, ${s.expected.heats} heats)</span>`:'')),'S'+s.n+'/meet')}
+  ${clRow(s,'S'+s.n+':lanesprint','Printed lane sheets (Meet Manager)','The lane sheet PDF Meet Manager printed for the session (not the scan). Claude copies the names, ages, teams and seed times from it, which is much more accurate than reading them off the scans. Bring it in before the first event.',
+    s.lanePrints.map(p=>link(s,'meet',p.name)+` <span class="meta">(${p.sheets} sheet${p.sheets===1?'':'s'}, event${p.events.length===1?'':'s'} ${esc(evRange(p.events))})</span>`),'S'+s.n+'/meet')}
+  <div class="cl-sec">Each event, as it is swum</div>
+  <div class="meta" style="margin-bottom:4px">An event is <b>ready</b> when its lane sheet pack and every heat's Gen7 race PDF are in${GALA.auto?'; Claude is then asked to transcribe and audit it':''}. Drop a lane sheet pack on an event to add it.</div>
+  ${ev}
+  <div class="cl-sec">During and after the session</div>
+  ${clRow(s,'S'+s.n+':dq','DQ slips','The referees\' DQ slips, scanned (name the file with "DQ"). Claude reads each batch as it arrives.',scanFound(dq),'S'+s.n+'/scans')}
+  ${clRow(s,'S'+s.n+':etd','ETD programme','The programme with the Gen7 race numbers written by each heat (name the file with "ETD"). Needed for combined events and re-started heats.',scanFound(etd),'S'+s.n+'/scans')}
+  ${clRow(s,'S'+s.n+':codes','DQ codes','Each slip\'s FINA code, given by Claude; codes it wasn\'t sure of need the referee\'s OK.',s.dqCodes?[link(s,'ocr','dq-codes.json')]:[],null,true)}
+  ${clRow(s,'S'+s.n+':mmresults','Meet Manager merge results export','Exported from Meet Manager for this session (its header and layout are copied).',s.meet.results.map(n=>link(s,'meet',n)),'S'+s.n+'/meet')}
+  ${clRow(s,'S'+s.n+':merged','Merged results for Meet Manager','Written by Claude once every event is audited and the merge results export is in: the audited results to import.',s.merged.map(n=>link(s,'reports',n)).concat(s.sessionReport?['session report: '+link(s,'reports',s.sessionReport)]:[]),null,true)}
+  ${clRow(s,'S'+s.n+':mmfinal','Final merge results export','Exported from Meet Manager after the audited results were imported and finalised (name it with "final").',s.meet.final.map(n=>link(s,'meet',n)),'S'+s.n+'/meet')}
+  ${clRow(s,'S'+s.n+':final','Final audit report','Written by Claude: every change made by hand in Meet Manager.',s.finalReports.map(n=>link(s,'reports',n)),null,true)}
+  </div>`}
 async function galaUpload(folder,files,card){
  const msg=card&&card.querySelector('[data-gmsg]');const say=t=>{if(msg)msg.textContent=t};
  for(const f of files){
   say('Uploading '+f.name+'…');
-  const send=async rep=>{const u=url('/api/gala/upload');u.searchParams.set('folder',folder);u.searchParams.set('filename',f.name);if(rep)u.searchParams.set('replace','1');
-   return fetch(u,{method:'POST',body:f})};
-  let r=await send(false);
-  if(r.status===409){if(!confirm(f.name+' is already there. Replace it? (The old copy is kept as a hidden .previous file.)')){say('Skipped '+f.name);continue}r=await send(true)}
-  const jj=await r.json().catch(()=>({}));
-  if(!r.ok){say('Could not upload '+f.name+': '+(jj.error||r.status));return}
- }
- say('Uploaded '+files.length+' file'+(files.length>1?'s':'')+'.');galaSig='';loadGala()}
-$('#g-steps').onclick=e=>{const b=e.target.closest('[data-step]');if(b)galaAsk(+b.dataset.step)};
-$('#g-folders').addEventListener('change',e=>{const i=e.target.closest('[data-gup]');if(i&&i.files.length)galaUpload(i.dataset.gup,[...i.files],i.closest('.gfolder'))});
-$('#g-folders').addEventListener('dragover',e=>{const c=e.target.closest('.gfolder');if(!c||c.dataset.gfolder==='ocr')return;e.preventDefault();c.classList.add('over')});
-$('#g-folders').addEventListener('dragleave',e=>{const c=e.target.closest('.gfolder');if(c&&!c.contains(e.relatedTarget))c.classList.remove('over')});
-$('#g-folders').addEventListener('drop',e=>{const c=e.target.closest('.gfolder');if(!c||c.dataset.gfolder==='ocr')return;e.preventDefault();c.classList.remove('over');
- const fs=[...(e.dataTransfer.files||[])];if(fs.length)galaUpload(c.dataset.gfolder,fs,c)});
+  const u=url('/api/gala/upload');u.searchParams.set('folder',folder);u.searchParams.set('filename',f.name);
+  const r=await fetch(u,{method:'POST',body:f});const jj=await r.json().catch(()=>({}));
+  if(!r.ok){say('Could not upload '+f.name+': '+(jj.error||r.status));return}}
+ say(folder==='inbox'?`Uploaded ${files.length} file${files.length>1?'s':''}: sorting…`:`Uploaded ${files.length} file${files.length>1?'s':''}.`);
+ galaSig='';loadGala();if(folder==='inbox')setTimeout(()=>{galaSig='';loadGala()},9000)}
+function galaClicks(e){
+ const sb=e.target.closest('[data-sess]');if(sb){GSESS=+sb.dataset.sess;store('qa-gsess',GSESS);galaSig='';loadGala();return}
+ if(e.target.closest('[data-newsess]')){galaPost('/api/gala/session').then(()=>{GSESS=(GALA&&GALA.sessions.length?Math.max(...GALA.sessions.map(s=>s.n)):0)+1;store('qa-gsess',GSESS);galaSig='';loadGala()});return}
+ const go=e.target.closest('[data-goto]');if(go){e.preventDefault();showView(go.dataset.goto);return}
+ const ab=e.target.closest('[data-ask]');if(ab){ab.disabled=true;
+  galaPost('/api/gala/ask',{key:ab.dataset.ask}).then(j=>{ab.textContent='Asked (#'+j.question+')';galaSig='';setTimeout(loadGala,1500)})
+   .catch(err=>{ab.disabled=false;alert(err.message)});return}
+ const mv=e.target.closest('[data-move]');if(mv){const li=mv.closest('li');
+  galaPost('/api/gala/move',{path:mv.dataset.move,session:+li.querySelector('[data-mvs]').value,folder:li.querySelector('[data-mvf]').value})
+   .then(()=>{galaSig='';loadGala()}).catch(err=>alert(err.message))}}
+function galaChange(e){
+ const up=e.target.closest('[data-gup]');if(up&&up.files.length){galaUpload(up.dataset.gup,[...up.files],up.closest('[data-gfolder],.cl-row,tr,.drop')||up.parentElement);return}
+ const tk=e.target.closest('[data-tick]');if(tk){galaPost('/api/gala/tick',{key:tk.dataset.tick,checked:tk.checked}).then(()=>{galaSig='';loadGala()})
+  .catch(err=>{tk.checked=!tk.checked;alert('Could not save: '+err.message)})}}
+for(const sec of ['#v-gala','#v-checklist']){const el=$(sec);el.addEventListener('click',galaClicks);el.addEventListener('change',galaChange);
+ el.addEventListener('dragover',e=>{const c=e.target.closest('[data-gfolder],[data-cldrop],#g-inbox');if(!c)return;e.preventDefault();c.classList.add('over')});
+ el.addEventListener('dragleave',e=>{const c=e.target.closest('[data-gfolder],[data-cldrop],#g-inbox');if(c&&!c.contains(e.relatedTarget))c.classList.remove('over')});
+ el.addEventListener('drop',e=>{const c=e.target.closest('[data-gfolder],[data-cldrop],#g-inbox');if(!c)return;e.preventDefault();c.classList.remove('over');
+  const fs=[...(e.dataTransfer.files||[])];if(!fs.length)return;
+  const folder=c.id==='g-inbox'?'inbox':(c.dataset.gfolder||c.dataset.cldrop);
+  if(/\/(ocr|reports)$/.test(folder)){alert('That folder is written by Claude. Drop the file on the inbox instead.');return}
+  galaUpload(folder,fs,c)})}
+$('#g-inboxfile').addEventListener('change',e=>{if(e.target.files.length)galaUpload('inbox',[...e.target.files],$('#g-inbox'))});
+$('#g-auto').addEventListener('change',e=>galaPost('/api/gala/auto',{auto:e.target.checked}).then(()=>{galaSig='';loadGala()}));
+setInterval(()=>{if(!document.hidden&&(view==='gala'||view==='checklist'))loadGala()},4000);
 
 // ---- views
-let view=['#gala','#questions','#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'gala');
+let view=['#gala','#checklist','#questions','#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'gala');
 // ?me=NAME (from start-portal.sh) picks "I am" the first time
 {const m=new URLSearchParams(location.search).get('me');if(m&&!store('qa-me'))store('qa-me',m)}
 function showView(v){view=v;store('qa-view',v);if(v!=='deploys')focusDep=null;
  document.querySelectorAll('#views button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
- $('#v-gala').hidden=v!=='gala';$('#v-questions').hidden=v!=='questions';$('#v-docs').hidden=v!=='docs';$('#v-live').hidden=v!=='live';$('#v-users').hidden=v!=='users';$('#v-deploys').hidden=v!=='deploys';refresh()}
+ $('#v-gala').hidden=v!=='gala';$('#v-checklist').hidden=v!=='checklist';$('#v-questions').hidden=v!=='questions';$('#v-docs').hidden=v!=='docs';$('#v-live').hidden=v!=='live';$('#v-users').hidden=v!=='users';$('#v-deploys').hidden=v!=='deploys';refresh()}
 $('#views').onclick=e=>{const b=e.target.closest('button');if(b&&b.dataset.v)showView(b.dataset.v)};
 $('#mini').onclick=()=>{showView('live');window.scrollTo(0,0)};
-function refresh(){loadUsers();view==='gala'?loadGala():view==='docs'?loadDocs():view==='live'?loadLive():view==='users'?null:view==='deploys'?loadDeps():load()}
+function refresh(){loadUsers();(view==='gala'||view==='checklist')?loadGala():view==='docs'?loadDocs():view==='live'?loadLive():view==='users'?null:view==='deploys'?loadDeps():load()}
 setInterval(()=>{if(!document.hidden)loadLive()},2000);
 
 // ---- live console (sent by the board watcher on the server, when it runs with --live)
@@ -2542,8 +3281,9 @@ def main():
     s.add_argument("--max-doc-mb", type=float, default=20, help="largest document accepted (default 20)")
     s.add_argument("--name", default="CGA Gala Audit", help='board name shown on the page, e.g. "Acme Web App"')
     s.add_argument("--accent", default="#cd2529", help="accent colour, e.g. #7a4cab")
-    s.add_argument("--brand-dir", default=None, help="folder with brand.css, logo and fonts (default: brand/ next to the docs)")
-    s.add_argument("--gala-data", default=None, help="the Gala data folder shown on the Gala tab")
+    s.add_argument("--gala-data", default=None, help="the gala's data folder (sessions/, inbox/, state.json)")
+    s.add_argument("--inbox", default=None, help="folder new gala files arrive in (default: DATA/inbox)")
+    s.add_argument("--brand-dir", default=None, help="folder with brand.css, logo and fonts")
     s.add_argument("--terminal-url", default="", help="where browsers reach this board's Claude Code web terminal, "
                                                       "e.g. http://127.0.0.1:17681 (the SSH tunnel)")
     b = sub.add_parser("bridge", help="stdio<->HTTP MCP bridge for Claude Desktop")

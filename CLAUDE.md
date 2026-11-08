@@ -7,34 +7,56 @@ Use the **gala-ocr plugin's skills** for the actual work:
 | Skill | For |
 |---|---|
 | `gala-ocr` | Transcribing the scans: lane sheets, DQ slips (front + back) and the ETD programme, one JSON per page/slip |
-| `gen7-report` | Reading the Colorado Gen7 session report PDF into JSON/CSV |
+| `gen7-report` | Reading Gen7's race PDFs (a session's folder of them) into JSON/CSV |
 | `gala-audit` | DQ codes (`dq-codes.json`), the HTML audit report, the merged results `.hy3`, and the final audit |
 
 Load the skill before you start a task, and follow it; it has the file formats and the scripts.
 If the skills are missing, tell the person on the portal: `/plugin install gala-ocr@gala-ai-plugins`.
 
-## The data folder
+## The gala runs while you work
 
-Everything for the gala is in `data/` (the portal's Gala tab shows it, and people drop files there):
+The portal runs **during the gala**. Files arrive as the gala goes on, in an inbox folder, and the portal sorts
+each one into its session:
 
-| Folder | What | Skill default it replaces |
+| Folder | What | Who writes it |
 |---|---|---|
-| `data/pdf/scanned/` | The scans: `Lane Sheets.pdf`, `DQs.pdf`, `ETD.pdf` (names can differ) | `pdf/scanned/` |
-| `data/pdf/original/` | The Meet Manager print and the Gen7 session report (`*Session*.pdf`) | `pdf/original/` |
-| `data/meet/` | Meet Manager entries/results `.hy3` (or the `.zip` they came in) | |
-| `data/ocr/` | **Output** of gala-ocr (the OCR cache), plus `dq-codes.json` | `data/ocr/` |
-| `data/reports/` | **Output**: audit reports (HTML), merged `.hy3`, CSV/JSON | |
+| `data/sessions/S<n>/meet/` | Meet Manager files: the session's **entries export** (`Meet Entries-…zip` / `Hfile…hy3`), the **merge results export**, the **final** merge results export, the **printed lane sheets** (Meet Manager's PDF, not a scan) and other prints | people |
+| `data/sessions/S<n>/gen7/` | **Gen7 race PDFs**, one per race (a reprint replaces the earlier copy) | people |
+| `data/sessions/S<n>/scans/` | **Lane sheet packs, one per event** (`Event 03 Lane Sheets.pdf`), DQ slip batches (`DQ…`), the ETD programme (`ETD…`) | people |
+| `data/sessions/S<n>/ocr/` | Your gala-ocr output for the session, and `dq-codes.json` | **you** |
+| `data/sessions/S<n>/reports/` | Your reports: `Event NN audit.html`, `Session N audit.html`, the merge results `.hy3`, the final audit | **you** |
 
-So whenever a skill names its default paths, use these instead. Never write into `data/pdf/` or `data/meet/`;
-those are the originals. Never delete files in `data/`; write a new file (e.g. `...-v2.html`) instead.
+Use these paths instead of the skills' defaults (`pdf/scanned`, `data/ocr`, ...). Use one session's folders
+together: its `ocr`, its `gen7` folder (give the **folder** to the scripts: the plugin reads race-by-race PDFs,
+version 1.6.0 or later) and `--scans data/sessions/S<n>/scans` so the reports embed the scanned pages.
+Never write into `meet/`, `gen7/` or `scans/`, and never move or delete files there; the portal does the sorting.
+Folders called `.replaced` hold old copies; ignore them.
 
-Typical order: check files → lane sheets → DQ slips → ETD → Gen7 report → DQ codes → audit report →
-(the referee fixes things in Meet Manager) → merged results `.hy3` → final audit. Start every OCR job by
-listing `data/ocr/` and skipping pages that are done; run the skill's `validate_cache.py` at the end.
+When the session's **printed lane sheets** are in `meet/`, always take the printed fields (names, ages, teams,
+seed times, heats) from them with gala-ocr's `original_sheets.py`, and read only the handwriting off the scans.
+The event questions name the print to use.
 
-Name reports after the gala and date, e.g. `data/reports/2026-11-08 Gala audit.html`. In answers, link a
-report as `[the audit report](/api/gala/file?path=reports/NAME.html)` (spaces as `%20`) so it opens from
-the portal.
+**The portal asks you for the work, as questions on the board** (when "Ask Claude automatically" is on):
+
+- **An event is ready** (its lane sheet pack and every heat's Gen7 race are in): transcribe the pack, audit that
+  event (`audit_report.py … --events N`), update the session report (`--events` = every event transcribed so far
+  in the session), and answer with what the officials should look at **now**, while they are still at the pool.
+  Be quick and short: one event at a time, as they come.
+- **"New files, audit it again"**: a pack was rescanned (its old OCR has been set aside) or a Gen7 race reprinted.
+- **DQ slips** or **the ETD programme** arrived: read them, give DQ codes, update the session report.
+- **Merge results** (once every event is audited and Meet Manager's merge results export is in) and the
+  **final audit** (once the final export is in), per session.
+
+The questions give the exact commands. If several are waiting, do events in event order first. Events are
+numbered across the meet, so "event 12" is unique; heats come from the entries export.
+
+The portal's **Checklist** tab shows, per session, each event's lane sheets, Gen7 heats, OCR and audit, and the
+session's DQ slips, ETD, merge results and final audit. People tick items there; the ticks are in
+`data/state.json` (`GET /api/gala/overview` returns all of it; don't edit the file). When asked to check the
+files, say what is missing per event.
+
+In answers, link a report as `[Event 3 audit](/api/gala/file?path=sessions/S1/reports/Event%2003%20audit.html)`
+so it opens from the portal.
 
 ## The portal
 
@@ -43,12 +65,13 @@ the portal.
 - Answers stand on their own: what you did, which files you wrote, what you could not read, what needs a
   person (and on which page). Keep long tables in the report, not in the answer.
 - When you cannot read something on a scan (a time, a name, a DQ reason), ask on the portal with
-  `post_question` to the person who asked (not `anyone`), say which file and page, and carry on with the rest.
+  `post_question` to the person who asked (for work the portal itself asked for, author `portal`, use
+  `anyone`), say which file and page, and carry on with the rest.
   You can attach a crop of the page: render it with pdftoppm and `upload_document` it, then show it in the
   question as `![page 12](/api/docs/ID/view)`.
-- Long jobs (a scan of 100+ pages, the audit): report progress with `deployment_progress` so a bar shows on
-  every page of the portal. id `ocr-YYYYMMDD-HHMM` / `audit-YYYYMMDD-HHMM`, target the gala, one step per
-  event or per batch of pages, the whole state each time, status done/failed at the end.
+- Long jobs (a big DQ batch, the session's merge results): report progress with `deployment_progress` so a bar
+  shows on every page of the portal. id `s1-merge-HHMM` etc., target the session, the whole state each time,
+  status done/failed at the end. A single event doesn't need one.
 - If you need someone at the keyboard (a sign-in, a permission prompt), call `needs_attention`.
 
 ## Privacy
