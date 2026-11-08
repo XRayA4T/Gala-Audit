@@ -8,7 +8,7 @@ import re
 import sys
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
-VERSION = "0.8.1"
+VERSION = "0.9.0"
 s = open(sys.argv[1], encoding="utf-8").read()
 piece = lambda name: open(os.path.join(SRC, name), encoding="utf-8").read()  # noqa: E731
 
@@ -114,5 +114,12 @@ sub("""function docUrl(u,kind){ // a link to one of this board's documents (rela
 """)
 sub("(?:https?:\\/\\/|\\/api\\/docs\\/)[^\\s)]+)", "(?:https?:\\/\\/|\\/api\\/docs\\/|\\/api\\/gala\\/)[^\\s)]+)")
 
+# the board's own browser dialogs (the terminal address) become page dialogs too
+sub("""function changeTermUrl(){const v=prompt('Address of this board\\'s Claude Code terminal (as your browser reaches it, e.g. through the SSH tunnel):',termUrl());
+ if(v===null)return;const t=v.trim();
+ if(t&&!/^https?:\\/\\/[^\\s]+$/.test(t)){alert('Use an address like http://127.0.0.1:17681');return}""",
+"""async function changeTermUrl(){const v=await galaDialog({title:'Claude Code terminal address',text:'The address of this board\\'s Claude Code terminal, as your browser reaches it (e.g. through the SSH tunnel).',
+  input:termUrl(),placeholder:'http://127.0.0.1:17681',ok:'Save',validate:x=>x.trim()&&!/^https?:\\/\\/[^\\s]+$/.test(x.trim())?'Use an address like http://127.0.0.1:17681':''});
+ if(v===null)return;const t=v.trim();""")
 open(sys.argv[2], "w", encoding="utf-8").write(s)
 print("wrote %s (v%s, %d bytes)" % (sys.argv[2], VERSION, len(s.encode())))

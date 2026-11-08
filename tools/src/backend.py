@@ -1076,7 +1076,7 @@ class Gala:
                 f["cleared"], f["clearedAt"] = True, now
         if json.dumps(hist, sort_keys=True) != before:
             self.save()
-        return sorted(hist.values(), key=lambda f: (int(f["heat"]), int(f["lane"])))
+        return sorted(hist.values(), key=lambda f: (int(f["lane"]), int(f["heat"])))   # by lane, then heat
 
     def fixes_file(self, n):
         return os.path.join(self.sdir(n), "fixes.json")

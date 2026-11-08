@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.1"
+VERSION = "0.9.0"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 STATUSES = ("open", "answered", "resolved", "on_hold")
 
@@ -1613,7 +1613,7 @@ class Gala:
                 f["cleared"], f["clearedAt"] = True, now
         if json.dumps(hist, sort_keys=True) != before:
             self.save()
-        return sorted(hist.values(), key=lambda f: (int(f["heat"]), int(f["lane"])))
+        return sorted(hist.values(), key=lambda f: (int(f["lane"]), int(f["heat"])))   # by lane, then heat
 
     def fixes_file(self, n):
         return os.path.join(self.sdir(n), "fixes.json")
@@ -3027,6 +3027,19 @@ form.qffix button{padding:2px 10px}
 .qft input[type=checkbox]{width:auto!important}
 .qft [data-swdiff] span,.qft [data-meddiff] span{font-size:.82rem;font-weight:600}
 ul.qf>li.cleared>div>ul{opacity:.75}
+.gdlg{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000;padding:16px}
+.gdlg[hidden]{display:none}
+.gdlg-box{background:var(--card);color:var(--fg);border-radius:10px;padding:18px 20px;max-width:520px;width:100%;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+.gdlg-box h3{margin:0 0 8px}
+.gdlg-box p{margin:0 0 12px;color:var(--muted)}
+.gdlg-in{width:100%;margin:4px 0}
+.gdlg-btns{display:flex;justify-content:flex-end;gap:8px;margin-top:10px}
+#gnotes{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:1001;max-width:min(440px,calc(100vw - 32px))}
+.gnote{display:flex;gap:10px;align-items:flex-start;background:var(--card);color:var(--fg);border-left:4px solid var(--ans);border-radius:8px;padding:10px 12px;box-shadow:0 4px 18px rgba(0,0,0,.2)}
+.gnote.err{border-left-color:var(--accent)}
+.gnote span{flex:1}
+.gnote button{padding:0 6px;border:0;background:none;cursor:pointer;color:var(--muted)}
+.cl-ev button.primary.regen{padding:3px 10px;font-size:.85em;color:#fff}
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -3253,11 +3266,11 @@ function renderChecklist(){setTimeout(swAll,0);
    const fx=e.fixes||null,fxDone=fx?fx.filter(f=>GALA.ticks[qfKey(e,f)]).length:0;
    const fxCell=fx==null?'<span class="no">–</span>':fx.length?(fxDone===fx.length?`<span class="ok" title="All ${fx.length} ticked">done ✓ <span class="sm">(${fx.length})</span></span>`:`<span class="gwarn">${fxDone}/${fx.length}</span>`):'<span class="ok" title="No quick fixes">none ✓</span>';
    const lastFix=Math.max(0,...Object.values(e.handFixes||{}).map(h=>h.at||0)),needRegen=fx&&fx.length&&fxDone===fx.length&&lastFix>(e.mergeAt||0);
-   const regen=`<div><button type="button" class="sm" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'Write the merge results again from what is already transcribed, with every DQ slip read so far (no scans are read again)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export and the empty merge results export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
+   const regen=`<div><button type="button" class="primary regen" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'Write the merge results again from what is already transcribed, with every DQ slip read so far (no scans are read again)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export and the empty merge results export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
    const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="${esc(!s.meet.entries.length?'No entries export':'No empty merge results export')}">waiting</span>`)+regen;
    const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${needRegen?`<div class="qfdone">All quick fixes for event ${e.event} are done, and fixes were made since its merge results were written. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries and the empty merge results export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details data-qfd="S${s.n}:e${e.event}"${(QF_OPEN['S'+s.n+':e'+e.event]??(fxDone<fx.length))?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} ticked${fx.some(x=>x.cleared)?', '+fx.filter(x=>x.cleared).length+' settled by the re-check':''})${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
      <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
-      return `<li class="${t?'done':''}${f.cleared?' cleared':''}">${tickBox(k,'Heat '+f.heat+' lane '+f.lane)}<div><b>Heat ${esc(f.heat)} · Lane ${esc(f.lane)}</b>${f.cleared?` <span class="st audited" title="${esc('No longer flagged since '+agoShort(f.clearedAt))}">settled by the re-check</span>`:''} <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
+      return `<li class="${t?'done':''}${f.cleared?' cleared':''}">${tickBox(k,'Lane '+f.lane+' heat '+f.heat)}<div><b>Lane ${esc(f.lane)} · Heat ${esc(f.heat)}</b>${f.cleared?` <span class="st audited" title="${esc('No longer flagged since '+agoShort(f.clearedAt))}">settled by the re-check</span>`:''} <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
        ${f.scans.length?`<div class="sm">${f.scans.map(sc=>`<a href="${esc(galaHref('sessions/S'+s.n+'/scans/'+sc.scan))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`).join(' · ')}</div>`:''}
        <form class="qffix" data-fix="${s.n}|${e.event}|${esc(f.heat)}|${esc(f.lane)}" autocomplete="off">
@@ -3320,22 +3333,22 @@ function galaClicks(e){
  const go=e.target.closest('[data-goto]');if(go){e.preventDefault();showView(go.dataset.goto);return}
  const ab=e.target.closest('[data-ask]');if(ab){ab.disabled=true;
   galaPost('/api/gala/ask',{key:ab.dataset.ask}).then(j=>{ab.textContent='Asked (#'+j.question+')';galaSig='';setTimeout(loadGala,1500)})
-   .catch(err=>{ab.disabled=false;alert(err.message)});return}
+   .catch(err=>{ab.disabled=false;galaNotice(err.message,'error')});return}
  const mv=e.target.closest('[data-move]');if(mv){const li=mv.closest('li');
   galaPost('/api/gala/move',{path:mv.dataset.move,session:+li.querySelector('[data-mvs]').value,folder:li.querySelector('[data-mvf]').value})
-   .then(()=>{galaSig='';loadGala()}).catch(err=>alert(err.message))}}
+   .then(()=>{galaSig='';loadGala()}).catch(err=>galaNotice(err.message,'error'))}}
 function galaChange(e){
  const fm=e.target.closest('form.qffix');if(fm){fm.dataset.dirty='1';if(e.target.name==='status')fm.querySelector('.qfcode').hidden=e.target.value!=='DQ';return}
  const up=e.target.closest('[data-gup]');if(up&&up.files.length){galaUpload(up.dataset.gup,[...up.files],up.closest('[data-gfolder],.cl-row,tr,.drop')||up.parentElement);return}
  const tk=e.target.closest('[data-tick]');if(tk){galaPost('/api/gala/tick',{key:tk.dataset.tick,checked:tk.checked}).then(()=>{if(tk.checked)offerRegen(tk.dataset.tick,tk.dataset.tick);galaSig='';loadGala()})
-  .catch(err=>{tk.checked=!tk.checked;alert('Could not save: '+err.message)})}}
+  .catch(err=>{tk.checked=!tk.checked;galaNotice('Could not save: '+err.message,'error')})}}
 for(const sec of ['#v-gala','#v-checklist']){const el=$(sec);el.addEventListener('click',galaClicks);el.addEventListener('change',galaChange);
  el.addEventListener('dragover',e=>{const c=e.target.closest('[data-gfolder],[data-cldrop],#g-inbox');if(!c)return;e.preventDefault();c.classList.add('over')});
  el.addEventListener('dragleave',e=>{const c=e.target.closest('[data-gfolder],[data-cldrop],#g-inbox');if(c&&!c.contains(e.relatedTarget))c.classList.remove('over')});
  el.addEventListener('drop',e=>{const c=e.target.closest('[data-gfolder],[data-cldrop],#g-inbox');if(!c)return;e.preventDefault();c.classList.remove('over');
   const fs=[...(e.dataTransfer.files||[])];if(!fs.length)return;
   const folder=c.id==='g-inbox'?'inbox':(c.dataset.gfolder||c.dataset.cldrop);
-  if(/\/(ocr|reports)$/.test(folder)){alert('That folder is written by Claude. Drop the file on the inbox instead.');return}
+  if(/\/(ocr|reports)$/.test(folder)){galaNotice('That folder is written by Claude. Drop the file on the inbox instead.','error');return}
   galaUpload(folder,fs,c)})}
 $('#g-inboxfile').addEventListener('change',e=>{if(e.target.files.length)galaUpload('inbox',[...e.target.files],$('#g-inbox'))});
 $('#g-auto').addEventListener('change',e=>galaPost('/api/gala/auto',{auto:e.target.checked}).then(()=>{galaSig='';loadGala()}));
@@ -3347,9 +3360,12 @@ function offerRegen(key,justDone){
  const s=GALA&&GALA.sessions.find(x=>x.n===n),e=s&&s.events.find(x=>x.event===ev);if(!e||!e.fixes||!e.canMerge)return;
  const left=e.fixes.filter(f=>{const k='S'+n+':e'+ev+':qf:'+f.heat+'.'+f.lane;return k!==justDone&&!GALA.ticks[k]});
  if(left.length)return;
- if(confirm('All '+e.fixes.length+' quick fixes for event '+ev+' are done.\n\nRegenerate the event\'s merge results now, with the fixes made in the portal and every DQ slip read so far? (No scans are read again.)'))
-  galaPost('/api/gala/ask',{key:'S'+n+':remerge:'+ev}).then(j=>alert('Asked Claude (question #'+j.question+').')).catch(err=>alert(err.message))}
-document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.qffix');if(!fm)return;ev.preventDefault();
+ galaDialog({title:'All quick fixes for event '+ev+' are done',
+  text:'Regenerate the event\'s merge results now, with the fixes made in the portal and every DQ slip read so far? No scans are read again.',
+  ok:'Regenerate the merge results',cancel:'Not now'}).then(yes=>{if(!yes)return;
+  galaPost('/api/gala/ask',{key:'S'+n+':remerge:'+ev}).then(j=>galaNotice('Asked Claude to regenerate event '+ev+'\'s merge results (question #'+j.question+').'))
+   .catch(err=>galaNotice(err.message,'error'))})}
+document.addEventListener('submit',async ev=>{const fm=ev.target.closest('form.qffix');if(!fm)return;ev.preventDefault();
  const [n,event,heat,lane]=fm.dataset.fix.split('|'),d=Object.fromEntries([...new FormData(fm).entries()].filter(([k])=>!/^(w\d+|wt\d+|swpick|swq)$/.test(k)));
  const watches={};let bad='';
  fm.querySelectorAll('input[data-swcol]').forEach(i=>{const c=i.dataset.swcol,tv=i.value.trim(),orig=i.dataset.orig||'',acc=fm.querySelector('input[data-swacc="'+c+'"]');
@@ -3361,10 +3377,11 @@ document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.qffix')
  const swb=fm.querySelector('.qfsw[data-add]');if(swb){if(!d.swimmer){fm.querySelector('[data-fixmsg]').textContent='Pick the swimmer first';return}d.add=true}
  if(d.time&&!/^(\d{1,2}:)?\d{1,2}\.\d{2}$/.test(d.time)){fm.querySelector('[data-fixmsg]').textContent='Time like 1:05.32 or 32.10';return}
  if(d.status==='DQ'&&!d.code){fm.querySelector('[data-fixmsg]').textContent='A DQ needs its code';return}
- if(d.code&&CODES.codes&&CODES.codes.length&&!CODES.codes.some(c=>c[0]===d.code)&&!confirm(d.code+' is not in '+(CODES.source||'the code list')+'. Save it anyway?'))return;
+ if(d.code&&CODES.codes&&CODES.codes.length&&!CODES.codes.some(c=>c[0]===d.code)&&
+   !await galaDialog({title:'DQ code '+d.code+' is not in the list',text:d.code+' is not in '+(CODES.source||'the code list')+'. Save it anyway?',ok:'Save it',cancel:'Change it'}))return;
  galaPost('/api/gala/fix',Object.assign({session:+n,event:+event,heat:+heat,lane:+lane},d)).then(()=>{
   delete fm.dataset.dirty;document.activeElement&&document.activeElement.blur();
-  if(Object.keys(d.watches||{}).length||d.swimmer||fm.querySelector('.qft'))galaPost('/api/gala/recheck',{session:+n,event:+event}).catch(err=>alert('Could not re-check: '+err.message));
+  if(Object.keys(d.watches||{}).length||d.swimmer||fm.querySelector('.qft'))galaPost('/api/gala/recheck',{session:+n,event:+event}).catch(err=>galaNotice('Could not re-check: '+err.message,'error'));
   offerRegen('S'+n+':e'+event+':qf:'+heat+'.'+lane,'S'+n+':e'+event+':qf:'+heat+'.'+lane);galaSig='';loadGala()})
   .catch(err=>{fm.querySelector('[data-fixmsg]').textContent='Could not save: '+err.message})});
 document.addEventListener('click',ev=>{const b=ev.target.closest('[data-clearfix]');if(!b)return;const fm=b.closest('form.qffix');
@@ -3420,7 +3437,7 @@ document.addEventListener('input',ev=>{const i=ev.target.closest('.qfsw input[na
 document.addEventListener('focusin',ev=>{const i=ev.target.closest('.qfw input[name^=wt]');if(i){const r=i.closest('.qfw').querySelector('input[value=capture]');if(r)r.checked=true}});
 
 document.addEventListener('click',ev=>{const b=ev.target.closest('[data-recheck]');if(!b)return;ev.preventDefault();const [n,e]=b.dataset.recheck.split('|');
- b.disabled=true;b.textContent='re-checking…';galaPost('/api/gala/recheck',{session:+n,event:+e}).then(()=>{galaSig='';setTimeout(loadGala,1500)}).catch(err=>{b.disabled=false;alert(err.message)})});
+ b.disabled=true;b.textContent='re-checking…';galaPost('/api/gala/recheck',{session:+n,event:+e}).then(()=>{galaSig='';setTimeout(loadGala,1500)}).catch(err=>{b.disabled=false;galaNotice(err.message,'error')})});
 
 // ---- the times row at the top of every quick fix: TP, PB, each stopwatch (correctable), median and final.
 // Typing a watch time recalculates the median and the differences here; "Save & recalculate" saves the corrected
@@ -3459,6 +3476,24 @@ _qftObs.observe(document.body,{childList:true,subtree:true});
 // Remember which quick-fix lists are open, so a refresh doesn't fold one you are looking at (or unfold one you closed).
 const QF_OPEN={};
 document.addEventListener('toggle',ev=>{const d=ev.target;if(d.matches&&d.matches('details[data-qfd]'))QF_OPEN[d.dataset.qfd]=d.open},true);
+
+// ---- dialogs and notices that are part of the page (never the browser's alert/confirm/prompt boxes)
+function galaDialog(o){
+ return new Promise(res=>{
+  let d=$('#gdlg');if(!d){d=document.createElement('div');d.id='gdlg';d.className='gdlg';d.setAttribute('role','dialog');d.setAttribute('aria-modal','true');document.body.appendChild(d)}
+  d.innerHTML=`<div class="gdlg-box"><h3>${esc(o.title||'')}</h3>${o.text?`<p>${esc(o.text)}</p>`:''}
+   ${o.input!==undefined?`<input class="gdlg-in" value="${esc(o.input)}" placeholder="${esc(o.placeholder||'')}"><div class="sm gwarn gdlg-err"></div>`:''}
+   <div class="gdlg-btns">${o.cancel===false?'':`<button type="button" data-no>${esc(o.cancel||'Cancel')}</button>`}<button type="button" class="primary" data-yes>${esc(o.ok||'OK')}</button></div></div>`;
+  d.hidden=false;const inp=d.querySelector('.gdlg-in');(inp||d.querySelector('[data-yes]')).focus();
+  const done=v=>{if(o.input!==undefined&&v!==false&&o.validate){const err=o.validate(v);if(err){d.querySelector('.gdlg-err').textContent=err;return}}
+   d.hidden=true;d.innerHTML='';document.removeEventListener('keydown',key,true);res(v)};
+  const key=ev=>{if(ev.key==='Escape'){ev.preventDefault();done(o.input!==undefined?null:false)}else if(ev.key==='Enter'&&(inp||document.activeElement.closest('#gdlg'))){ev.preventDefault();done(inp?inp.value:true)}};
+  document.addEventListener('keydown',key,true);
+  d.onclick=ev=>{if(ev.target===d)done(o.input!==undefined?null:false);else if(ev.target.closest('[data-yes]'))done(inp?inp.value:true);else if(ev.target.closest('[data-no]'))done(o.input!==undefined?null:false)}})}
+function galaNotice(text,kind){
+ let box=$('#gnotes');if(!box){box=document.createElement('div');box.id='gnotes';box.setAttribute('aria-live','polite');document.body.appendChild(box)}
+ const n=document.createElement('div');n.className='gnote'+(kind==='error'?' err':'');n.innerHTML=`<span>${esc(text)}</span><button type="button" aria-label="Close">✕</button>`;
+ n.querySelector('button').onclick=()=>n.remove();box.appendChild(n);setTimeout(()=>n.remove(),kind==='error'?12000:6000)}
 
 // ---- views
 let view=['#gala','#checklist','#questions','#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'gala');
@@ -3592,9 +3627,9 @@ function openTerm(){const w=$('#termwin');
   $('#termnew').href=termUrl();w.hidden=false;$('#termshade').hidden=false;document.body.classList.add('termopen')}
  $('#termframe').focus()}
 function closeTerm(){$('#termframe').src='about:blank';$('#termwin').hidden=true;$('#termshade').hidden=true;document.body.classList.remove('termopen')}
-function changeTermUrl(){const v=prompt('Address of this board\'s Claude Code terminal (as your browser reaches it, e.g. through the SSH tunnel):',termUrl());
+async function changeTermUrl(){const v=await galaDialog({title:'Claude Code terminal address',text:'The address of this board\'s Claude Code terminal, as your browser reaches it (e.g. through the SSH tunnel).',
+  input:termUrl(),placeholder:'http://127.0.0.1:17681',ok:'Save',validate:x=>x.trim()&&!/^https?:\/\/[^\s]+$/.test(x.trim())?'Use an address like http://127.0.0.1:17681':''});
  if(v===null)return;const t=v.trim();
- if(t&&!/^https?:\/\/[^\s]+$/.test(t)){alert('Use an address like http://127.0.0.1:17681');return}
  store('qa-term',t&&t!==TERM_DEFAULT?t:'');if(!$('#termwin').hidden){$('#termframe').src=termUrl();$('#termurl').textContent=termUrl().replace(/^https?:\/\//,'');$('#termnew').href=termUrl()}}
 $('#openterm').onclick=openTerm;
 $('#termclose').onclick=closeTerm;
