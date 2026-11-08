@@ -1,0 +1,8 @@
+# The gala's files (children's data) and the portal's private state never go into git.
+/data/*
+!/data/README.txt
+.portal/
+.mcp.json
+.claude/settings.local.json
+__pycache__/
+*.pyc
