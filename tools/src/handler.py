@@ -2,6 +2,89 @@
     def _gala(self):
         return getattr(self.server, "gala", None)
 
+    # ---- the web terminal, served through the portal: /terminal/ro/ (watch) and /terminal/rw/ (type)
+    # Two ttyd's on 127.0.0.1 attach to Claude's tmux session; the portal passes the page and its WebSocket through,
+    # so the browser only talks to the portal, with its key. Watching needs the portal's key; typing needs the
+    # admin key too (or a browser on this computer).
+    def _term_token(self, mode):
+        secret = (self.server.admin_key if mode == "rw" and getattr(self.server, "admin_key", "") else self.server.key) or ""
+        return hmac.new(secret.encode(), ("gala-term-" + mode).encode(), hashlib.sha256).hexdigest()[:32]
+
+    def _term_local(self):
+        return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def _terminal(self):
+        raw = urllib.parse.urlsplit(self.path)
+        parts = raw.path.split("/")
+        mode = parts[2] if len(parts) > 2 else ""
+        port = (getattr(self.server, "term_ports", None) or {}).get(mode)
+        if not port:
+            return self._send(404, "No web terminal here (install ttyd and start the portal again).", "text/plain")
+        q = {k: v[-1] for k, v in urllib.parse.parse_qs(raw.query).items()}
+        cookie = "gala_term_" + mode
+        jar = {}
+        for c in (self.headers.get("Cookie") or "").split(";"):
+            if "=" in c:
+                k, v = c.strip().split("=", 1)
+                jar[k] = v
+        token = self._term_token(mode)
+        by_cookie = hmac.compare_digest(jar.get(cookie, ""), token)
+        admin_ok = bool(self.server.admin_key) and hmac.compare_digest(q.get("admin", ""), self.server.admin_key)
+        # typing: the admin key if one is given (a wrong one is refused, even here), else only on this computer
+        by_query = self._authorized(q) and (mode == "ro" or (admin_ok if "admin" in q else self._term_local()))
+        if not (by_cookie or by_query):
+            if mode == "rw" and self._authorized(q):
+                return self._send(403, "Typing in the terminal needs the admin key (see start-portal.sh on the portal computer).", "text/plain")
+            return self._send(401, "Missing or wrong key.", "text/plain")
+        # the request for ttyd, without the keys
+        rest = urllib.parse.urlencode([(k, v) for k, v in urllib.parse.parse_qsl(raw.query) if k not in ("key", "admin")])
+        upgrade = (self.headers.get("Upgrade") or "").lower() == "websocket"
+        lines = ["GET %s%s HTTP/1.1" % (raw.path, "?" + rest if rest else ""), "Host: 127.0.0.1:%d" % port]
+        for k, v in self.headers.items():
+            if k.lower() in ("host", "cookie", "connection", "keep-alive", "x-qa-key") or (not upgrade and k.lower() == "upgrade"):
+                continue
+            lines.append("%s: %s" % (k, v))
+        lines.append("Connection: Upgrade" if upgrade else "Connection: close")
+        try:
+            up = socket.create_connection(("127.0.0.1", port), timeout=10)
+        except OSError:
+            return self._send(502, "The web terminal isn't running (start-portal.sh starts it).", "text/plain")
+        self.close_connection = True
+        try:
+            up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = up.recv(65536)
+                if not chunk:
+                    break
+                head += chunk
+                if len(head) > 65536:
+                    break
+            if by_query and not by_cookie and b"\r\n" in head:   # remember the browser for the page's own requests
+                first, rest_b = head.split(b"\r\n", 1)
+                head = first + ("\r\nSet-Cookie: %s=%s; Path=/terminal/%s/; HttpOnly; SameSite=Strict"
+                                % (cookie, token, mode)).encode() + b"\r\n" + rest_b
+            self.connection.sendall(head)
+            up.settimeout(None)
+            self.connection.settimeout(None)
+            socks = [self.connection, up]
+            while True:
+                r, _, _ = select.select(socks, [], [], 3600)
+                if not r:
+                    break
+                for s_ in r:
+                    data = s_.recv(65536)
+                    if not data:
+                        return
+                    (up if s_ is self.connection else self.connection).sendall(data)
+        except OSError:
+            return
+        finally:
+            try:
+                up.close()
+            except OSError:
+                pass
+
     def _gala_file(self, q):
         g = self._gala()
         p = gala_path(g.root, q.get("path")) if g else None

@@ -192,5 +192,10 @@ For the next gala, move the contents of `data/` to an archive folder (or use a c
 | `portal/claude-loop.sh`, `resume-prompt.txt`, `tmux.conf` | Claude's tmux session and restarts |
 | `.portal/` | Made at start: key, database, logs |
 
-Optional: install `ttyd` and the portal gets a web terminal (on port 9001) for typing to Claude from the
-browser.
+**Web terminal** (optional: `sudo apt install ttyd`, Mac `brew install ttyd`). **Open terminal** on the Live tab shows
+Claude's terminal in a window over the portal, served by the portal itself (`/terminal/`), so it works from any computer
+that can open the portal, with the same link. Everyone with the portal link can **watch**; to **type** to Claude a browser
+needs the **admin key**, which `start-portal.sh` prints on the portal computer (keep it to yourself: whoever can type can
+have Claude do anything on that computer). Click the bar at the top of the terminal window to enter it, or to go back to
+watching. The browser `start-portal.sh` opens on the portal computer can type already. ttyd itself (ports 9001 and 9002)
+only listens on the portal computer.

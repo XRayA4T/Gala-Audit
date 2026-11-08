@@ -73,6 +73,10 @@ printf '%q ' --port "$PORT" --host "$HOST" --inbox "$INBOX" --name "$NAME" > .po
 [ -s .portal/key ] || python3 -c 'import secrets;print(secrets.token_urlsafe(18))' > .portal/key
 chmod 600 .portal/key
 KEY="$(cat .portal/key)"
+# the admin key: lets a browser type to Claude in the web terminal (everyone else with the portal link can watch)
+[ -s .portal/admin-key ] || python3 -c 'import secrets;print(secrets.token_urlsafe(12))' > .portal/admin-key
+chmod 600 .portal/admin-key
+ADMIN="$(cat .portal/admin-key)"
 
 # ---- 3. Claude Code project settings
 say "Setting up Claude Code for this folder"
@@ -128,9 +132,12 @@ else
   claude plugin update gala-ocr@gala-ai-plugins >/dev/null 2>&1 || true   # needs 1.6.0+ (Gen7 race PDFs, --events)
 fi
 
-# ---- 4a. the portal (with a link to the web terminal if ttyd is installed)
+# ---- 4a. the portal (it serves the web terminal too, if ttyd is installed: /terminal/ro/ to watch, /terminal/rw/ to type)
 TERM_ARGS=()
-if command -v ttyd >/dev/null; then TERM_PORT=$((PORT + 1)); TERM_ARGS=(--terminal-url "http://127.0.0.1:$TERM_PORT"); fi
+if command -v ttyd >/dev/null; then
+  TERM_PORT=$((PORT + 1)); TERM_RO_PORT=$((PORT + 2))
+  TERM_ARGS=(--term-rw-port "$TERM_PORT" --term-ro-port "$TERM_RO_PORT" --admin-key "$ADMIN")
+fi
 if curl -s --max-time 2 "$BOARD/health?key=$KEY" | grep -q '"ok"'; then
   say "The portal is already running on $BOARD"
 else
@@ -167,21 +174,34 @@ if [ -s .portal/watch.pid ] && kill -0 "$(cat .portal/watch.pid)" 2>/dev/null; t
   echo $! > .portal/watch.pid
 fi
 
-# ---- 4d. optional web terminal (ttyd) so the browser can type to Claude too
+# ---- 4d. optional web terminal (ttyd), on this computer only; the portal passes it through with its keys.
+# One to type to Claude (needs the admin key), one to watch it (a read-only tmux client, so it can't type either way).
 if [ -n "$TERM_PORT" ]; then
-  if ! { [ -s .portal/ttyd.pid ] && kill -0 "$(cat .portal/ttyd.pid)" 2>/dev/null; }; then
-    nohup ttyd -i 127.0.0.1 -p "$TERM_PORT" -W tmux -L "$SOCK" attach -t "$SESSION" > .portal/ttyd.log 2>&1 &
-    echo $! > .portal/ttyd.pid
-  fi
+  for p in ttyd ttyd-ro; do
+    [ -s ".portal/$p.pid" ] && kill "$(cat ".portal/$p.pid")" 2>/dev/null; rm -f ".portal/$p.pid"
+  done
+  W=""; ttyd --help 2>&1 | grep -q -- '--writable' && W="-W"          # ttyd 1.7+ is read-only unless -W
+  RO=(-r); tmux -V | awk '{v=$2+0; exit !(v>=3.2)}' && RO=(-f read-only,ignore-size)   # a watcher doesn't resize Claude's screen
+  nohup ttyd -i 127.0.0.1 -p "$TERM_PORT" -b /terminal/rw $W tmux -L "$SOCK" attach -t "$SESSION" > .portal/ttyd.log 2>&1 &
+  echo $! > .portal/ttyd.pid
+  nohup ttyd -i 127.0.0.1 -p "$TERM_RO_PORT" -b /terminal/ro tmux -L "$SOCK" attach "${RO[@]}" -t "$SESSION" > .portal/ttyd-ro.log 2>&1 &
+  echo $! > .portal/ttyd-ro.pid
 fi
 
 URL="$BOARD/?key=$KEY&me=$ME"
+OPEN_URL="$URL&admin=$ADMIN"   # this computer's browser can type in the web terminal
 echo
 say "Portal:  $URL"
 if [ "$HOST" != "127.0.0.1" ]; then
   LAN="$(hostname -I 2>/dev/null | awk '{print $1}')"
   [ -n "$LAN" ] || LAN="$(ipconfig getifaddr en0 2>/dev/null || true)"
   [ -n "$LAN" ] && say "On the network:  http://$LAN:$PORT/?key=$KEY   (anyone with this link can open it)"
+fi
+if [ -n "$TERM_PORT" ]; then
+  say "Web terminal:  anyone with the portal link can watch Claude (Live tab, Open terminal); to type to it,"
+  say "         a browser needs the admin key: $ADMIN   (keep it to yourself; this computer's browser has it already)"
+else
+  say "Web terminal:  install ttyd for one in the portal (sudo apt install ttyd)"
 fi
 say "Inbox:   $(cd "$INBOX" && pwd)   (the scanner / Gen7 computer save here, or drop files on the Gala tab)"
 say "Data:    $HERE/data/sessions"
@@ -192,9 +212,9 @@ echo
 
 # ---- 5. browser and terminal
 if [ "$BROWSER" = 1 ]; then
-  if command -v xdg-open >/dev/null; then xdg-open "$URL" >/dev/null 2>&1 &
-  elif command -v open >/dev/null; then open "$URL"
-  elif command -v wslview >/dev/null; then wslview "$URL"
+  if command -v xdg-open >/dev/null; then xdg-open "$OPEN_URL" >/dev/null 2>&1 &
+  elif command -v open >/dev/null; then open "$OPEN_URL"
+  elif command -v wslview >/dev/null; then wslview "$OPEN_URL"
   else warn "Open the address above in your browser."; fi
 fi
 if [ "$ATTACH" = 1 ] && [ -t 1 ]; then

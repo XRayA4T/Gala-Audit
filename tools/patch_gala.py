@@ -8,7 +8,7 @@ import re
 import sys
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 s = open(sys.argv[1], encoding="utf-8").read()
 piece = lambda name: open(os.path.join(SRC, name), encoding="utf-8").read()  # noqa: E731
 
@@ -27,7 +27,8 @@ sub('"""\nQA Board - a tiny shared question & answer board',
     'each event is handed to Claude as soon as its lane sheets and Gen7 races are in. Based on the QA Board:\n\n'
     'QA Board - a tiny shared question & answer board')
 s = re.sub(r'^VERSION = "[^"]+"', 'VERSION = "%s"' % VERSION, s, count=1, flags=re.M)
-sub("import sqlite3\n", "import shutil\nimport sqlite3\nimport subprocess\n")
+sub("import sqlite3\n", "import select\nimport shutil\nimport socket\nimport sqlite3\nimport subprocess\n")
+sub("import hashlib\n", "import hashlib\nimport hmac\n")
 
 # ---------------------------------------------------------------- back end
 sub("\n\ndef clean_deployment(", piece("backend.py") + "\n\ndef clean_deployment(")
@@ -62,6 +63,15 @@ sub('''        store = self.server.store
                         "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update"):
                 return self._gala_post(path, q)
             if path == "/api/live":''')
+# the web terminal, through the portal (before the key check: it takes the key or its own cookie)
+sub('''        if path.startswith("/brand/"):   # the board's look: stylesheet, fonts, logo (no key needed)
+            return self._brand_file(path[len("/brand/"):])
+        if not self._authorized(q):''', '''        if path.startswith("/brand/"):   # the board's look: stylesheet, fonts, logo (no key needed)
+            return self._brand_file(path[len("/brand/"):])
+        if path.startswith("/terminal/"):
+            return self._terminal()
+        if not self._authorized(q):''')
+sub("    if terminal_url and not re.fullmatch(", '    if terminal_url and terminal_url != "/terminal/" and not re.fullmatch(')
 # quieter log: the page and the watcher poll every few seconds
 sub('''    def log_message(self, fmt, *args):
         sys.stderr.write''', '''    def log_message(self, fmt, *args):
@@ -77,6 +87,10 @@ sub('''    def _brand_dir(self):
 # ---------------------------------------------------------------- serve() and the command line
 sub("    srv.page = render_page(srv.brand, srv.accent, args.terminal_url)",
     "    srv.brand_dir = os.path.abspath(args.brand_dir) if args.brand_dir else None\n"
+    "    srv.term_ports = {k: v for k, v in ((\"rw\", args.term_rw_port), (\"ro\", args.term_ro_port)) if v}\n"
+    "    srv.admin_key = args.admin_key or \"\"\n"
+    "    if srv.term_ports:\n"
+    "        args.terminal_url = \"/terminal/\"\n"
     "    srv.gala = Gala(args.gala_data, args.inbox, srv.store) if args.gala_data else None\n"
     "    if srv.gala:\n"
     "        threading.Thread(target=srv.gala.run, daemon=True).start()\n"
@@ -86,6 +100,9 @@ sub('''    s.add_argument("--terminal-url", default="",''',
     '''    s.add_argument("--gala-data", default=None, help="the gala's data folder (sessions/, inbox/, state.json)")
     s.add_argument("--inbox", default=None, help="folder new gala files arrive in (default: DATA/inbox)")
     s.add_argument("--brand-dir", default=None, help="folder with brand.css, logo and fonts")
+    s.add_argument("--term-rw-port", type=int, default=None, help="ttyd (on 127.0.0.1) to type to Claude: served at /terminal/rw/")
+    s.add_argument("--term-ro-port", type=int, default=None, help="ttyd (on 127.0.0.1) to watch Claude: served at /terminal/ro/")
+    s.add_argument("--admin-key", default="", help="key that lets a browser type in the web terminal")
     s.add_argument("--terminal-url", default="",''')
 sub('s.add_argument("--name", default="Team"', 's.add_argument("--name", default="CGA Gala Audit"')
 sub('s.add_argument("--accent", default="#3949ab"', 's.add_argument("--accent", default="#cd2529"')
@@ -119,6 +136,11 @@ sub("""function docUrl(u,kind){ // a link to one of this board's documents (rela
 """)
 sub("(?:https?:\\/\\/|\\/api\\/docs\\/)[^\\s)]+)", "(?:https?:\\/\\/|\\/api\\/docs\\/|\\/api\\/gala\\/)[^\\s)]+)")
 
+sub("const termUrl=()=>store('qa-term')||TERM_DEFAULT;",
+    "const termUrl=()=>TERM_DEFAULT==='/terminal/'?galaTermUrl():(store('qa-term')||TERM_DEFAULT);")
+sub("$('#termurl').textContent=termUrl().replace(/^https?:\\/\\//,'');\n  $('#termnew').href=termUrl();w.hidden=false;",
+    "galaTermBar();\n  $('#termnew').href=termUrl();w.hidden=false;")
+sub("$('#termurl').onclick=changeTermUrl;", "$('#termurl').onclick=galaTermClick;")
 # the board's own browser dialogs (the terminal address) become page dialogs too
 sub("""function changeTermUrl(){const v=prompt('Address of this board\\'s Claude Code terminal (as your browser reaches it, e.g. through the SSH tunnel):',termUrl());
  if(v===null)return;const t=v.trim();
