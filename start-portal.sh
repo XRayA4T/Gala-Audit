@@ -5,17 +5,17 @@
 #   2. makes the data/ folders and a private key (.portal/key)
 #   3. sets up the project for Claude Code: the gala-ocr plugin, the portal MCP server, permissions, the inbox hook
 #   4. starts the portal web page (http://127.0.0.1:PORT), Claude Code in tmux, and the watcher
-#   5. opens the portal in your web browser and attaches this terminal to Claude
+#   5. opens the portal in your web browser; Claude keeps running in the background (watch it on the Live tab)
 #
 # Options:  --port N (default 9000)   --host ADDR (default 0.0.0.0: every network; 127.0.0.1: this computer only)
 #             --inbox DIR (default data/inbox)   --name "Gala name"
-#           --no-browser   --no-attach
+#           --no-browser   --attach (put this terminal into Claude's session; leave it with Ctrl-b d)
 # Stop everything with:  bash stop-portal.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-PORT="${PORTAL_PORT:-9000}"; HOST="${PORTAL_HOST:-0.0.0.0}"; INBOX="${GALA_INBOX:-data/inbox}"; TERM_PORT=""; BROWSER=1; ATTACH=1; NAME="CGA Gala Audit"
+PORT="${PORTAL_PORT:-9000}"; HOST="${PORTAL_HOST:-0.0.0.0}"; INBOX="${GALA_INBOX:-data/inbox}"; TERM_PORT=""; BROWSER=1; ATTACH=0; NAME="CGA Gala Audit"
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
@@ -23,7 +23,8 @@ while [ $# -gt 0 ]; do
     --inbox) INBOX="$2"; shift 2 ;;
     --host) HOST="$2"; shift 2 ;;
     --no-browser) BROWSER=0; shift ;;
-    --no-attach) ATTACH=0; shift ;;
+    --attach) ATTACH=1; shift ;;
+    --no-attach) ATTACH=0; shift ;;   # the default now; kept so older commands still work
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1"; exit 2 ;;
   esac
@@ -163,7 +164,8 @@ if [ "$HOST" != "127.0.0.1" ]; then
 fi
 say "Inbox:   $(cd "$INBOX" && pwd)   (the scanner / Gen7 computer save here, or drop files on the Gala tab)"
 say "Data:    $HERE/data/sessions"
-say "Claude:  tmux -L $SOCK attach -t $SESSION      (detach: Ctrl-b d)"
+say "Claude:  running in the background - watch it on the portal's Live tab"
+say "         to type to it here:  tmux -L $SOCK attach -t $SESSION   (leave with Ctrl-b d)"
 say "Stop:    bash stop-portal.sh"
 echo
 
@@ -177,4 +179,10 @@ fi
 if [ "$ATTACH" = 1 ] && [ -t 1 ]; then
   sleep 1
   exec tmux -L "$SOCK" attach -t "$SESSION"
+fi
+# Claude Code may be waiting for an answer the first time (trust this folder, the portal MCP server, the plugin):
+# say so, since nobody is looking at its terminal.
+sleep 4
+if tmux -L "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null | grep -qiE "do you trust|trust the files|enter to confirm|\\(y/n\\)|❯ 1\\. yes"; then
+  warn "Claude Code is asking a question (first start?). Answer it with:  tmux -L $SOCK attach -t $SESSION"
 fi

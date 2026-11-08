@@ -28,15 +28,17 @@ It:
    permissions and the inbox hook (`.claude/settings.local.json`);
 4. starts the portal at `http://127.0.0.1:9000`, Claude Code in tmux (it restarts itself and carries on if it
    exits), and the watcher that hands new questions to Claude and mirrors its screen on the **Live** tab;
-5. opens the portal in your browser and puts this terminal into the Claude session.
+5. opens the portal in your browser. Claude Code runs in the background and the terminal is free again; watch
+   Claude on the **Live** tab.
 
-**The first time**, answer Claude Code's questions in the terminal: trust this folder, use the `portal` MCP
-server, and install the plugin from the `gala-ai-plugins` marketplace. If Claude isn't signed in yet, run
-`claude` once on its own first.
+**The first time**, start with `--attach` and answer Claude Code's questions in the terminal: trust this folder,
+use the `portal` MCP server, and install the plugin from the `gala-ai-plugins` marketplace (then leave with
+**Ctrl-b d**). If Claude isn't signed in yet, run `claude` once on its own first. If Claude is waiting for an
+answer when the script finishes, it says so.
 
 Options: `--port 9000`, `--inbox DIR` (default `data/inbox`; e.g. a shared folder the scanner and the Gen7
-computer save into), `--name "Gala name"`, `--no-browser`, `--no-attach`.
-Leave the terminal with **Ctrl-b d**; Claude keeps running. Back in: `tmux -L gala-portal attach -t claude`.
+computer save into), `--name "Gala name"`, `--no-browser`, `--attach` (put this terminal into Claude's session).
+To type to Claude later: `tmux -L gala-portal attach -t claude`, and leave with **Ctrl-b d**; Claude keeps running.
 
 ```bash
 bash stop-portal.sh              # stops the page, the watcher and Claude (data/ and the questions are kept)
