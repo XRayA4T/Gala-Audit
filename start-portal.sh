@@ -108,7 +108,7 @@ if curl -s --max-time 2 "$BOARD/health?key=$KEY" | grep -q '"ok"'; then
 else
   say "Starting the portal on $BOARD"
   nohup python3 portal/portal.py serve --host 127.0.0.1 --port "$PORT" --db .portal/portal.db --key "$KEY" \
-        --max-doc-mb 200 --name "$NAME" --gala-data data ${TERM_ARGS[@]+"${TERM_ARGS[@]}"} > .portal/portal.log 2>&1 &
+        --max-doc-mb 200 --name "$NAME" --brand-dir portal/brand --gala-data data ${TERM_ARGS[@]+"${TERM_ARGS[@]}"} > .portal/portal.log 2>&1 &
   echo $! > .portal/portal.pid
   for _ in $(seq 1 40); do curl -s --max-time 1 "$BOARD/health?key=$KEY" | grep -q '"ok"' && break; sleep 0.25; done
   curl -s --max-time 2 "$BOARD/health?key=$KEY" | grep -q '"ok"' || die "The portal didn't start - see .portal/portal.log"

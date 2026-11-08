@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "gala-ai-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "XRayA4T/Gala-AI-Plugins"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "gala-ocr@gala-ai-plugins": true
+  }
+}

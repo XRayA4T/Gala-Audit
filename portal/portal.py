@@ -1163,7 +1163,7 @@ class Handler(BaseHTTPRequestHandler):
                           {"Cache-Control": "public, max-age=3600"})
 
     def _brand_dir(self):
-        return os.path.join(os.path.dirname(self.server.store.docdir), "brand")
+        return getattr(self.server, "brand_dir", None) or os.path.join(os.path.dirname(self.server.store.docdir), "brand")
 
     def _brand_file(self, rel):
         base = os.path.realpath(self._brand_dir())
@@ -1496,6 +1496,7 @@ def serve(args):
     srv.key = args.key
     srv.brand = args.name
     srv.accent = args.accent if re.fullmatch(r"#[0-9a-fA-F]{6}", args.accent or "") else "#3949ab"
+    srv.brand_dir = os.path.abspath(args.brand_dir) if getattr(args, 'brand_dir', None) else None
     srv.gala_root = os.path.abspath(args.gala_data) if getattr(args, 'gala_data', None) else None
     if srv.gala_root:
         for f in GALA_FOLDERS:
@@ -2540,7 +2541,8 @@ def main():
     s.add_argument("--key", default=None, help="optional shared secret; clients add ?key=... or X-QA-Key")
     s.add_argument("--max-doc-mb", type=float, default=20, help="largest document accepted (default 20)")
     s.add_argument("--name", default="CGA Gala Audit", help='board name shown on the page, e.g. "Acme Web App"')
-    s.add_argument("--accent", default="#0b7a75", help="accent colour, e.g. #7a4cab")
+    s.add_argument("--accent", default="#cd2529", help="accent colour, e.g. #7a4cab")
+    s.add_argument("--brand-dir", default=None, help="folder with brand.css, logo and fonts (default: brand/ next to the docs)")
     s.add_argument("--gala-data", default=None, help="the Gala data folder shown on the Gala tab")
     s.add_argument("--terminal-url", default="", help="where browsers reach this board's Claude Code web terminal, "
                                                       "e.g. http://127.0.0.1:17681 (the SSH tunnel)")

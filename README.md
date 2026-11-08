@@ -75,6 +75,7 @@ For the next gala, move the contents of `data/` to an archive folder (or use a c
 | `CLAUDE.md` | Claude's instructions: its role, the folders, the skills, how to use the portal |
 | `portal/portal.py` | The portal (one Python file, standard library only) |
 | `portal/board-watch.py` | The watcher |
+| `portal/brand/` | The CGA look: `brand.css` (colours, header) and the logo. Edit it to change the look |
 | `portal/claude-loop.sh`, `resume-prompt.txt`, `tmux.conf` | Claude's tmux session and restarts |
 | `.portal/` | Made at start: key, database, logs |
 
