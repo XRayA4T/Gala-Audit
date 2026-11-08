@@ -108,6 +108,16 @@
                 return self._json(200, {"ok": True, "question": row["id"]})
             elif path == "/api/gala/move":
                 g.move(str(d.get("path") or ""), int(d.get("session") or 0), str(d.get("folder") or ""))
+            elif path == "/api/gala/restart":
+                mode = str(d.get("mode") or "")
+                if str(d.get("confirm") or "").strip().upper() != ("DELETE" if mode == "delete" else "RESTART"):
+                    return self._json(400, {"error": "type %s to confirm" % ("DELETE" if mode == "delete" else "RESTART")})
+                return self._json(200, dict(g.restart(mode, bool(d.get("questions")), bool(d.get("reimport")),
+                                                      str(d.get("label") or ""), who), ok=True))
+            elif path == "/api/gala/update":
+                g.start_update(who, bool(d.get("claude")))
+            elif path == "/api/gala/archive-delete":
+                g.delete_archive(str(d.get("name") or ""))
             elif path == "/api/gala/recheck":
                 g.recheck(int(d.get("session") or 0), int(d.get("event") or 0), who)
             elif path == "/api/gala/fix":

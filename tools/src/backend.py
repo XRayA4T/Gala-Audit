@@ -697,7 +697,8 @@ class Gala:
                     "unsorted": _ls(os.path.join(self.root, "unsorted")),
                     "sessions": [self.session(n) for n in self.sessions()],
                     "ticks": self.state["ticks"],
-                    "tools": {t: bool(shutil.which(t)) for t in ("pdfinfo", "pdftoppm", "pdftotext")}}
+                    "tools": {t: bool(shutil.which(t)) for t in ("pdfinfo", "pdftoppm", "pdftotext")},
+                    "summary": self.summary(), "archives": self.archives()}
 
     # ---------------------------------------------------------------- asking Claude
     def P(self, n, sub, name=""):
@@ -1046,7 +1047,9 @@ class Gala:
             name_score = score
             score += 0.3 if entered else 0
             if (words and name_score >= 0.5) or (not words and entered):
-                out.append((score, dict(s, entered=entered, name="%s, %s" % (s["surname"], s["first"]))))
+                # The preferred name, when the entries have one, is the name used (a nickname rather than the legal first name).
+                out.append((score, dict(s, entered=entered,
+                                        name="%s, %s" % (s["surname"], s.get("preferred") or s["first"]))))
         out.sort(key=lambda x: -x[0])
         return [dict(x, score=round(sc, 2)) for sc, x in out[:limit]]
 
@@ -1229,6 +1232,168 @@ class Gala:
                 pass
             return out
         return {"source": os.path.basename(path), "codes": self._cached("codes", path, run) or []}
+
+    # ---------------------------------------------------------------- restarting: clear the gala out
+    def _size(self, path):
+        if os.path.islink(path):
+            return 0, 0
+        if os.path.isfile(path):
+            return 1, os.path.getsize(path)
+        files = size = 0
+        for dp, dirs, fs in os.walk(path):
+            for f in fs:
+                try:
+                    size += os.path.getsize(os.path.join(dp, f))
+                    files += 1
+                except OSError:
+                    pass
+        return files, size
+
+    def _inbox_own(self):
+        """What is in the inbox itself: files and folders, but not linked folders (those belong to other computers)."""
+        return [os.path.join(self.inbox, f["name"]) for f in _ls(self.inbox)
+                if not self._linked(os.path.join(self.inbox, f["name"]))]
+
+    @staticmethod
+    def _linked(path):
+        """A folder that belongs to another computer: a symbolic link, or a share mounted straight into the inbox."""
+        return os.path.islink(path) or os.path.ismount(path)
+
+    def summary(self):
+        files, size = 0, 0
+        for p in [os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")] + self._inbox_own():
+            if os.path.exists(p):
+                f, b = self._size(p)
+                files, size = files + f, size + b
+        return {"sessions": len(self.sessions()), "files": files, "bytes": size,
+                "questions": self.store.db.execute("SELECT COUNT(*) FROM questions").fetchone()[0],
+                "documents": self.store.db.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
+                "linked": [f["name"] for f in _ls(self.inbox) if self._linked(os.path.join(self.inbox, f["name"]))]}
+
+    def archives(self):
+        out = []
+        for f in _ls(os.path.join(self.root, "archive")):
+            if f["dir"]:
+                n, b = self._size(os.path.join(self.root, "archive", f["name"]))
+                out.append({"name": f["name"], "files": n, "bytes": b, "mtime": f["mtime"]})
+        return sorted(out, key=lambda a: a["name"], reverse=True)
+
+    def restart(self, mode, questions, reimport, label, who):
+        """Clear the gala out: its sessions, unsorted files, what is waiting in the inbox (not linked folders) and the
+        portal's state (ticks, history, log). mode "archive" moves it all to data/archive/<date time label>/;
+        "delete" deletes it for good. questions: also clear the Questions, answers, documents and deployments.
+        reimport: forget which files were copied from linked inbox folders, so they are copied in again."""
+        if mode not in ("archive", "delete"):
+            raise ValueError("mode must be archive or delete")
+        with self.lock:
+            stamp = time.strftime("%Y-%m-%d_%H%M%S")
+            name = stamp + ("_" + re.sub(r"[^\w -]", "", label or "").strip()[:40] if (label or "").strip() else "")
+            dest = os.path.join(self.root, "archive", name)
+            moving = [os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted"),
+                      self.state_file] + self._inbox_own()
+            for p in moving:
+                if not os.path.exists(p):
+                    continue
+                if mode == "archive":
+                    rel = "inbox/" + os.path.basename(p) if os.path.dirname(p) == self.inbox else os.path.relpath(p, self.root)
+                    os.makedirs(os.path.dirname(os.path.join(dest, rel)), exist_ok=True)
+                    shutil.move(p, os.path.join(dest, rel))
+                elif os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p)
+                else:
+                    os.unlink(p)
+            if questions:
+                st = self.store
+                with st.lock:
+                    if mode == "archive":
+                        os.makedirs(dest, exist_ok=True)
+                        st.db.commit()
+                        bk = sqlite3.connect(os.path.join(dest, "portal-questions.db"))
+                        st.db.backup(bk)
+                        bk.close()
+                        if os.path.isdir(st.docdir):
+                            shutil.copytree(st.docdir, os.path.join(dest, "documents"), dirs_exist_ok=True)
+                    for t in ("answers", "questions", "document_versions", "documents", "deployments"):
+                        st.db.execute("DELETE FROM %s" % t)
+                    st.db.commit()
+                    st.attention = None
+                    if os.path.isdir(st.docdir):
+                        for f in os.listdir(st.docdir):
+                            if f == ".tmp":   # the store's upload area: keep it
+                                continue
+                            p = os.path.join(st.docdir, f)
+                            shutil.rmtree(p) if os.path.isdir(p) else os.unlink(p)
+            copied = {} if reimport else self.state.get("copied", {})
+            self.state = {"auto": self.state.get("auto", True), "log": [], "asked": {}, "ticks": {}, "qf": {},
+                          "copied": copied}
+            self.rechecks, self.cache, self.seen = {}, {}, {}
+            for d in (self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
+                os.makedirs(d, exist_ok=True)
+            self.save()
+        what = ("archived to data/archive/%s" % name) if mode == "archive" else "deleted"
+        self.log("Restarted by %s: the gala's files and the portal's state %s%s" % (
+            who or "someone", what, "; questions and documents cleared" if questions else ""))
+        return {"archive": name if mode == "archive" else None}
+
+    def delete_archive(self, name):
+        p = os.path.join(self.root, "archive", name)
+        if not re.fullmatch(r"[\w -]{1,80}", name or "") or not os.path.isdir(p):
+            raise ValueError("no such archive")
+        shutil.rmtree(p)
+        self.log("Archive %s deleted for good" % name)
+
+    # ---- updates from GitHub (the portal folder is a git clone; update.sh does the work)
+    def project_dir(self):
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # portal/portal.py -> the project
+
+    def update_status(self, fetch=False):
+        d = self.project_dir()
+        out = {"git": os.path.isdir(os.path.join(d, ".git")) and bool(shutil.which("git")), "version": VERSION}
+        if not out["git"]:
+            return out
+
+        def git(*a, timeout=10):
+            r = subprocess.run(["git", "-C", d] + list(a), capture_output=True, text=True, timeout=timeout)
+            return r.stdout.strip() if r.returncode == 0 else None
+        try:
+            branch = git("rev-parse", "--abbrev-ref", "HEAD") or "main"
+            branch = "main" if branch == "HEAD" else branch
+            cached = getattr(self, "_upd", None)
+            if fetch or not cached or time.time() - cached > 600:
+                out["fetched"] = git("fetch", "-q", "origin", branch, timeout=30) is not None
+                self._upd = time.time() if out["fetched"] else None
+            out["checkedAt"] = getattr(self, "_upd", None)
+            out["current"] = git("log", "-1", "--format=%h|%cd|%s", "--date=format:%Y-%m-%d %H:%M")
+            log = git("log", "--format=%h|%cd|%s", "--date=format:%Y-%m-%d", "HEAD..origin/" + branch) or ""
+            out["behind"] = [dict(zip(("sha", "date", "subject"), x.split("|", 2))) for x in log.splitlines() if x]
+            out["ahead"] = int(git("rev-list", "--count", "origin/%s..HEAD" % branch) or 0)
+            out["changed"] = [x[3:] for x in (git("status", "--porcelain", "--untracked-files=no") or "").splitlines()
+                              if x[3:] != ".claude/settings.json"]   # start-portal.sh rewrites it; update.sh puts it back
+        except (OSError, subprocess.SubprocessError) as e:
+            out["error"] = str(e)
+        lf = os.path.join(d, ".portal", "update.log")
+        if os.path.exists(lf):
+            with open(lf, encoding="utf-8", errors="replace") as f:
+                out["log"] = f.read()[-3000:]
+        return out
+
+    def start_update(self, who, claude=False):
+        """Runs update.sh --restart on its own (it stops this portal, updates and starts it again)."""
+        d = self.project_dir()
+        st = self.update_status()
+        if not st.get("git"):
+            raise ValueError("this copy isn't a git clone, so it can't update itself")
+        if st.get("changed"):
+            raise ValueError("files were changed on this computer: %s" % ", ".join(st["changed"][:6]))
+        if st.get("ahead"):
+            raise ValueError("this copy has changes of its own that aren't on GitHub")
+        os.makedirs(os.path.join(d, ".portal"), exist_ok=True)
+        log = open(os.path.join(d, ".portal", "update.log"), "a", encoding="utf-8")
+        log.write("\n---- update asked for by %s\n" % who)
+        log.flush()
+        subprocess.Popen(["bash", os.path.join(d, "update.sh"), "--restart"] + (["--restart-claude"] if claude else []), cwd=d, stdout=log, stderr=log,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+        self.log("Update started by %s; the portal restarts in a minute" % who)
 
     def tick(self, key, checked, who):
         if not re.fullmatch(r"S\d{1,2}:[\w.:=() \-]{1,200}", key or ""):

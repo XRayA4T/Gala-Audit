@@ -116,3 +116,15 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .gnote span{flex:1}
 .gnote button{padding:0 6px;border:0;background:none;cursor:pointer;color:var(--muted)}
 .cl-ev button.primary.regen{padding:3px 10px;font-size:.85em;color:#fff}
+.rs-opts{display:flex;flex-direction:column;gap:8px;margin:12px 0}
+.rs-opts label{display:block}
+.rs-opts input[type=radio],.rs-opts input[type=checkbox]{width:auto!important;margin:0 8px 0 0;vertical-align:-2px;accent-color:var(--accent)}
+.rs-opts .rs-label{margin-left:26px;color:var(--muted)}
+.rs-opts .rs-label input,.rs-go input{width:auto!important;display:inline-block}
+.rs-go{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding-top:10px;border-top:1px solid var(--line)}
+.rs-go button{flex:0 0 auto}
+#rs-arch table{border-collapse:collapse;width:100%}
+#rs-arch td{padding:4px 8px;border-top:1px solid var(--line)}
+.up-list{margin:4px 0 0 18px;padding:0}
+.up-log{max-height:260px;overflow:auto;font-size:12px;background:var(--bg);padding:8px;border-radius:6px;white-space:pre-wrap}
+#up-card .bad{color:#cd2529}

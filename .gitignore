@@ -7,3 +7,6 @@
 __pycache__/
 *.pyc
 plugin-update/
+
+# Test galas with real swimmers (children's data): keep them on this computer only.
+simulation/

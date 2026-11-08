@@ -12,10 +12,39 @@ The gala's files stay on this computer. The page listens on every network (`0.0.
 officials can open it from other computers at the venue; it needs the key in its link, and it is plain HTTP, so
 use it on the venue's own network only. `--host 127.0.0.1` keeps it to this computer.
 
+## Install on a computer
+
+On Linux (or macOS), in a terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/XRayA4T/Gala-Audit/main/install.sh | bash
+```
+
+The installer checks for git, python3, tmux, curl and poppler and offers to install the missing ones; installs
+Claude Code if it isn't there; clones the portal into `~/CGA Gala Audit` (`--dir DIR` or `GALA_DIR` for
+elsewhere); installs the gala-ocr plugin; and adds **CGA Gala Audit Portal** to the applications menu (it starts
+the portal, updating it first). Run it again on a computer that has it and it updates instead. Options: `--yes`
+(install the missing tools without asking), `--no-launcher`. From a copy of this repository: `bash install.sh`.
+
+## Updates
+
+The portal is a git clone of this repository, and updates itself from it:
+
+- **On start**, `start-portal.sh` checks GitHub (a few seconds, skipped without internet) and says if an update is
+  available. `bash start-portal.sh --update` updates first.
+- **`bash update.sh`** updates now: it stops the portal, brings it up to date (`git merge --ff-only`), updates the
+  gala-ocr plugin, and starts the portal again if it was running. `--check` only says whether there's an update.
+  Claude Code keeps running unless you add `--restart-claude` (it picks up new instructions and the new plugin
+  when it next starts).
+- **The Restart tab's Updates card** lists the updates waiting, with an **Update now** button that does the same
+  and reloads the page when the portal is back (about a minute). Best between events or sessions.
+
+The gala's files (`data/`), the key and the questions (`.portal/`) are not in git and are never touched. If a
+portal file was changed by hand on that computer, the update stops and says which, rather than overwrite it.
+
 ## Start
 
 ```bash
-git clone https://github.com/XRayA4T/Gala-Audit.git "CGA Gala Audit"
 cd "CGA Gala Audit"
 bash start-portal.sh
 ```
@@ -119,6 +148,12 @@ missing, OCR lanes, audit report, status, Ask Claude); then DQ slips, ETD, DQ co
 our merge results, the final export and the final audit. Tick items off once you've checked them; ticks are
 shared. Drop a file on a row to add it.
 
+**Restart tab:** clears the gala out to start the next one: every session's files, files not sorted or still in
+the inbox, the ticks, quick-fix history, fixes and the activity log, and optionally the Questions, answers and
+Documents. Either **archive** it all (to `data/archive/<date time name>`, which can be deleted later from the same
+tab) or **delete it for good**. Linked inbox folders are left alone, and files already copied from them aren't
+copied in again unless you ask. Type RESTART (or DELETE) to confirm.
+
 Watch Claude work on the **Live** tab; long jobs show a progress bar under the tabs.
 
 ## The data folder
@@ -144,6 +179,7 @@ For the next gala, move the contents of `data/` to an archive folder (or use a c
 | File | |
 |---|---|
 | `start-portal.sh`, `stop-portal.sh` | Start and stop everything |
+| `install.sh`, `update.sh` | Install on a computer from GitHub; update from GitHub |
 | `CLAUDE.md` | Claude's instructions: its role, the folders, the skills, how to use the portal |
 | `portal/portal.py` | The portal (one Python file, standard library only; built from the QA Board) |
 | `portal/board-watch.py` | The watcher |

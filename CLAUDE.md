@@ -59,6 +59,9 @@ The event questions name the print to use.
 - **Merge results** (once every event is audited and Meet Manager's merge results export is in) and the
   **final audit** (once the final export is in), per session.
 
+Swimmers' names: when the entries file has a **preferred name** (D1 columns 49-68, a nickname in place of the legal first name),
+use it, not the first name, in answers and questions (the plugin does the same from 1.6.9).
+
 The questions give the exact commands. If several are waiting, do events in event order first. Events are
 numbered across the meet, so "event 12" is unique; heats come from the entries export.
 

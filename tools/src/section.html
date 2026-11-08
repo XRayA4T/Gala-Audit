@@ -15,3 +15,26 @@
 <div class="spills" id="cl-sess"></div>
 <div id="cl-body"></div>
 </section>
+<section id="v-restart" hidden>
+<div class="card"><h2 style="margin:0 0 4px;font-size:1.3em">Restart</h2>
+<div class="meta">Clear this gala out of the portal to start the next one: every session's files (scans, Gen7 PDFs, Meet Manager
+files, transcriptions, reports), files not sorted or still in the inbox, the checklist ticks, the quick-fix history, the fixes
+made here and the activity log. Linked inbox folders (the Gen7 or scanner shares) are left alone.</div>
+<div class="gstats" id="rs-sum"></div>
+<div class="rs-opts">
+ <label><input type="radio" name="rsmode" value="archive" checked> <b>Archive it</b> <span class="meta">moved to <code>data/archive/&lt;date time&gt;</code>; it can be looked at or deleted later</span></label>
+ <label class="rs-label">Archive name <input id="rs-label" placeholder="e.g. CGA Summer 3" size="28"></label>
+ <label><input type="radio" name="rsmode" value="delete"> <b>Delete it for good</b> <span class="meta">nothing is kept (the gala's files hold children's details)</span></label>
+ <label><input type="checkbox" id="rs-q"> Also clear the <b>Questions</b>, answers, <b>Documents</b> and deployments <span class="meta">(archived with the rest when archiving)</span></label>
+ <label><input type="checkbox" id="rs-re"> Copy in again the files still in linked inbox folders <span class="meta">(normally off: they belong to the gala being cleared)</span></label>
+</div>
+<div class="rs-go">Type <b id="rs-word">RESTART</b> to confirm: <input id="rs-confirm" size="10" autocomplete="off"> <button type="button" class="primary" id="rs-btn" disabled>Restart the portal</button> <span class="meta" id="rs-msg"></span></div>
+</div>
+<div class="card"><h3 style="margin:0 0 6px">Archives</h3><div id="rs-arch" class="meta">None yet.</div></div>
+<div class="card" id="up-card"><h3 style="margin:0 0 6px">Updates</h3>
+<div id="up-info" class="meta">Checking…</div>
+<div class="rs-go"><button type="button" id="up-check">Check now</button> <button type="button" class="primary" id="up-go" hidden>Update now</button>
+ <label id="up-claude-l" hidden><input type="checkbox" id="up-claude"> Restart Claude too <span class="meta">(picks up new instructions and plugin; only between events)</span></label></div>
+<details id="up-logd" hidden><summary class="meta">Update log</summary><pre id="up-log" class="up-log"></pre></details>
+</div>
+</section>

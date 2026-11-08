@@ -8,7 +8,7 @@ import re
 import sys
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
-VERSION = "0.9.0"
+VERSION = "0.11.0"
 s = open(sys.argv[1], encoding="utf-8").read()
 piece = lambda name: open(os.path.join(SRC, name), encoding="utf-8").read()  # noqa: E731
 
@@ -47,6 +47,9 @@ sub('''            if path == "/health":
             if path == "/api/gala/codes":
                 g = self._gala()
                 return self._json(200, g.code_list(int(q.get("session") or 1)) if g else {"codes": []})
+            if path == "/api/gala/update-status":
+                g = self._gala()
+                return self._json(200, g.update_status(q.get("fetch") == "1") if g else {"git": False})
             if path == "/api/gala/file":
                 return self._gala_file(q)''')
 sub('''        store = self.server.store
@@ -55,7 +58,8 @@ sub('''        store = self.server.store
         try:
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
-            if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck"):
+            if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck",
+                        "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/update"):
                 return self._gala_post(path, q)
             if path == "/api/live":''')
 # quieter log: the page and the watcher poll every few seconds
@@ -93,16 +97,17 @@ sub('<span>Q&amp;A Board <small class="ver">', '<span>Gala Audit Portal <small c
 sub('<nav class="views" id="views"><button data-v="questions">Questions</button>',
     '<nav class="views" id="views"><button data-v="gala">Gala</button><button data-v="checklist">Checklist</button>'
     '<button data-v="questions">Questions</button>')
+sub('<button data-v="users">Users</button></nav>', '<button data-v="users">Users</button><button data-v="restart">Restart</button></nav>')
 sub('<section id="v-questions">', piece("section.html") + '<section id="v-questions">')
 sub("\n.drop{border:2px dashed", "\n" + piece("gala.css") + "\n.drop{border:2px dashed")
 sub("let view=['#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'questions');",
-    "let view=['#gala','#checklist','#questions','#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'gala');\n"
+    "let view=['#gala','#checklist','#restart','#questions','#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'gala');\n"
     "// ?me=NAME (from start-portal.sh) picks \"I am\" the first time\n"
     "{const m=new URLSearchParams(location.search).get('me');if(m&&!store('qa-me'))store('qa-me',m)}")
 sub("$('#v-questions').hidden=v!=='questions';",
-    "$('#v-gala').hidden=v!=='gala';$('#v-checklist').hidden=v!=='checklist';$('#v-questions').hidden=v!=='questions';")
+    "$('#v-gala').hidden=v!=='gala';$('#v-checklist').hidden=v!=='checklist';$('#v-restart').hidden=v!=='restart';$('#v-questions').hidden=v!=='questions';")
 sub("function refresh(){loadUsers();view==='docs'?",
-    "function refresh(){loadUsers();(view==='gala'||view==='checklist')?loadGala():view==='docs'?")
+    "function refresh(){loadUsers();(view==='gala'||view==='checklist'||view==='restart')?loadGala():view==='docs'?")
 sub("function defaultTo(){const c=USERS.find(u=>u.name==='dev-claude')||",
     "function defaultTo(){const c=USERS.find(u=>u.name==='gala-claude')||USERS.find(u=>u.name==='dev-claude')||")
 sub("\n// ---- views\n", piece("gala.js") + "\n// ---- views\n")

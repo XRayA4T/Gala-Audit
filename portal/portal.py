@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.9.0"
+VERSION = "0.11.0"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 STATUSES = ("open", "answered", "resolved", "on_hold")
 
@@ -1234,7 +1234,8 @@ class Gala:
                     "unsorted": _ls(os.path.join(self.root, "unsorted")),
                     "sessions": [self.session(n) for n in self.sessions()],
                     "ticks": self.state["ticks"],
-                    "tools": {t: bool(shutil.which(t)) for t in ("pdfinfo", "pdftoppm", "pdftotext")}}
+                    "tools": {t: bool(shutil.which(t)) for t in ("pdfinfo", "pdftoppm", "pdftotext")},
+                    "summary": self.summary(), "archives": self.archives()}
 
     # ---------------------------------------------------------------- asking Claude
     def P(self, n, sub, name=""):
@@ -1583,7 +1584,9 @@ class Gala:
             name_score = score
             score += 0.3 if entered else 0
             if (words and name_score >= 0.5) or (not words and entered):
-                out.append((score, dict(s, entered=entered, name="%s, %s" % (s["surname"], s["first"]))))
+                # The preferred name, when the entries have one, is the name used (a nickname rather than the legal first name).
+                out.append((score, dict(s, entered=entered,
+                                        name="%s, %s" % (s["surname"], s.get("preferred") or s["first"]))))
         out.sort(key=lambda x: -x[0])
         return [dict(x, score=round(sc, 2)) for sc, x in out[:limit]]
 
@@ -1766,6 +1769,168 @@ class Gala:
                 pass
             return out
         return {"source": os.path.basename(path), "codes": self._cached("codes", path, run) or []}
+
+    # ---------------------------------------------------------------- restarting: clear the gala out
+    def _size(self, path):
+        if os.path.islink(path):
+            return 0, 0
+        if os.path.isfile(path):
+            return 1, os.path.getsize(path)
+        files = size = 0
+        for dp, dirs, fs in os.walk(path):
+            for f in fs:
+                try:
+                    size += os.path.getsize(os.path.join(dp, f))
+                    files += 1
+                except OSError:
+                    pass
+        return files, size
+
+    def _inbox_own(self):
+        """What is in the inbox itself: files and folders, but not linked folders (those belong to other computers)."""
+        return [os.path.join(self.inbox, f["name"]) for f in _ls(self.inbox)
+                if not self._linked(os.path.join(self.inbox, f["name"]))]
+
+    @staticmethod
+    def _linked(path):
+        """A folder that belongs to another computer: a symbolic link, or a share mounted straight into the inbox."""
+        return os.path.islink(path) or os.path.ismount(path)
+
+    def summary(self):
+        files, size = 0, 0
+        for p in [os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")] + self._inbox_own():
+            if os.path.exists(p):
+                f, b = self._size(p)
+                files, size = files + f, size + b
+        return {"sessions": len(self.sessions()), "files": files, "bytes": size,
+                "questions": self.store.db.execute("SELECT COUNT(*) FROM questions").fetchone()[0],
+                "documents": self.store.db.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
+                "linked": [f["name"] for f in _ls(self.inbox) if self._linked(os.path.join(self.inbox, f["name"]))]}
+
+    def archives(self):
+        out = []
+        for f in _ls(os.path.join(self.root, "archive")):
+            if f["dir"]:
+                n, b = self._size(os.path.join(self.root, "archive", f["name"]))
+                out.append({"name": f["name"], "files": n, "bytes": b, "mtime": f["mtime"]})
+        return sorted(out, key=lambda a: a["name"], reverse=True)
+
+    def restart(self, mode, questions, reimport, label, who):
+        """Clear the gala out: its sessions, unsorted files, what is waiting in the inbox (not linked folders) and the
+        portal's state (ticks, history, log). mode "archive" moves it all to data/archive/<date time label>/;
+        "delete" deletes it for good. questions: also clear the Questions, answers, documents and deployments.
+        reimport: forget which files were copied from linked inbox folders, so they are copied in again."""
+        if mode not in ("archive", "delete"):
+            raise ValueError("mode must be archive or delete")
+        with self.lock:
+            stamp = time.strftime("%Y-%m-%d_%H%M%S")
+            name = stamp + ("_" + re.sub(r"[^\w -]", "", label or "").strip()[:40] if (label or "").strip() else "")
+            dest = os.path.join(self.root, "archive", name)
+            moving = [os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted"),
+                      self.state_file] + self._inbox_own()
+            for p in moving:
+                if not os.path.exists(p):
+                    continue
+                if mode == "archive":
+                    rel = "inbox/" + os.path.basename(p) if os.path.dirname(p) == self.inbox else os.path.relpath(p, self.root)
+                    os.makedirs(os.path.dirname(os.path.join(dest, rel)), exist_ok=True)
+                    shutil.move(p, os.path.join(dest, rel))
+                elif os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p)
+                else:
+                    os.unlink(p)
+            if questions:
+                st = self.store
+                with st.lock:
+                    if mode == "archive":
+                        os.makedirs(dest, exist_ok=True)
+                        st.db.commit()
+                        bk = sqlite3.connect(os.path.join(dest, "portal-questions.db"))
+                        st.db.backup(bk)
+                        bk.close()
+                        if os.path.isdir(st.docdir):
+                            shutil.copytree(st.docdir, os.path.join(dest, "documents"), dirs_exist_ok=True)
+                    for t in ("answers", "questions", "document_versions", "documents", "deployments"):
+                        st.db.execute("DELETE FROM %s" % t)
+                    st.db.commit()
+                    st.attention = None
+                    if os.path.isdir(st.docdir):
+                        for f in os.listdir(st.docdir):
+                            if f == ".tmp":   # the store's upload area: keep it
+                                continue
+                            p = os.path.join(st.docdir, f)
+                            shutil.rmtree(p) if os.path.isdir(p) else os.unlink(p)
+            copied = {} if reimport else self.state.get("copied", {})
+            self.state = {"auto": self.state.get("auto", True), "log": [], "asked": {}, "ticks": {}, "qf": {},
+                          "copied": copied}
+            self.rechecks, self.cache, self.seen = {}, {}, {}
+            for d in (self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
+                os.makedirs(d, exist_ok=True)
+            self.save()
+        what = ("archived to data/archive/%s" % name) if mode == "archive" else "deleted"
+        self.log("Restarted by %s: the gala's files and the portal's state %s%s" % (
+            who or "someone", what, "; questions and documents cleared" if questions else ""))
+        return {"archive": name if mode == "archive" else None}
+
+    def delete_archive(self, name):
+        p = os.path.join(self.root, "archive", name)
+        if not re.fullmatch(r"[\w -]{1,80}", name or "") or not os.path.isdir(p):
+            raise ValueError("no such archive")
+        shutil.rmtree(p)
+        self.log("Archive %s deleted for good" % name)
+
+    # ---- updates from GitHub (the portal folder is a git clone; update.sh does the work)
+    def project_dir(self):
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # portal/portal.py -> the project
+
+    def update_status(self, fetch=False):
+        d = self.project_dir()
+        out = {"git": os.path.isdir(os.path.join(d, ".git")) and bool(shutil.which("git")), "version": VERSION}
+        if not out["git"]:
+            return out
+
+        def git(*a, timeout=10):
+            r = subprocess.run(["git", "-C", d] + list(a), capture_output=True, text=True, timeout=timeout)
+            return r.stdout.strip() if r.returncode == 0 else None
+        try:
+            branch = git("rev-parse", "--abbrev-ref", "HEAD") or "main"
+            branch = "main" if branch == "HEAD" else branch
+            cached = getattr(self, "_upd", None)
+            if fetch or not cached or time.time() - cached > 600:
+                out["fetched"] = git("fetch", "-q", "origin", branch, timeout=30) is not None
+                self._upd = time.time() if out["fetched"] else None
+            out["checkedAt"] = getattr(self, "_upd", None)
+            out["current"] = git("log", "-1", "--format=%h|%cd|%s", "--date=format:%Y-%m-%d %H:%M")
+            log = git("log", "--format=%h|%cd|%s", "--date=format:%Y-%m-%d", "HEAD..origin/" + branch) or ""
+            out["behind"] = [dict(zip(("sha", "date", "subject"), x.split("|", 2))) for x in log.splitlines() if x]
+            out["ahead"] = int(git("rev-list", "--count", "origin/%s..HEAD" % branch) or 0)
+            out["changed"] = [x[3:] for x in (git("status", "--porcelain", "--untracked-files=no") or "").splitlines()
+                              if x[3:] != ".claude/settings.json"]   # start-portal.sh rewrites it; update.sh puts it back
+        except (OSError, subprocess.SubprocessError) as e:
+            out["error"] = str(e)
+        lf = os.path.join(d, ".portal", "update.log")
+        if os.path.exists(lf):
+            with open(lf, encoding="utf-8", errors="replace") as f:
+                out["log"] = f.read()[-3000:]
+        return out
+
+    def start_update(self, who, claude=False):
+        """Runs update.sh --restart on its own (it stops this portal, updates and starts it again)."""
+        d = self.project_dir()
+        st = self.update_status()
+        if not st.get("git"):
+            raise ValueError("this copy isn't a git clone, so it can't update itself")
+        if st.get("changed"):
+            raise ValueError("files were changed on this computer: %s" % ", ".join(st["changed"][:6]))
+        if st.get("ahead"):
+            raise ValueError("this copy has changes of its own that aren't on GitHub")
+        os.makedirs(os.path.join(d, ".portal"), exist_ok=True)
+        log = open(os.path.join(d, ".portal", "update.log"), "a", encoding="utf-8")
+        log.write("\n---- update asked for by %s\n" % who)
+        log.flush()
+        subprocess.Popen(["bash", os.path.join(d, "update.sh"), "--restart"] + (["--restart-claude"] if claude else []), cwd=d, stdout=log, stderr=log,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+        self.log("Update started by %s; the portal restarts in a minute" % who)
 
     def tick(self, key, checked, who):
         if not re.fullmatch(r"S\d{1,2}:[\w.:=() \-]{1,200}", key or ""):
@@ -2455,6 +2620,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "question": row["id"]})
             elif path == "/api/gala/move":
                 g.move(str(d.get("path") or ""), int(d.get("session") or 0), str(d.get("folder") or ""))
+            elif path == "/api/gala/restart":
+                mode = str(d.get("mode") or "")
+                if str(d.get("confirm") or "").strip().upper() != ("DELETE" if mode == "delete" else "RESTART"):
+                    return self._json(400, {"error": "type %s to confirm" % ("DELETE" if mode == "delete" else "RESTART")})
+                return self._json(200, dict(g.restart(mode, bool(d.get("questions")), bool(d.get("reimport")),
+                                                      str(d.get("label") or ""), who), ok=True))
+            elif path == "/api/gala/update":
+                g.start_update(who, bool(d.get("claude")))
+            elif path == "/api/gala/archive-delete":
+                g.delete_archive(str(d.get("name") or ""))
             elif path == "/api/gala/recheck":
                 g.recheck(int(d.get("session") or 0), int(d.get("event") or 0), who)
             elif path == "/api/gala/fix":
@@ -2494,6 +2669,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/gala/codes":
                 g = self._gala()
                 return self._json(200, g.code_list(int(q.get("session") or 1)) if g else {"codes": []})
+            if path == "/api/gala/update-status":
+                g = self._gala()
+                return self._json(200, g.update_status(q.get("fetch") == "1") if g else {"git": False})
             if path == "/api/gala/file":
                 return self._gala_file(q)
             if path == "/api/questions":
@@ -2548,7 +2726,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
-            if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck"):
+            if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck",
+                        "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/update"):
                 return self._gala_post(path, q)
             if path == "/api/live":   # console snapshot from the board watcher
                 d = self._body(2 * 1024 * 1024)
@@ -3040,6 +3219,18 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .gnote span{flex:1}
 .gnote button{padding:0 6px;border:0;background:none;cursor:pointer;color:var(--muted)}
 .cl-ev button.primary.regen{padding:3px 10px;font-size:.85em;color:#fff}
+.rs-opts{display:flex;flex-direction:column;gap:8px;margin:12px 0}
+.rs-opts label{display:block}
+.rs-opts input[type=radio],.rs-opts input[type=checkbox]{width:auto!important;margin:0 8px 0 0;vertical-align:-2px;accent-color:var(--accent)}
+.rs-opts .rs-label{margin-left:26px;color:var(--muted)}
+.rs-opts .rs-label input,.rs-go input{width:auto!important;display:inline-block}
+.rs-go{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding-top:10px;border-top:1px solid var(--line)}
+.rs-go button{flex:0 0 auto}
+#rs-arch table{border-collapse:collapse;width:100%}
+#rs-arch td{padding:4px 8px;border-top:1px solid var(--line)}
+.up-list{margin:4px 0 0 18px;padding:0}
+.up-log{max-height:260px;overflow:auto;font-size:12px;background:var(--bg);padding:8px;border-radius:6px;white-space:pre-wrap}
+#up-card .bad{color:#cd2529}
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -3057,7 +3248,7 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 <header><div class="brand"><img src="/favicon.svg" alt="" width="34" height="34"><h1>{BRAND_HTML}<span>Gala Audit Portal <small class="ver">v{VERSION}</small></span></h1></div>
 <button class="mini" id="mini" hidden title="Claude's console - open the Live view" aria-label="Open the Live view"><pre id="minipre"></pre><span class="led"></span></button>
 <label class="me">I am <select id="me"><option value="">choose…</option></select></label></header>
-<nav class="views" id="views"><button data-v="gala">Gala</button><button data-v="checklist">Checklist</button><button data-v="questions">Questions</button><button data-v="docs">Documents</button><button data-v="live">Live</button><button data-v="deploys">Deploys</button><button data-v="users">Users</button></nav>
+<nav class="views" id="views"><button data-v="gala">Gala</button><button data-v="checklist">Checklist</button><button data-v="questions">Questions</button><button data-v="docs">Documents</button><button data-v="live">Live</button><button data-v="deploys">Deploys</button><button data-v="users">Users</button><button data-v="restart">Restart</button></nav>
 <div class="deps" id="deps" hidden></div>
 </div>
 
@@ -3077,6 +3268,29 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 <section id="v-checklist" hidden>
 <div class="spills" id="cl-sess"></div>
 <div id="cl-body"></div>
+</section>
+<section id="v-restart" hidden>
+<div class="card"><h2 style="margin:0 0 4px;font-size:1.3em">Restart</h2>
+<div class="meta">Clear this gala out of the portal to start the next one: every session's files (scans, Gen7 PDFs, Meet Manager
+files, transcriptions, reports), files not sorted or still in the inbox, the checklist ticks, the quick-fix history, the fixes
+made here and the activity log. Linked inbox folders (the Gen7 or scanner shares) are left alone.</div>
+<div class="gstats" id="rs-sum"></div>
+<div class="rs-opts">
+ <label><input type="radio" name="rsmode" value="archive" checked> <b>Archive it</b> <span class="meta">moved to <code>data/archive/&lt;date time&gt;</code>; it can be looked at or deleted later</span></label>
+ <label class="rs-label">Archive name <input id="rs-label" placeholder="e.g. CGA Summer 3" size="28"></label>
+ <label><input type="radio" name="rsmode" value="delete"> <b>Delete it for good</b> <span class="meta">nothing is kept (the gala's files hold children's details)</span></label>
+ <label><input type="checkbox" id="rs-q"> Also clear the <b>Questions</b>, answers, <b>Documents</b> and deployments <span class="meta">(archived with the rest when archiving)</span></label>
+ <label><input type="checkbox" id="rs-re"> Copy in again the files still in linked inbox folders <span class="meta">(normally off: they belong to the gala being cleared)</span></label>
+</div>
+<div class="rs-go">Type <b id="rs-word">RESTART</b> to confirm: <input id="rs-confirm" size="10" autocomplete="off"> <button type="button" class="primary" id="rs-btn" disabled>Restart the portal</button> <span class="meta" id="rs-msg"></span></div>
+</div>
+<div class="card"><h3 style="margin:0 0 6px">Archives</h3><div id="rs-arch" class="meta">None yet.</div></div>
+<div class="card" id="up-card"><h3 style="margin:0 0 6px">Updates</h3>
+<div id="up-info" class="meta">Checking…</div>
+<div class="rs-go"><button type="button" id="up-check">Check now</button> <button type="button" class="primary" id="up-go" hidden>Update now</button>
+ <label id="up-claude-l" hidden><input type="checkbox" id="up-claude"> Restart Claude too <span class="meta">(picks up new instructions and plugin; only between events)</span></label></div>
+<details id="up-logd" hidden><summary class="meta">Update log</summary><pre id="up-log" class="up-log"></pre></details>
+</div>
 </section>
 <section id="v-questions">
 <details class="card new" id="newbox"><summary>Ask a question</summary>
@@ -3192,7 +3406,7 @@ async function loadGala(){
  const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;GALA=j;
  if(!j.root){$('#g-root').textContent='This portal was started without a data folder (--gala-data).';return}
  const cs=curSession();if(cs)GSESS=cs.n;
- renderGalaHead();renderPills('#g-sess');renderPills('#cl-sess');renderSession();renderActivity();renderChecklist()}
+ renderGalaHead();renderRestart();renderPills('#g-sess');renderPills('#cl-sess');renderSession();renderActivity();renderChecklist()}
 function renderGalaHead(){
  $('#g-root').innerHTML='Data folder: <code>'+esc(GALA.root)+'</code><br>Inbox: <code>'+esc(GALA.inbox)+'</code>'
   +(GALA.waiting.length?` · <span class="gwarn">${GALA.waiting.length} file${GALA.waiting.length>1?'s':''} arriving</span>`:'');
@@ -3352,7 +3566,7 @@ for(const sec of ['#v-gala','#v-checklist']){const el=$(sec);el.addEventListener
   galaUpload(folder,fs,c)})}
 $('#g-inboxfile').addEventListener('change',e=>{if(e.target.files.length)galaUpload('inbox',[...e.target.files],$('#g-inbox'))});
 $('#g-auto').addEventListener('change',e=>galaPost('/api/gala/auto',{auto:e.target.checked}).then(()=>{galaSig='';loadGala()}));
-setInterval(()=>{if(!document.hidden&&(view==='gala'||view==='checklist'))loadGala()},4000);
+setInterval(()=>{if(!document.hidden&&(view==='gala'||view==='checklist'||view==='restart'))loadGala()},4000);
 
 // After the last quick fix of an event is done (ticked or fixed here), offer to write its merge results again.
 function offerRegen(key,justDone){
@@ -3426,7 +3640,7 @@ async function swFill(box,q){
  try{SWCACHE[key]=SWCACHE[key]||(await api('/api/gala/swimmers?session='+n+'&event='+ev+'&q='+encodeURIComponent(q))).swimmers}catch(err){list.textContent='Could not search the entries: '+err.message;return}
  const rows=SWCACHE[key],chosen=box.dataset.chosen,prev=(box.querySelector('input[name=swpick]:checked')||{}).value;
  list.innerHTML=rows.length?rows.map((w,i)=>`<label class="swopt"><input type="radio" name="swpick" value="${esc(w.id)}" data-name="${esc(w.name)}"${(prev||chosen)===w.id||(!prev&&!chosen&&i===0&&(w.entered||w.score>=0.8))?' checked':''}>
-   ${esc(w.name)}${w.preferred&&w.preferred.toLowerCase()!==w.first.toLowerCase()?' <span class="meta">('+esc(w.preferred)+')</span>':''} <span class="meta">${esc([w.sex==='F'?'girl':w.sex==='M'?'boy':'',w.age&&('age '+w.age),w.team].filter(Boolean).join(' · '))}</span>
+   ${esc(w.name)}${w.preferred&&w.preferred.toLowerCase()!==w.first.toLowerCase()?' <span class="meta">(first name '+esc(w.first)+')</span>':''} <span class="meta">${esc([w.sex==='F'?'girl':w.sex==='M'?'boy':'',w.age&&('age '+w.age),w.team].filter(Boolean).join(' · '))}</span>
    ${w.entered?'<span class="ok">entered in this event</span>':'<span class="gwarn">not entered in this event</span>'}${i===0&&q&&!prev&&!chosen?' <span class="meta">(best match)</span>':''}</label>`).join('')
   +'<label class="swopt"><input type="radio" name="swpick" value=""> none of these</label>'
   :'<span class="meta">No swimmer in the entries matches.</span>'}
@@ -3495,16 +3709,73 @@ function galaNotice(text,kind){
  const n=document.createElement('div');n.className='gnote'+(kind==='error'?' err':'');n.innerHTML=`<span>${esc(text)}</span><button type="button" aria-label="Close">✕</button>`;
  n.querySelector('button').onclick=()=>n.remove();box.appendChild(n);setTimeout(()=>n.remove(),kind==='error'?12000:6000)}
 
+// ---- Restart tab: archive or delete the gala and start again
+function renderRestart(){
+ if(!GALA||!GALA.summary)return;const s=GALA.summary;
+ const stat=(n,t)=>`<div class="gstat"><b>${n}</b><span class="meta">${t}</span></div>`;
+ $('#rs-sum').innerHTML=stat(s.sessions,'sessions')+stat(s.files,'files')+stat(size(s.bytes),'on disk')+stat(s.questions,'questions')+stat(s.documents,'documents')
+  +(s.linked.length?`<div class="meta" style="align-self:center">Linked inbox folders, left alone: ${esc(s.linked.join(', '))}</div>`:'');
+ const a=GALA.archives||[];
+ $('#rs-arch').innerHTML=a.length?'<table>'+a.map(x=>`<tr><td><code>data/archive/${esc(x.name)}</code></td><td>${x.files} files · ${size(x.bytes)}</td><td style="text-align:right"><button type="button" data-rsdel="${esc(x.name)}">Delete for good</button></td></tr>`).join('')+'</table>':'None yet.'}
+function rsCheck(){const mode=(document.querySelector('input[name=rsmode]:checked')||{}).value,w=mode==='delete'?'DELETE':'RESTART';
+ $('#rs-word').textContent=w;$('#rs-btn').disabled=$('#rs-confirm').value.trim().toUpperCase()!==w;$('#rs-btn').textContent=mode==='delete'?'Delete and restart':'Archive and restart'}
+$('#v-restart').addEventListener('input',rsCheck);$('#v-restart').addEventListener('change',rsCheck);
+$('#rs-btn').addEventListener('click',async()=>{
+ const mode=document.querySelector('input[name=rsmode]:checked').value,q=$('#rs-q').checked;
+ const ok=await galaDialog({title:mode==='delete'?'Delete this gala for good?':'Archive this gala and start again?',
+  text:(mode==='delete'?'Every session\'s files, the ticks, fixes and history are deleted and can\'t be brought back.':'Everything is moved to data/archive and the portal starts empty.')+(q?' The questions, answers and documents are cleared too.':'')+' Claude carries on, but its earlier work will be gone from the portal.',
+  ok:mode==='delete'?'Delete for good':'Archive and restart',cancel:'Cancel'});
+ if(!ok)return;$('#rs-btn').disabled=true;$('#rs-msg').textContent='Working…';
+ try{const j=await galaPost('/api/gala/restart',{mode,questions:q,reimport:$('#rs-re').checked,label:$('#rs-label').value,confirm:$('#rs-confirm').value});
+  $('#rs-confirm').value='';rsCheck();$('#rs-msg').textContent='';galaNotice(j.archive?'Archived to data/archive/'+j.archive+'. The portal is empty and ready for the next gala.':'Deleted. The portal is empty and ready for the next gala.');
+  try{localStorage.removeItem('qa-drafts')}catch(e){}GSESS=0;galaSig='';loadGala()}
+ catch(err){$('#rs-msg').textContent='';galaNotice(err.message,'error');rsCheck()}});
+$('#rs-arch').addEventListener('click',async ev=>{const b=ev.target.closest('[data-rsdel]');if(!b)return;
+ if(!await galaDialog({title:'Delete archive '+b.dataset.rsdel+' for good?',text:'Its files are deleted and can\'t be brought back.',ok:'Delete for good',cancel:'Keep it'}))return;
+ galaPost('/api/gala/archive-delete',{name:b.dataset.rsdel}).then(()=>{galaNotice('Archive deleted.');galaSig='';loadGala()}).catch(err=>galaNotice(err.message,'error'))});
+
+// ---- Restart tab: updates from GitHub (update.sh)
+let UPD=null,updAt=0;
+async function loadUpdate(fetch){
+ try{UPD=await api('/api/gala/update-status'+(fetch?'?fetch=1':''));updAt=Date.now()}catch(e){$('#up-info').textContent='Could not check: '+e.message;return}
+ renderUpdate()}
+function renderUpdate(){const u=UPD;if(!u)return;const go=$('#up-go'),cl=$('#up-claude-l');go.hidden=cl.hidden=true;
+ if(!u.git){$('#up-info').innerHTML='This copy of the portal (v'+esc(u.version)+') isn\'t a git clone, so it can\'t update itself. Install it with <code>install.sh</code> to get updates.';return}
+ const cur=(u.current||'').split('|');let h='Installed: <b>v'+esc(u.version)+'</b> · <code>'+esc(cur[0]||'?')+'</code> '+esc(cur[1]||'')+(cur[2]?' – '+esc(cur[2]):'');
+ if(u.fetched===false)h+='<br><span class="bad">Couldn\'t reach GitHub just now (no internet?).</span>';
+ if(u.checkedAt)h+='<br>Checked '+new Date(u.checkedAt*1000).toLocaleTimeString()+'.';
+ const b=u.behind||[];
+ if(u.changed&&u.changed.length)h+='<br><span class="bad">Portal files were changed on this computer, so it won\'t update: '+esc(u.changed.join(', '))+'</span>';
+ else if(u.ahead)h+='<br><span class="bad">This copy has '+u.ahead+' change(s) of its own that aren\'t on GitHub (the development copy?), so it won\'t update.</span>';
+ if(b.length){h+='<br><b>'+b.length+' update'+(b.length>1?'s':'')+' available:</b><ul class="up-list">'+b.slice(0,15).map(c=>'<li><code>'+esc(c.sha)+'</code> '+esc(c.date)+' – '+esc(c.subject)+'</li>').join('')+'</ul>';
+  if(!(u.changed&&u.changed.length)&&!u.ahead)go.hidden=cl.hidden=false}
+ else if(u.fetched!==false)h+='<br>Up to date.';
+ $('#up-info').innerHTML=h;
+ if(u.log){$('#up-logd').hidden=false;$('#up-log').textContent=u.log}}
+$('#up-check').addEventListener('click',()=>{$('#up-info').textContent='Checking GitHub…';loadUpdate(true)});
+$('#up-go').addEventListener('click',async()=>{const claude=$('#up-claude').checked;
+ if(!await galaDialog({title:'Update the portal now?',text:'The portal stops, updates from GitHub (and the gala-ocr plugin), and starts again, which takes about a minute; this page reloads itself. The gala\'s files, ticks, fixes and questions are kept.'+(claude?' Claude Code is restarted too: do this between events, not while Claude is auditing one.':' Claude Code keeps running.'),ok:'Update now',cancel:'Not now'}))return;
+ $('#up-go').disabled=true;
+ try{await galaPost('/api/gala/update',{claude})}catch(err){$('#up-go').disabled=false;galaNotice(err.message,'error');return}
+ galaNotice('Updating… the page reloads when the portal is back.');$('#up-info').textContent='Updating…';
+ const was=UPD&&UPD.current;let down=false;const t0=Date.now();
+ const poll=async()=>{if(Date.now()-t0>180000){galaNotice('The portal hasn\'t come back after 3 minutes. Look at .portal/update.log, or run bash start-portal.sh.','error');return}
+  try{const r=await fetch(url('/api/gala/update-status'),{cache:'no-store'});if(r.ok){const j=await r.json();
+   if(down||(j.current&&j.current!==was)){location.reload();return}}else down=true}catch(e){down=true}
+  setTimeout(poll,3000)};setTimeout(poll,4000)});
+// check when the Restart tab is shown (every 10 minutes at most)
+setInterval(()=>{if(!document.hidden&&view==='restart'&&Date.now()-updAt>600000)loadUpdate(false)},5000);
+
 // ---- views
-let view=['#gala','#checklist','#questions','#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'gala');
+let view=['#gala','#checklist','#restart','#questions','#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'gala');
 // ?me=NAME (from start-portal.sh) picks "I am" the first time
 {const m=new URLSearchParams(location.search).get('me');if(m&&!store('qa-me'))store('qa-me',m)}
 function showView(v){view=v;store('qa-view',v);if(v!=='deploys')focusDep=null;
  document.querySelectorAll('#views button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
- $('#v-gala').hidden=v!=='gala';$('#v-checklist').hidden=v!=='checklist';$('#v-questions').hidden=v!=='questions';$('#v-docs').hidden=v!=='docs';$('#v-live').hidden=v!=='live';$('#v-users').hidden=v!=='users';$('#v-deploys').hidden=v!=='deploys';refresh()}
+ $('#v-gala').hidden=v!=='gala';$('#v-checklist').hidden=v!=='checklist';$('#v-restart').hidden=v!=='restart';$('#v-questions').hidden=v!=='questions';$('#v-docs').hidden=v!=='docs';$('#v-live').hidden=v!=='live';$('#v-users').hidden=v!=='users';$('#v-deploys').hidden=v!=='deploys';refresh()}
 $('#views').onclick=e=>{const b=e.target.closest('button');if(b&&b.dataset.v)showView(b.dataset.v)};
 $('#mini').onclick=()=>{showView('live');window.scrollTo(0,0)};
-function refresh(){loadUsers();(view==='gala'||view==='checklist')?loadGala():view==='docs'?loadDocs():view==='live'?loadLive():view==='users'?null:view==='deploys'?loadDeps():load()}
+function refresh(){loadUsers();(view==='gala'||view==='checklist'||view==='restart')?loadGala():view==='docs'?loadDocs():view==='live'?loadLive():view==='users'?null:view==='deploys'?loadDeps():load()}
 setInterval(()=>{if(!document.hidden)loadLive()},2000);
 
 // ---- live console (sent by the board watcher on the server, when it runs with --live)

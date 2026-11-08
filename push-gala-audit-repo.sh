@@ -28,7 +28,7 @@ git remote get-url origin >/dev/null 2>&1 && git remote set-url origin "$URL" ||
 
 git add -A
 # Safety: nothing from the gala, the key or local settings may be committed.
-BAD="$(git diff --cached --name-only | grep -E '^(data/(.+/)?[^/]+|\.portal/|\.mcp\.json$|\.claude/settings\.local\.json$)' | grep -vx 'data/README.txt' || true)"
+BAD="$(git diff --cached --name-only | grep -E '^(data/(.+/)?[^/]+|simulation/|plugin-update/|.*\.(hy3|zip|pdf|cl2|ev3|hyv)$|\.portal/|\.mcp\.json$|\.claude/settings\.local\.json$)' | grep -vx 'data/README.txt' || true)"
 if [ -n "$BAD" ]; then
   echo "Refusing to commit these files (gala data or private settings):"; echo "$BAD"
   git reset -q; exit 1

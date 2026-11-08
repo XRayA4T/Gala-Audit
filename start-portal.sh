@@ -10,12 +10,14 @@
 # Options:  --port N (default 9000)   --host ADDR (default 0.0.0.0: every network; 127.0.0.1: this computer only)
 #             --inbox DIR (default data/inbox)   --name "Gala name"
 #           --no-browser   --attach (put this terminal into Claude's session; leave it with Ctrl-b d)
+#           --update (update from GitHub first, with update.sh)   --no-update-check
 # Stop everything with:  bash stop-portal.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-PORT="${PORTAL_PORT:-9000}"; HOST="${PORTAL_HOST:-0.0.0.0}"; INBOX="${GALA_INBOX:-data/inbox}"; TERM_PORT=""; BROWSER=1; ATTACH=0; NAME="CGA Gala Audit"
+ORIG_ARGS=("$@")
+PORT="${PORTAL_PORT:-9000}"; HOST="${PORTAL_HOST:-0.0.0.0}"; INBOX="${GALA_INBOX:-data/inbox}"; TERM_PORT=""; BROWSER=1; ATTACH=0; UPDATE=0; NAME="CGA Gala Audit"
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
@@ -25,7 +27,9 @@ while [ $# -gt 0 ]; do
     --no-browser) BROWSER=0; shift ;;
     --attach) ATTACH=1; shift ;;
     --no-attach) ATTACH=0; shift ;;   # the default now; kept so older commands still work
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    --update) UPDATE=1; shift ;;
+    --no-update-check) UPDATE=-1; shift ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1"; exit 2 ;;
   esac
 done
@@ -36,6 +40,21 @@ BOARD="http://127.0.0.1:$PORT"
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mxx\033[0m %s\n' "$*"; exit 1; }
+
+# ---- 0. updates from GitHub (a git clone only)
+if [ -d .git ] && [ -f update.sh ]; then
+  if [ "$UPDATE" = 1 ]; then
+    before="$(git rev-parse HEAD)"
+    bash update.sh || warn "Not updated; starting the version installed."
+    if [ "$(git rev-parse HEAD)" != "$before" ]; then   # run the new start-portal.sh
+      args=(); for a in "${ORIG_ARGS[@]}"; do [ "$a" = --update ] || args+=("$a"); done
+      exec bash "$0" --no-update-check "${args[@]}"
+    fi
+  elif [ "$UPDATE" = 0 ]; then
+    rc=0; timeout 20 bash update.sh --check >/dev/null 2>&1 || rc=$?
+    [ "$rc" = 10 ] && warn "An update is available: bash update.sh  (or start with --update, or the Update button on the Restart tab)"
+  fi
+fi
 
 # ---- 1. tools
 command -v python3 >/dev/null || die "python3 is needed."
@@ -49,6 +68,8 @@ done
 # ---- 2. folders and key
 mkdir -p .portal data/sessions data/unsorted "$INBOX"
 chmod 700 .portal
+# remember how it was started, so update.sh starts it again the same way
+printf '%q ' --port "$PORT" --host "$HOST" --inbox "$INBOX" --name "$NAME" > .portal/start-args
 [ -s .portal/key ] || python3 -c 'import secrets;print(secrets.token_urlsafe(18))' > .portal/key
 chmod 600 .portal/key
 KEY="$(cat .portal/key)"

@@ -20,7 +20,7 @@ async function loadGala(){
  const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;GALA=j;
  if(!j.root){$('#g-root').textContent='This portal was started without a data folder (--gala-data).';return}
  const cs=curSession();if(cs)GSESS=cs.n;
- renderGalaHead();renderPills('#g-sess');renderPills('#cl-sess');renderSession();renderActivity();renderChecklist()}
+ renderGalaHead();renderRestart();renderPills('#g-sess');renderPills('#cl-sess');renderSession();renderActivity();renderChecklist()}
 function renderGalaHead(){
  $('#g-root').innerHTML='Data folder: <code>'+esc(GALA.root)+'</code><br>Inbox: <code>'+esc(GALA.inbox)+'</code>'
   +(GALA.waiting.length?` · <span class="gwarn">${GALA.waiting.length} file${GALA.waiting.length>1?'s':''} arriving</span>`:'');
@@ -180,7 +180,7 @@ for(const sec of ['#v-gala','#v-checklist']){const el=$(sec);el.addEventListener
   galaUpload(folder,fs,c)})}
 $('#g-inboxfile').addEventListener('change',e=>{if(e.target.files.length)galaUpload('inbox',[...e.target.files],$('#g-inbox'))});
 $('#g-auto').addEventListener('change',e=>galaPost('/api/gala/auto',{auto:e.target.checked}).then(()=>{galaSig='';loadGala()}));
-setInterval(()=>{if(!document.hidden&&(view==='gala'||view==='checklist'))loadGala()},4000);
+setInterval(()=>{if(!document.hidden&&(view==='gala'||view==='checklist'||view==='restart'))loadGala()},4000);
 
 // After the last quick fix of an event is done (ticked or fixed here), offer to write its merge results again.
 function offerRegen(key,justDone){
@@ -254,7 +254,7 @@ async function swFill(box,q){
  try{SWCACHE[key]=SWCACHE[key]||(await api('/api/gala/swimmers?session='+n+'&event='+ev+'&q='+encodeURIComponent(q))).swimmers}catch(err){list.textContent='Could not search the entries: '+err.message;return}
  const rows=SWCACHE[key],chosen=box.dataset.chosen,prev=(box.querySelector('input[name=swpick]:checked')||{}).value;
  list.innerHTML=rows.length?rows.map((w,i)=>`<label class="swopt"><input type="radio" name="swpick" value="${esc(w.id)}" data-name="${esc(w.name)}"${(prev||chosen)===w.id||(!prev&&!chosen&&i===0&&(w.entered||w.score>=0.8))?' checked':''}>
-   ${esc(w.name)}${w.preferred&&w.preferred.toLowerCase()!==w.first.toLowerCase()?' <span class="meta">('+esc(w.preferred)+')</span>':''} <span class="meta">${esc([w.sex==='F'?'girl':w.sex==='M'?'boy':'',w.age&&('age '+w.age),w.team].filter(Boolean).join(' · '))}</span>
+   ${esc(w.name)}${w.preferred&&w.preferred.toLowerCase()!==w.first.toLowerCase()?' <span class="meta">(first name '+esc(w.first)+')</span>':''} <span class="meta">${esc([w.sex==='F'?'girl':w.sex==='M'?'boy':'',w.age&&('age '+w.age),w.team].filter(Boolean).join(' · '))}</span>
    ${w.entered?'<span class="ok">entered in this event</span>':'<span class="gwarn">not entered in this event</span>'}${i===0&&q&&!prev&&!chosen?' <span class="meta">(best match)</span>':''}</label>`).join('')
   +'<label class="swopt"><input type="radio" name="swpick" value=""> none of these</label>'
   :'<span class="meta">No swimmer in the entries matches.</span>'}
@@ -322,3 +322,60 @@ function galaNotice(text,kind){
  let box=$('#gnotes');if(!box){box=document.createElement('div');box.id='gnotes';box.setAttribute('aria-live','polite');document.body.appendChild(box)}
  const n=document.createElement('div');n.className='gnote'+(kind==='error'?' err':'');n.innerHTML=`<span>${esc(text)}</span><button type="button" aria-label="Close">✕</button>`;
  n.querySelector('button').onclick=()=>n.remove();box.appendChild(n);setTimeout(()=>n.remove(),kind==='error'?12000:6000)}
+
+// ---- Restart tab: archive or delete the gala and start again
+function renderRestart(){
+ if(!GALA||!GALA.summary)return;const s=GALA.summary;
+ const stat=(n,t)=>`<div class="gstat"><b>${n}</b><span class="meta">${t}</span></div>`;
+ $('#rs-sum').innerHTML=stat(s.sessions,'sessions')+stat(s.files,'files')+stat(size(s.bytes),'on disk')+stat(s.questions,'questions')+stat(s.documents,'documents')
+  +(s.linked.length?`<div class="meta" style="align-self:center">Linked inbox folders, left alone: ${esc(s.linked.join(', '))}</div>`:'');
+ const a=GALA.archives||[];
+ $('#rs-arch').innerHTML=a.length?'<table>'+a.map(x=>`<tr><td><code>data/archive/${esc(x.name)}</code></td><td>${x.files} files · ${size(x.bytes)}</td><td style="text-align:right"><button type="button" data-rsdel="${esc(x.name)}">Delete for good</button></td></tr>`).join('')+'</table>':'None yet.'}
+function rsCheck(){const mode=(document.querySelector('input[name=rsmode]:checked')||{}).value,w=mode==='delete'?'DELETE':'RESTART';
+ $('#rs-word').textContent=w;$('#rs-btn').disabled=$('#rs-confirm').value.trim().toUpperCase()!==w;$('#rs-btn').textContent=mode==='delete'?'Delete and restart':'Archive and restart'}
+$('#v-restart').addEventListener('input',rsCheck);$('#v-restart').addEventListener('change',rsCheck);
+$('#rs-btn').addEventListener('click',async()=>{
+ const mode=document.querySelector('input[name=rsmode]:checked').value,q=$('#rs-q').checked;
+ const ok=await galaDialog({title:mode==='delete'?'Delete this gala for good?':'Archive this gala and start again?',
+  text:(mode==='delete'?'Every session\'s files, the ticks, fixes and history are deleted and can\'t be brought back.':'Everything is moved to data/archive and the portal starts empty.')+(q?' The questions, answers and documents are cleared too.':'')+' Claude carries on, but its earlier work will be gone from the portal.',
+  ok:mode==='delete'?'Delete for good':'Archive and restart',cancel:'Cancel'});
+ if(!ok)return;$('#rs-btn').disabled=true;$('#rs-msg').textContent='Working…';
+ try{const j=await galaPost('/api/gala/restart',{mode,questions:q,reimport:$('#rs-re').checked,label:$('#rs-label').value,confirm:$('#rs-confirm').value});
+  $('#rs-confirm').value='';rsCheck();$('#rs-msg').textContent='';galaNotice(j.archive?'Archived to data/archive/'+j.archive+'. The portal is empty and ready for the next gala.':'Deleted. The portal is empty and ready for the next gala.');
+  try{localStorage.removeItem('qa-drafts')}catch(e){}GSESS=0;galaSig='';loadGala()}
+ catch(err){$('#rs-msg').textContent='';galaNotice(err.message,'error');rsCheck()}});
+$('#rs-arch').addEventListener('click',async ev=>{const b=ev.target.closest('[data-rsdel]');if(!b)return;
+ if(!await galaDialog({title:'Delete archive '+b.dataset.rsdel+' for good?',text:'Its files are deleted and can\'t be brought back.',ok:'Delete for good',cancel:'Keep it'}))return;
+ galaPost('/api/gala/archive-delete',{name:b.dataset.rsdel}).then(()=>{galaNotice('Archive deleted.');galaSig='';loadGala()}).catch(err=>galaNotice(err.message,'error'))});
+
+// ---- Restart tab: updates from GitHub (update.sh)
+let UPD=null,updAt=0;
+async function loadUpdate(fetch){
+ try{UPD=await api('/api/gala/update-status'+(fetch?'?fetch=1':''));updAt=Date.now()}catch(e){$('#up-info').textContent='Could not check: '+e.message;return}
+ renderUpdate()}
+function renderUpdate(){const u=UPD;if(!u)return;const go=$('#up-go'),cl=$('#up-claude-l');go.hidden=cl.hidden=true;
+ if(!u.git){$('#up-info').innerHTML='This copy of the portal (v'+esc(u.version)+') isn\'t a git clone, so it can\'t update itself. Install it with <code>install.sh</code> to get updates.';return}
+ const cur=(u.current||'').split('|');let h='Installed: <b>v'+esc(u.version)+'</b> · <code>'+esc(cur[0]||'?')+'</code> '+esc(cur[1]||'')+(cur[2]?' – '+esc(cur[2]):'');
+ if(u.fetched===false)h+='<br><span class="bad">Couldn\'t reach GitHub just now (no internet?).</span>';
+ if(u.checkedAt)h+='<br>Checked '+new Date(u.checkedAt*1000).toLocaleTimeString()+'.';
+ const b=u.behind||[];
+ if(u.changed&&u.changed.length)h+='<br><span class="bad">Portal files were changed on this computer, so it won\'t update: '+esc(u.changed.join(', '))+'</span>';
+ else if(u.ahead)h+='<br><span class="bad">This copy has '+u.ahead+' change(s) of its own that aren\'t on GitHub (the development copy?), so it won\'t update.</span>';
+ if(b.length){h+='<br><b>'+b.length+' update'+(b.length>1?'s':'')+' available:</b><ul class="up-list">'+b.slice(0,15).map(c=>'<li><code>'+esc(c.sha)+'</code> '+esc(c.date)+' – '+esc(c.subject)+'</li>').join('')+'</ul>';
+  if(!(u.changed&&u.changed.length)&&!u.ahead)go.hidden=cl.hidden=false}
+ else if(u.fetched!==false)h+='<br>Up to date.';
+ $('#up-info').innerHTML=h;
+ if(u.log){$('#up-logd').hidden=false;$('#up-log').textContent=u.log}}
+$('#up-check').addEventListener('click',()=>{$('#up-info').textContent='Checking GitHub…';loadUpdate(true)});
+$('#up-go').addEventListener('click',async()=>{const claude=$('#up-claude').checked;
+ if(!await galaDialog({title:'Update the portal now?',text:'The portal stops, updates from GitHub (and the gala-ocr plugin), and starts again, which takes about a minute; this page reloads itself. The gala\'s files, ticks, fixes and questions are kept.'+(claude?' Claude Code is restarted too: do this between events, not while Claude is auditing one.':' Claude Code keeps running.'),ok:'Update now',cancel:'Not now'}))return;
+ $('#up-go').disabled=true;
+ try{await galaPost('/api/gala/update',{claude})}catch(err){$('#up-go').disabled=false;galaNotice(err.message,'error');return}
+ galaNotice('Updating… the page reloads when the portal is back.');$('#up-info').textContent='Updating…';
+ const was=UPD&&UPD.current;let down=false;const t0=Date.now();
+ const poll=async()=>{if(Date.now()-t0>180000){galaNotice('The portal hasn\'t come back after 3 minutes. Look at .portal/update.log, or run bash start-portal.sh.','error');return}
+  try{const r=await fetch(url('/api/gala/update-status'),{cache:'no-store'});if(r.ok){const j=await r.json();
+   if(down||(j.current&&j.current!==was)){location.reload();return}}else down=true}catch(e){down=true}
+  setTimeout(poll,3000)};setTimeout(poll,4000)});
+// check when the Restart tab is shown (every 10 minutes at most)
+setInterval(()=>{if(!document.hidden&&view==='restart'&&Date.now()-updAt>600000)loadUpdate(false)},5000);
