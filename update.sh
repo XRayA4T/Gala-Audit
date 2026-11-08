@@ -27,6 +27,8 @@ warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
 
 [ -d .git ] || { warn "This copy of the portal isn't a git clone, so it can't update itself. Install it with install.sh."; exit 1; }
+# Making a script runnable (chmod +x start-portal.sh, to run it as ./start-portal.sh) isn't a change to the portal.
+git config core.fileMode false
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
 [ "$BRANCH" = HEAD ] && BRANCH=main
 
@@ -79,6 +81,7 @@ if ! git merge -q --ff-only "origin/$BRANCH"; then
     bash start-portal.sh --no-browser --no-update-check "${ARGS[@]}" >/dev/null 2>&1; fi
   exit 5
 fi
+chmod +x start-portal.sh stop-portal.sh update.sh install.sh 2>/dev/null || true
 say "Now at $(git log -1 --format='%h, %cd: %s' --date=short)"
 
 say "Updating the gala-ocr plugin"

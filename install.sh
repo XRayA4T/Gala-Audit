@@ -80,6 +80,8 @@ fi
 say "Installing into $DIR"
 git clone -q "$REPO" "$DIR"
 cd "$DIR"
+git config core.fileMode false          # so chmod +x on a script doesn't count as a local change
+chmod +x start-portal.sh stop-portal.sh update.sh install.sh 2>/dev/null || true
 
 # ---- 3. the gala-ocr plugin for Claude Code
 say "Installing the gala-ocr plugin for Claude Code"
