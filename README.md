@@ -8,7 +8,9 @@ transcribes and audits that event with the
 so problems reach the officials while they're still at the pool. It is built from the Claude QA Board, so it also has questions and answers, documents, a live
 view of Claude's screen and progress bars.
 
-Everything stays on this computer. The page only listens on `127.0.0.1`.
+The gala's files stay on this computer. The page listens on every network (`0.0.0.0`, port 9000) so
+officials can open it from other computers at the venue; it needs the key in its link, and it is plain HTTP, so
+use it on the venue's own network only. `--host 127.0.0.1` keeps it to this computer.
 
 ## Start
 
@@ -89,7 +91,10 @@ Move button.
 an event's lane sheet pack and every heat's Gen7 race are in, it asks `gala-claude` (a question on the
 **Questions** tab) to transcribe the pack, audit that event and update the session report, and Claude writes the
 event's merge results (`Event NN merge results.hy3`, to import into Meet Manager) and its Quick Fix list,
-which shows under the event on the Checklist tab to tick off swim by swim. **Regenerate** (in the event's
+which shows under the event on the Checklist tab to tick off swim by swim. Each quick fix can be **fixed in the portal**: set the result (swam,
+no-show or DQ with its code, from the FINA list or the meet's own), a corrected time and a note, and save; or
+just tick it. When the last one is done, the portal offers to regenerate the event's merge results with those
+fixes. **Regenerate** (in the event's
 Merge column) rewrites the event's merge results and quick fixes from what is already transcribed, with
 every DQ slip read since; no scans are read again, and answers with what the
 officials should look at. DQ slip batches and the ETD programme are handed over as they arrive.

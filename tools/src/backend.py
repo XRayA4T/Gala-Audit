@@ -573,6 +573,7 @@ class Gala:
             gen7_by_event.setdefault(r["event"], {}).setdefault(r["heat"], r)
             if r["desc"]:
                 desc.setdefault(r["event"], r["desc"])
+        hand = self.fixes(n)
         printed, prints, print_heats, print_lanes = {}, [], {}, {}
         mine = set(expected) | {r["event"] for r in races}
         for m, name, info in self.all_prints():
@@ -639,7 +640,9 @@ class Gala:
                            "report": report["name"] if report else None, "ready": ready, "sig": sig,
                            "status": status, "asked": a, "merge": merge_file, "canMerge": can_merge,
                            "seeded": seeded, "fixes": fixes, "dqSlips": len(slips_done.get(e, [])),
-                           "fixesFile": qf_file["name"][:-5] + ".html" if qf_file else None})
+                           "fixesFile": qf_file["name"][:-5] + ".html" if qf_file else None,
+                           "handFixes": {k.split("-", 1)[1].replace("-", "."): v for k, v in hand.items()
+                                         if k.startswith("%d-" % e)}})
         merged = [f["name"] for f in reports if f["name"].lower().endswith(".hy3") and not re.search(r"(?i)\bevent\b", f["name"])]
         finals = [f["name"] for f in reports if f["name"].lower().endswith(".html") and "final" in f["name"].lower()]
         sess_report = next((f["name"] for f in reports if f["name"].lower().endswith(".html")
@@ -650,7 +653,7 @@ class Gala:
                 "sessionReport": sess_report, "dqCodes": "dq-codes.json" in ocr,
                 "folders": {k: _ls(self.sdir(n, k)) if k != "ocr" else
                             sorted(_ls(self.sdir(n, k)), key=lambda f: -f["mtime"])[:12] for k in SESSION_KEYS},
-                "ocrCount": len(ocr)}
+                "ocrCount": len(ocr), "handFixCount": len(hand)}
 
     def overview(self):
         with self.lock:
@@ -677,6 +680,11 @@ class Gala:
         q = self._question(key, n)
         if not q:
             return q
+        if os.path.exists(self.fixes_file(n)) and self.fixes(n):
+            fx = "data/sessions/S%d/fixes.json" % n
+            body = re.sub(r"(`merge_results\.py [^`]*)`", lambda m: '%s --fixes "%s"`' % (m.group(1), fx), q[1])
+            q = (q[0], body + ("\n\nFixes made in the portal: `%s` (%d swims). It is passed to merge_results.py as "
+                               "`--fixes`; don't edit it." % (fx, len(self.fixes(n)))))
         own = self.meet_files(n)["codes"]
         if own:
             path = self.P(n, "meet", own[-1]["name"])
@@ -911,6 +919,78 @@ class Gala:
             except Exception as e:
                 sys.stderr.write("gala loop: %r\n" % (e,))
             time.sleep(every)
+
+    # ---------------------------------------------------------------- quick fixes done in the portal
+    def fixes_file(self, n):
+        return os.path.join(self.sdir(n), "fixes.json")
+
+    def fixes(self, n):
+        """Fixes made in the portal: {"E-H-L": {time, status, code, note, by, at}}, passed to merge_results --fixes."""
+        try:
+            with open(self.fixes_file(n), encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def set_fix(self, n, e, h, ln, fix, who):
+        if n not in self.sessions():
+            raise ValueError("no such session")
+        status = str(fix.get("status") or "").upper()
+        t = str(fix.get("time") or "").strip()
+        code = str(fix.get("code") or "").strip()[:6]
+        note = str(fix.get("note") or "").strip()[:300]
+        if status not in ("", "OK", "NS", "DQ"):
+            raise ValueError("result must be OK, NS or DQ")
+        if t and not re.fullmatch(r"(?:\d{1,2}:)?\d{1,2}\.\d{2}", t):
+            raise ValueError("time must look like 1:05.32 or 32.10")
+        if status == "DQ" and not code:
+            raise ValueError("a DQ needs its code")
+        key = "%d-%d-%d" % (int(e), int(h), int(ln))
+        with self.lock:
+            d = self.fixes(n)
+            if not (status or t or note):
+                d.pop(key, None)
+                text = "cleared"
+            else:
+                d[key] = {"status": status, "time": t, "code": code if status == "DQ" else "", "note": note,
+                          "by": str(who or "someone")[:60], "at": time.time()}
+                text = ", ".join(x for x in (status and {"OK": "swam", "NS": "no-show", "DQ": "DQ " + code}[status],
+                                             t, note and "note") if x)
+            tmp = self.fixes_file(n) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, indent=1, sort_keys=True)
+            os.replace(tmp, self.fixes_file(n))
+            if key in d:
+                self.state["ticks"]["S%d:e%d:qf:%d.%d" % (n, int(e), int(h), int(ln))] = {"by": str(who or "someone")[:60],
+                                                                                         "at": time.time()}
+                self.save()
+        self.log("Session %d event %d heat %d lane %d fixed in the portal: %s" % (n, int(e), int(h), int(ln), text))
+
+    def code_list(self, n):
+        """The DQ codes to choose from: the meet's own list in meet/ if there is one, else the plugin's FINA list."""
+        own = self.meet_files(n)["codes"]
+        if own:
+            path = os.path.join(self.sdir(n, "meet"), own[-1]["name"])
+        else:
+            import glob
+            found = glob.glob(os.path.expanduser("~/.claude/plugins/**/gala-audit/data/dqcodesFINA.txt"), recursive=True)
+            path = max(found, key=os.path.getmtime) if found else None
+        if not path:
+            return {"source": None, "codes": []}
+
+        def run(p):
+            import csv
+            out = []
+            try:
+                with open(p, encoding="utf-8", errors="replace", newline="") as f:
+                    for row in csv.reader(f):
+                        if len(row) >= 2 and row[0].strip():
+                            out.append([row[0].strip(), row[1].strip(), row[2].strip() if len(row) > 2 else ""])
+            except OSError:
+                pass
+            return out
+        return {"source": os.path.basename(path), "codes": self._cached("codes", path, run) or []}
 
     def tick(self, key, checked, who):
         if not re.fullmatch(r"S\d{1,2}:[\w.:=() \-]{1,200}", key or ""):

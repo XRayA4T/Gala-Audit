@@ -73,3 +73,9 @@ ul.qf>li{display:grid;grid-template-columns:28px 1fr;gap:8px;padding:6px 0;borde
 ul.qf>li.done>div{opacity:.6}
 ul.qf ul{margin:2px 0 2px 18px;padding:0}
 ul.qf input[type=checkbox]{width:20px;height:20px;accent-color:var(--accent)}
+form.qffix{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin:6px 0 2px;font-size:.88em}
+form.qffix label{display:inline-flex;gap:4px;align-items:center;color:var(--muted)}
+form.qffix input,form.qffix select{padding:2px 6px;font-size:1em}
+form.qffix .qfnote input{width:200px}
+form.qffix button{padding:2px 10px}
+.qfdone{margin:6px 0;padding:8px 10px;border:1px solid var(--ans);border-radius:8px;color:var(--ans);font-weight:600;display:flex;gap:10px;align-items:center;flex-wrap:wrap}

@@ -108,13 +108,15 @@
                 return self._json(200, {"ok": True, "question": row["id"]})
             elif path == "/api/gala/move":
                 g.move(str(d.get("path") or ""), int(d.get("session") or 0), str(d.get("folder") or ""))
+            elif path == "/api/gala/fix":
+                g.set_fix(int(d.get("session") or 0), d.get("event"), d.get("heat"), d.get("lane"), d, who)
             elif path == "/api/gala/session":
                 n = max(g.sessions() or [0]) + 1
                 g.sdir(n)
                 g.log("Session %d added by %s" % (n, who))
             else:
                 return self._json(404, {"error": "not found"})
-        except (ValueError, OSError) as e:
+        except (ValueError, TypeError, OSError) as e:
             return self._json(400, {"error": str(e)})
         return self._json(200, {"ok": True})
 

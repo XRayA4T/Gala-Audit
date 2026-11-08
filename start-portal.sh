@@ -7,19 +7,21 @@
 #   4. starts the portal web page (http://127.0.0.1:PORT), Claude Code in tmux, and the watcher
 #   5. opens the portal in your web browser and attaches this terminal to Claude
 #
-# Options:  --port N (default 9000)   --inbox DIR (default data/inbox)   --name "Gala name"
+# Options:  --port N (default 9000)   --host ADDR (default 0.0.0.0: every network; 127.0.0.1: this computer only)
+#             --inbox DIR (default data/inbox)   --name "Gala name"
 #           --no-browser   --no-attach
 # Stop everything with:  bash stop-portal.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-PORT="${PORTAL_PORT:-9000}"; INBOX="${GALA_INBOX:-data/inbox}"; TERM_PORT=""; BROWSER=1; ATTACH=1; NAME="CGA Gala Audit"
+PORT="${PORTAL_PORT:-9000}"; HOST="${PORTAL_HOST:-0.0.0.0}"; INBOX="${GALA_INBOX:-data/inbox}"; TERM_PORT=""; BROWSER=1; ATTACH=1; NAME="CGA Gala Audit"
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
     --name) NAME="$2"; shift 2 ;;
     --inbox) INBOX="$2"; shift 2 ;;
+    --host) HOST="$2"; shift 2 ;;
     --no-browser) BROWSER=0; shift ;;
     --no-attach) ATTACH=0; shift ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
@@ -111,7 +113,7 @@ if curl -s --max-time 2 "$BOARD/health?key=$KEY" | grep -q '"ok"'; then
   say "The portal is already running on $BOARD"
 else
   say "Starting the portal on $BOARD"
-  nohup python3 portal/portal.py serve --host 127.0.0.1 --port "$PORT" --db .portal/portal.db --key "$KEY" \
+  nohup python3 portal/portal.py serve --host "$HOST" --port "$PORT" --db .portal/portal.db --key "$KEY" \
         --max-doc-mb 200 --name "$NAME" --brand-dir portal/brand --gala-data data --inbox "$INBOX" ${TERM_ARGS[@]+"${TERM_ARGS[@]}"} > .portal/portal.log 2>&1 &
   echo $! > .portal/portal.pid
   for _ in $(seq 1 40); do curl -s --max-time 1 "$BOARD/health?key=$KEY" | grep -q '"ok"' && break; sleep 0.25; done
@@ -154,6 +156,11 @@ fi
 URL="$BOARD/?key=$KEY&me=$ME"
 echo
 say "Portal:  $URL"
+if [ "$HOST" != "127.0.0.1" ]; then
+  LAN="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [ -n "$LAN" ] || LAN="$(ipconfig getifaddr en0 2>/dev/null || true)"
+  [ -n "$LAN" ] && say "On the network:  http://$LAN:$PORT/?key=$KEY   (anyone with this link can open it)"
+fi
 say "Inbox:   $(cd "$INBOX" && pwd)   (the scanner / Gen7 computer save here, or drop files on the Gala tab)"
 say "Data:    $HERE/data/sessions"
 say "Claude:  tmux -L $SOCK attach -t $SESSION      (detach: Ctrl-b d)"

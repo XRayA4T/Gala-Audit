@@ -9,7 +9,13 @@ const FOLDER_TXT={meet:['Meet Manager files','Entries, merge results and final e
  reports:['Reports (Claude)','Event and session audits, merge results .hy3, final audit']};
 function curSession(){if(!GALA||!GALA.sessions.length)return null;
  return GALA.sessions.find(s=>s.n===GSESS)||GALA.sessions[GALA.sessions.length-1]}
+function galaEditing(){const a=document.activeElement;return !!(a&&a.closest&&a.closest('form.qffix'))||!!document.querySelector('form.qffix[data-dirty]')}
+let CODES={},CODES_FOR=null;
+async function loadCodes(n){if(CODES_FOR===n)return;CODES_FOR=n;
+ try{const j=await api('/api/gala/codes?session='+n);CODES=j;let dl=$('#dqcodes');if(!dl){dl=document.createElement('datalist');dl.id='dqcodes';document.body.appendChild(dl)}
+  dl.innerHTML=(j.codes||[]).map(c=>`<option value="${esc(c[0])}">${esc(c[0]+' – '+c[1]+(c[2]?' ('+c[2]+')':''))}</option>`).join('')}catch(e){CODES_FOR=null}}
 async function loadGala(){
+ if(galaEditing())return;
  let j;try{j=await api('/api/gala/overview')}catch(e){$('#g-root').textContent='Could not load the data folder: '+e.message;return}
  const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;GALA=j;
  if(!j.root){$('#g-root').textContent='This portal was started without a data folder (--gala-data).';return}
@@ -75,7 +81,7 @@ function clRow(s,key,title,why,found,folder,claude){
 function evRange(evs){const out=[];for(let i=0;i<evs.length;i++){let j=i;while(j+1<evs.length&&evs[j+1]===evs[j]+1)j++;out.push(j>i?evs[i]+'–'+evs[j]:''+evs[i]);i=j}return out.join(', ')}
 function link(s,sub,name){return `<a href="${esc(galaHref('sessions/S'+s.n+'/'+sub+'/'+name))}" target="_blank" rel="noopener">${esc(name)}</a>`}
 function renderChecklist(){
- const s=curSession(),box=$('#cl-body');
+ const s=curSession(),box=$('#cl-body');if(s)loadCodes(s.n);
  if(!s){box.innerHTML='<div class="card meta">No sessions yet. Drop the session\'s Meet Manager entries export on the Gala tab (or in the inbox folder) to start.</div>';return}
  const qfKey=(e,f)=>'S'+s.n+':e'+e.event+':qf:'+f.heat+'.'+f.lane;
  const keys=['entries','lanesprint','mmresults',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','final'].map(k=>'S'+s.n+':'+k)
@@ -89,12 +95,19 @@ function renderChecklist(){
    const fxCell=fx==null?'<span class="no">–</span>':fx.length?`<span class="${fxDone===fx.length?'ok':'gwarn'}">${fxDone}/${fx.length}</span>`:'<span class="ok" title="No quick fixes">none ✓</span>';
    const regen=`<div><button type="button" class="sm" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'Write the merge results again from what is already transcribed, with every DQ slip read so far (no scans are read again)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export and the empty merge results export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
    const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="${esc(!s.meet.entries.length?'No entries export':'No empty merge results export')}">waiting</span>`)+regen;
-   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10"><details${fxDone<fx.length?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} done)${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
-     <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k];
+   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${fxDone===fx.length?`<div class="qfdone">All quick fixes for event ${e.event} are done. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries and the empty merge results export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details${fxDone<fx.length?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} done)${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
+     <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
       return `<li class="${t?'done':''}">${tickBox(k,'Heat '+f.heat+' lane '+f.lane)}<div><b>Heat ${esc(f.heat)} · Lane ${esc(f.lane)}</b> <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
        ${f.scans.length?`<div class="sm">${f.scans.map(sc=>`<a href="${esc(galaHref('sessions/S'+s.n+'/scans/'+sc.scan))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`).join(' · ')}</div>`:''}
-       ${t?`<div class="sm">fixed · ticked by ${esc(t.by)} · ${esc(agoShort(t.at))}</div>`:''}</div></li>`}).join('')}</ul></details></td></tr>`:'';
+       <form class="qffix" data-fix="${s.n}|${e.event}|${esc(f.heat)}|${esc(f.lane)}" autocomplete="off">
+        <label>Result <select name="status"><option value="">as audited</option><option value="OK"${hf.status==='OK'?' selected':''}>Swam</option><option value="NS"${hf.status==='NS'?' selected':''}>No-show</option><option value="DQ"${hf.status==='DQ'?' selected':''}>DQ</option></select></label>
+        <label>Time <input name="time" value="${esc(hf.time||'')}" placeholder="m:ss.hh" size="8"></label>
+        <label class="qfcode"${hf.status==='DQ'?'':' hidden'}>Code <input name="code" value="${esc(hf.code||'')}" list="dqcodes" size="6"></label>
+        <label class="qfnote">Note <input name="note" value="${esc(hf.note||'')}" placeholder="what was fixed"></label>
+        <button type="submit">${hf.by?'Update':'Save fix'}</button>${hf.by?'<button type="button" data-clearfix>Clear</button>':''}
+        <span class="sm" data-fixmsg>${hf.by?esc('Fixed by '+hf.by+' · '+agoShort(hf.at)):'Or just tick it if nothing needs changing.'}</span></form>
+       ${t?`<div class="sm">done · ticked by ${esc(t.by)} · ${esc(agoShort(t.at))}</div>`:''}</div></li>`}).join('')}</ul></details></td></tr>`:'';
    return `<tr class="${t?'done':''}" data-cldrop="S${s.n}/scans">
     <td>${tickBox(key,'Event '+e.event)}</td>
     <td><span class="evname">Event ${e.event}</span>${e.desc?`<div class="sm">${esc(e.desc)}</div>`:''}${!e.expected&&s.meet.entries.length?'<div class="sm gwarn">not in the entries</div>':''}${t?`<div class="sm">ticked by ${esc(t.by)}</div>`:''}</td>
@@ -150,8 +163,9 @@ function galaClicks(e){
   galaPost('/api/gala/move',{path:mv.dataset.move,session:+li.querySelector('[data-mvs]').value,folder:li.querySelector('[data-mvf]').value})
    .then(()=>{galaSig='';loadGala()}).catch(err=>alert(err.message))}}
 function galaChange(e){
+ const fm=e.target.closest('form.qffix');if(fm){fm.dataset.dirty='1';if(e.target.name==='status')fm.querySelector('.qfcode').hidden=e.target.value!=='DQ';return}
  const up=e.target.closest('[data-gup]');if(up&&up.files.length){galaUpload(up.dataset.gup,[...up.files],up.closest('[data-gfolder],.cl-row,tr,.drop')||up.parentElement);return}
- const tk=e.target.closest('[data-tick]');if(tk){galaPost('/api/gala/tick',{key:tk.dataset.tick,checked:tk.checked}).then(()=>{galaSig='';loadGala()})
+ const tk=e.target.closest('[data-tick]');if(tk){galaPost('/api/gala/tick',{key:tk.dataset.tick,checked:tk.checked}).then(()=>{if(tk.checked)offerRegen(tk.dataset.tick,tk.dataset.tick);galaSig='';loadGala()})
   .catch(err=>{tk.checked=!tk.checked;alert('Could not save: '+err.message)})}}
 for(const sec of ['#v-gala','#v-checklist']){const el=$(sec);el.addEventListener('click',galaClicks);el.addEventListener('change',galaChange);
  el.addEventListener('dragover',e=>{const c=e.target.closest('[data-gfolder],[data-cldrop],#g-inbox');if(!c)return;e.preventDefault();c.classList.add('over')});
@@ -164,3 +178,24 @@ for(const sec of ['#v-gala','#v-checklist']){const el=$(sec);el.addEventListener
 $('#g-inboxfile').addEventListener('change',e=>{if(e.target.files.length)galaUpload('inbox',[...e.target.files],$('#g-inbox'))});
 $('#g-auto').addEventListener('change',e=>galaPost('/api/gala/auto',{auto:e.target.checked}).then(()=>{galaSig='';loadGala()}));
 setInterval(()=>{if(!document.hidden&&(view==='gala'||view==='checklist'))loadGala()},4000);
+
+// After the last quick fix of an event is done (ticked or fixed here), offer to write its merge results again.
+function offerRegen(key,justDone){
+ const m=/^S(\d+):e(\d+):qf:/.exec(key);if(!m)return;const n=+m[1],ev=+m[2];
+ const s=GALA&&GALA.sessions.find(x=>x.n===n),e=s&&s.events.find(x=>x.event===ev);if(!e||!e.fixes||!e.canMerge)return;
+ const left=e.fixes.filter(f=>{const k='S'+n+':e'+ev+':qf:'+f.heat+'.'+f.lane;return k!==justDone&&!GALA.ticks[k]});
+ if(left.length)return;
+ if(confirm('All '+e.fixes.length+' quick fixes for event '+ev+' are done.\n\nRegenerate the event\'s merge results now, with the fixes made in the portal and every DQ slip read so far? (No scans are read again.)'))
+  galaPost('/api/gala/ask',{key:'S'+n+':remerge:'+ev}).then(j=>alert('Asked Claude (question #'+j.question+').')).catch(err=>alert(err.message))}
+document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.qffix');if(!fm)return;ev.preventDefault();
+ const [n,event,heat,lane]=fm.dataset.fix.split('|'),d=Object.fromEntries(new FormData(fm).entries());
+ if(d.time&&!/^(\d{1,2}:)?\d{1,2}\.\d{2}$/.test(d.time)){fm.querySelector('[data-fixmsg]').textContent='Time like 1:05.32 or 32.10';return}
+ if(d.status==='DQ'&&!d.code){fm.querySelector('[data-fixmsg]').textContent='A DQ needs its code';return}
+ if(d.code&&CODES.codes&&CODES.codes.length&&!CODES.codes.some(c=>c[0]===d.code)&&!confirm(d.code+' is not in '+(CODES.source||'the code list')+'. Save it anyway?'))return;
+ galaPost('/api/gala/fix',Object.assign({session:+n,event:+event,heat:+heat,lane:+lane},d)).then(()=>{
+  delete fm.dataset.dirty;document.activeElement&&document.activeElement.blur();
+  offerRegen('S'+n+':e'+event+':qf:'+heat+'.'+lane,'S'+n+':e'+event+':qf:'+heat+'.'+lane);galaSig='';loadGala()})
+  .catch(err=>{fm.querySelector('[data-fixmsg]').textContent='Could not save: '+err.message})});
+document.addEventListener('click',ev=>{const b=ev.target.closest('[data-clearfix]');if(!b)return;const fm=b.closest('form.qffix');
+ const [n,event,heat,lane]=fm.dataset.fix.split('|');
+ galaPost('/api/gala/fix',{session:+n,event:+event,heat:+heat,lane:+lane,status:'',time:'',note:''}).then(()=>{delete fm.dataset.dirty;galaSig='';loadGala()})});
