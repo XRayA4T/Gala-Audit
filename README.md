@@ -54,15 +54,45 @@ them on the **Gala** tab). Within a few seconds each one is sorted into its sess
 | Lane sheet pack | a scanned PDF, "Event 3" in the name | `sessions/S<n>/scans` |
 | DQ slips / ETD programme | a scanned PDF with "DQ" / "ETD" in the name | `sessions/S<n>/scans` |
 
+Events numbered by session in hundreds (101–1xx session 1, 201–2xx session 2) are split into sessions
+automatically, so one meet-wide entries export or one printed lane sheet PDF covers every session. Heats come
+from the entries export, or, when it is a pre-gala export with no heats yet, from the printed lane sheets.
+
 The session comes from "Session 2" or "S2" in the name, the Gen7 PDF's own session, or the session whose
 entries have that event. A file with the same name as one already there replaces it (a rescan or a reprint;
-the old copy is kept in `.replaced`). Files the portal can't place are listed under **Not sorted**, with a
+the old copy is kept in `.replaced`). **A folder another computer saves into** (e.g. the Gen7 computer's PDF folder on a share): put a symbolic
+link to it in the inbox, `ln -s "/path/to/Gen7 PDFs" data/inbox/gen7`. Files in a linked folder are **copied**,
+not moved, so that folder is left alone; each file is copied once, and again only if it changes (a reprint).
+Every PDF already in it is copied on the first look, so link a folder for this gala only.
+
+The portal **looks** at the inbox every few seconds rather than waiting to be told of changes, so it works on a
+Windows (SMB) share, where Linux gets no change notifications. A new file is taken once its size and time have
+stayed the same for 6 seconds (it may still be copying), timed by this computer's clock, so a Windows clock
+that's ahead or behind doesn't matter. Mount the share read-only, for example:
+
+```bash
+sudo apt install cifs-utils
+sudo mkdir -p /mnt/gen7
+sudo mount -t cifs "//GEN7-PC/Gen7 Reports" /mnt/gen7 \
+     -o ro,vers=3.0,username=WINUSER,uid=$(id -u),gid=$(id -g),actimeo=1
+ln -s /mnt/gen7 data/inbox/gen7
+```
+
+To mount it at every start, put the same in `/etc/fstab` with a credentials file
+(`credentials=/home/YOU/.smb-gen7`, mode 600, holding `username=`, `password=`, `domain=`). A share opened from
+the file manager (`/run/user/<uid>/gvfs/smb-share:server=…,share=…`) works too, but is slower.
+
+Files the portal can't place are listed under **Not sorted**, with a
 Move button.
 
 **Claude works event by event.** From the session's entries export the portal knows the events and heats. When
 an event's lane sheet pack and every heat's Gen7 race are in, it asks `gala-claude` (a question on the
-**Questions** tab) to transcribe the pack, audit that event and update the session report, and Claude answers
-with what the officials should look at. DQ slip batches and the ETD programme are handed over as they arrive.
+**Questions** tab) to transcribe the pack, audit that event and update the session report, and Claude writes the
+event's merge results (`Event NN merge results.hy3`, to import into Meet Manager) and its Quick Fix list,
+which shows under the event on the Checklist tab to tick off swim by swim. **Regenerate** (in the event's
+Merge column) rewrites the event's merge results and quick fixes from what is already transcribed, with
+every DQ slip read since; no scans are read again, and answers with what the
+officials should look at. DQ slip batches and the ETD programme are handed over as they arrive.
 At the end of the session, once every event is audited and Meet Manager's merge results export is in, Claude
 writes the session's merge results `.hy3`; when the final export arrives, it runs the final audit. Untick
 **Ask Claude automatically** to do it by hand with the **Ask Claude** buttons instead.

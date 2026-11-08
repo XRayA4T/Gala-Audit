@@ -77,22 +77,35 @@ function link(s,sub,name){return `<a href="${esc(galaHref('sessions/S'+s.n+'/'+s
 function renderChecklist(){
  const s=curSession(),box=$('#cl-body');
  if(!s){box.innerHTML='<div class="card meta">No sessions yet. Drop the session\'s Meet Manager entries export on the Gala tab (or in the inbox folder) to start.</div>';return}
- const keys=['entries','lanesprint',...s.events.map(e=>'e'+e.event),'dq','etd','codes','mmresults','merged','mmfinal','final'].map(k=>'S'+s.n+':'+k);
+ const qfKey=(e,f)=>'S'+s.n+':e'+e.event+':qf:'+f.heat+'.'+f.lane;
+ const keys=['entries','lanesprint','mmresults',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','final'].map(k=>'S'+s.n+':'+k)
+  .concat(s.events.flatMap(e=>(e.fixes||[]).map(f=>qfKey(e,f))));
  const ticked=keys.filter(k=>GALA.ticks[k]).length,pct=Math.round(100*ticked/keys.length);
  const dq=s.scans.filter(x=>x.kind==='dq'),etd=s.scans.filter(x=>x.kind==='etd');
- const ev=s.events.length?`<div class="tblwrap"><table class="cl-ev"><tr><th></th><th>Event</th><th class="c">Printed</th><th>Lane sheets</th><th class="c">Gen7 heats</th><th class="c">OCR lanes</th><th>Audit</th><th>Status</th><th></th></tr>`
+ const ev=s.events.length?`<div class="tblwrap"><table class="cl-ev"><tr><th></th><th>Event</th><th class="c">Printed</th><th>Lane sheets</th><th class="c">Gen7 heats</th><th class="c">OCR lanes</th><th>Audit</th><th>Merge</th><th class="c">Quick fixes</th><th>Status</th><th></th></tr>`
   +s.events.map(e=>{const key='S'+s.n+':e'+e.event,t=GALA.ticks[key];
    const g7=e.heats?`${e.gen7.length}/${e.heats}`:(e.gen7.length||'–');
+   const fx=e.fixes||null,fxDone=fx?fx.filter(f=>GALA.ticks[qfKey(e,f)]).length:0;
+   const fxCell=fx==null?'<span class="no">–</span>':fx.length?`<span class="${fxDone===fx.length?'ok':'gwarn'}">${fxDone}/${fx.length}</span>`:'<span class="ok" title="No quick fixes">none ✓</span>';
+   const regen=`<div><button type="button" class="sm" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'Write the merge results again from what is already transcribed, with every DQ slip read so far (no scans are read again)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export and the empty merge results export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
+   const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="${esc(!s.meet.entries.length?'No entries export':'No empty merge results export')}">waiting</span>`)+regen;
+   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10"><details${fxDone<fx.length?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} done)${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
+     <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k];
+      return `<li class="${t?'done':''}">${tickBox(k,'Heat '+f.heat+' lane '+f.lane)}<div><b>Heat ${esc(f.heat)} · Lane ${esc(f.lane)}</b> <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
+       <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
+       ${f.scans.length?`<div class="sm">${f.scans.map(sc=>`<a href="${esc(galaHref('sessions/S'+s.n+'/scans/'+sc.scan))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`).join(' · ')}</div>`:''}
+       ${t?`<div class="sm">fixed · ticked by ${esc(t.by)} · ${esc(agoShort(t.at))}</div>`:''}</div></li>`}).join('')}</ul></details></td></tr>`:'';
    return `<tr class="${t?'done':''}" data-cldrop="S${s.n}/scans">
     <td>${tickBox(key,'Event '+e.event)}</td>
     <td><span class="evname">Event ${e.event}</span>${e.desc?`<div class="sm">${esc(e.desc)}</div>`:''}${!e.expected&&s.meet.entries.length?'<div class="sm gwarn">not in the entries</div>':''}${t?`<div class="sm">ticked by ${esc(t.by)}</div>`:''}</td>
-    <td class="c">${e.printed.length?'<span class="ok" title="'+esc(e.printed.join(', '))+'">✓</span>':'<span class="no" title="No printed lane sheets for this event">–</span>'}</td>
+    <td class="c">${e.printed.length?'<span class="ok" title="'+esc(e.printed.map(x=>x.split('/').pop()).join(', '))+'">✓</span>':'<span class="no" title="No printed lane sheets for this event">–</span>'}</td>
     <td>${e.packs.length?e.packs.map(p=>link(s,'scans',p)).join('<br>'):'<span class="no">–</span>'}</td>
     <td class="c">${g7}${e.gen7Missing.length&&e.gen7.length?`<div class="sm">missing ${esc(e.gen7Missing.join(', '))}</div>`:''}</td>
     <td class="c">${e.ocrLanes?e.ocrLanes+(e.lanes?'/'+e.lanes:''):'–'}</td>
     <td>${e.report?link(s,'reports',e.report):'–'}</td>
+    <td>${mergeCell}</td><td class="c">${fxCell}</td>
     <td><span class="st ${e.status}">${esc(ST_TXT[e.status]||e.status)}</span></td>
-    <td><button type="button" data-ask="${key}" ${e.packs.length?'':'disabled title="No lane sheet pack yet"'}>${e.asked?'Ask again':'Ask Claude'}</button></td></tr>`}).join('')+'</table></div>'
+    <td><button type="button" data-ask="${key}" ${e.packs.length?'':'disabled title="No lane sheet pack yet"'}>${e.asked?'Ask again':'Ask Claude'}</button></td></tr>${fxRows}`}).join('')+'</table></div>'
   :'<div class="meta" style="padding:8px 0">No events yet. They come from the entries export, or appear as lane sheet packs and Gen7 races arrive.</div>';
  const scanFound=list=>list.map(x=>link(s,'scans',x.name)+` <span class="meta">(${x.done}/${x.pages??'?'} pages read)</span>`);
  box.innerHTML=`<div class="card clhead"><div class="gh-top"><div><h2>Session ${s.n} checklist</h2>
@@ -101,18 +114,19 @@ function renderChecklist(){
   <div class="card">
   <div class="cl-sec">Start of the session</div>
   ${clRow(s,'S'+s.n+':entries','Meet entries export','From Meet Manager, for this session: the events, heats and lanes to expect (<code>Meet Entries-…zip</code> or its <code>Hfile…hy3</code>).',
-    s.meet.entries.map(n=>link(s,'meet',n)+(s.expected.events?` <span class="meta">(${s.expected.events} events, ${s.expected.heats} heats)</span>`:'')),'S'+s.n+'/meet')}
+    s.meet.entries.map(n=>link(s,'meet',n)+(s.expected.events?` <span class="meta">(${s.expected.events} events, ${s.expected.heats} heats)</span>`:'')
+     +(s.events.some(e=>e.expected&&!e.seeded)?' <span class="meta">(not seeded: a pre-gala export; the merge results seed each swim from the lane sheets)</span>':'')),'S'+s.n+'/meet')}
   ${clRow(s,'S'+s.n+':lanesprint','Printed lane sheets (Meet Manager)','The lane sheet PDF Meet Manager printed for the session (not the scan). Claude copies the names, ages, teams and seed times from it, which is much more accurate than reading them off the scans. Bring it in before the first event.',
-    s.lanePrints.map(p=>link(s,'meet',p.name)+` <span class="meta">(${p.sheets} sheet${p.sheets===1?'':'s'}, event${p.events.length===1?'':'s'} ${esc(evRange(p.events))})</span>`),'S'+s.n+'/meet')}
+    s.lanePrints.map(p=>`<a href="${esc(galaHref(p.path))}" target="_blank" rel="noopener">${esc(p.name)}</a>`+` <span class="meta">(${p.sheets} sheet${p.sheets===1?'':'s'}, event${p.events.length===1?'':'s'} ${esc(evRange(p.events))})</span>`),'S'+s.n+'/meet')}
+  ${clRow(s,'S'+s.n+':mmresults','Empty merge results export (Meet Manager)','Export merge results from Meet Manager for this session before any results are in (name it with "Results"). Claude copies its header and layout into each event\'s merge results file.',s.meet.results.map(n=>link(s,'meet',n)),'S'+s.n+'/meet')}
   <div class="cl-sec">Each event, as it is swum</div>
-  <div class="meta" style="margin-bottom:4px">An event is <b>ready</b> when its lane sheet pack and every heat's Gen7 race PDF are in${GALA.auto?'; Claude is then asked to transcribe and audit it':''}. Drop a lane sheet pack on an event to add it.</div>
+  <div class="meta" style="margin-bottom:4px">An event is <b>ready</b> when its lane sheet pack and every heat's Gen7 race PDF are in${GALA.auto?'; Claude is then asked to transcribe and audit it':''}. Claude then writes the event's <b>merge results</b> (<code>.hy3</code>, to import into Meet Manager) and its <b>quick fixes</b>: the swims to check by hand, listed under the event to tick off as they're fixed. Drop a lane sheet pack on an event to add it.</div>
   ${ev}
   <div class="cl-sec">During and after the session</div>
   ${clRow(s,'S'+s.n+':dq','DQ slips','The referees\' DQ slips, scanned (name the file with "DQ"). Claude reads each batch as it arrives.',scanFound(dq),'S'+s.n+'/scans')}
   ${clRow(s,'S'+s.n+':etd','ETD programme','The programme with the Gen7 race numbers written by each heat (name the file with "ETD"). Needed for combined events and re-started heats.',scanFound(etd),'S'+s.n+'/scans')}
-  ${clRow(s,'S'+s.n+':codes','DQ codes','Each slip\'s FINA code, given by Claude; codes it wasn\'t sure of need the referee\'s OK.',s.dqCodes?[link(s,'ocr','dq-codes.json')]:[],null,true)}
-  ${clRow(s,'S'+s.n+':mmresults','Meet Manager merge results export','Exported from Meet Manager for this session (its header and layout are copied).',s.meet.results.map(n=>link(s,'meet',n)),'S'+s.n+'/meet')}
-  ${clRow(s,'S'+s.n+':merged','Merged results for Meet Manager','Written by Claude once every event is audited and the merge results export is in: the audited results to import.',s.merged.map(n=>link(s,'reports',n)).concat(s.sessionReport?['session report: '+link(s,'reports',s.sessionReport)]:[]),null,true)}
+  ${clRow(s,'S'+s.n+':codes','DQ codes','Each slip\'s code, given by Claude from '+(s.meet.codes.length?'the meet\'s own list ('+link(s,'meet',s.meet.codes[s.meet.codes.length-1])+')':'the full FINA list in the plugin (<code>gala-audit/data/dqcodesFINA.txt</code>); drop a <code>.txt</code> with the meet\'s own list in the inbox to use that instead')+'. Codes it wasn\'t sure of need the referee\'s OK.',s.dqCodes?[link(s,'ocr','dq-codes.json')]:[],null,true)}
+  ${clRow(s,'S'+s.n+':merged','Session merge results (all events)','Written by Claude once every event is audited: one file with the whole session, and the session report.',s.merged.map(n=>link(s,'reports',n)).concat(s.sessionReport?['session report: '+link(s,'reports',s.sessionReport)]:[]),null,true)}
   ${clRow(s,'S'+s.n+':mmfinal','Final merge results export','Exported from Meet Manager after the audited results were imported and finalised (name it with "final").',s.meet.final.map(n=>link(s,'meet',n)),'S'+s.n+'/meet')}
   ${clRow(s,'S'+s.n+':final','Final audit report','Written by Claude: every change made by hand in Meet Manager.',s.finalReports.map(n=>link(s,'reports',n)),null,true)}
   </div>`}

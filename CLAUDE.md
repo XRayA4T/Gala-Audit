@@ -24,7 +24,7 @@ each one into its session:
 | `data/sessions/S<n>/gen7/` | **Gen7 race PDFs**, one per race (a reprint replaces the earlier copy) | people |
 | `data/sessions/S<n>/scans/` | **Lane sheet packs, one per event** (`Event 03 Lane Sheets.pdf`), DQ slip batches (`DQ…`), the ETD programme (`ETD…`) | people |
 | `data/sessions/S<n>/ocr/` | Your gala-ocr output for the session, and `dq-codes.json` | **you** |
-| `data/sessions/S<n>/reports/` | Your reports: `Event NN audit.html`, `Session N audit.html`, the merge results `.hy3`, the final audit | **you** |
+| `data/sessions/S<n>/reports/` | Your reports: `Event NN audit.html`, `Event NN merge results.hy3`, `Event NN quick fixes.html/.json`, `Session N audit.html`, the session merge results `.hy3`, the final audit | **you** |
 
 Use these paths instead of the skills' defaults (`pdf/scanned`, `data/ocr`, ...). Use one session's folders
 together: its `ocr`, its `gen7` folder (give the **folder** to the scripts: the plugin reads race-by-race PDFs,
@@ -38,12 +38,22 @@ The event questions name the print to use.
 
 **The portal asks you for the work, as questions on the board** (when "Ask Claude automatically" is on):
 
-- **An event is ready** (its lane sheet pack and every heat's Gen7 race are in): transcribe the pack, audit that
-  event (`audit_report.py … --events N`), update the session report (`--events` = every event transcribed so far
-  in the session), and answer with what the officials should look at **now**, while they are still at the pool.
+- **An event is ready** (its lane sheet pack and every heat's Gen7 race are in): transcribe the pack, write the
+  event's **merge results** (`reports/Event NN merge results.hy3`, `merge_results.py … --events N`, from the
+  session's entries export and Meet Manager's **empty merge results export**; a pre-gala entries export with no
+  seeding is fine, merge_results seeds each swim from the lane sheets, plugin 1.6.1+), audit the event with
+  `--merge` that file and `--quick-fixes "reports/Event NN quick fixes.html"` (the portal shows the `.json` it
+  writes as the event's quick-fix checklist, for people to tick off as they fix each swim in Meet Manager),
+  update the session report (`--events` = every event transcribed so far in the session), and answer with what the officials should look at **now**, while they are still at the pool.
   Be quick and short: one event at a time, as they come.
+- **"Regenerate the merge results"** (a button per event): rewrite that event's merge results and quick fixes from
+  what is already transcribed, with every DQ slip read so far (code any slip without one). **Never read scans
+  for this**; scans are only read when they arrive.
 - **"New files, audit it again"**: a pack was rescanned (its old OCR has been set aside) or a Gen7 race reprinted.
 - **DQ slips** or **the ETD programme** arrived: read them, give DQ codes, update the session report.
+  DQ codes come from the full FINA list in the plugin, `plugins/gala-ocr/skills/gala-audit/data/dqcodesFINA.txt`
+  (the gala-audit skill's `data/` folder, the scripts' default), unless the session's `meet/` folder has the meet's
+  own list (a `.txt`); then pass it to every script as `--codes`. The questions say which.
 - **Merge results** (once every event is audited and Meet Manager's merge results export is in) and the
   **final audit** (once the final export is in), per session.
 

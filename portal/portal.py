@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.1"
+VERSION = "0.4.3"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 STATUSES = ("open", "answered", "resolved", "on_hold")
 
@@ -553,13 +553,14 @@ SESSION_KEYS = [d[0] for d in SESSION_DIRS]
 SKIP_NAME = re.compile(r"^[.~]|\.(part|partial|tmp|crdownload|download|lock)$|^(thumbs\.db|desktop\.ini)$", re.I)
 SESSION_RX = re.compile(r"(?i)(?:\bsession|\bsess|\bses)\s*[-_#.]?\s*(\d{1,2})(?!\d)|(?<![a-z0-9])s(\d{1,2})(?![0-9])")
 EVENT_RX = re.compile(r"(?i)(?:\bevent|\bevt|\bev|(?<![a-z0-9])e)\s*[-_#.]?\s*(\d{1,3})(?!\d)")
-GEN7_RX = re.compile(r"Event:\s*(\d+)\s+Heat:\s*(\d+)\s+Race\s*#\s*(\d+)")
+GEN7_RX = re.compile(r"Event:\s*(\d+)\s+Heat:\s*(\d+)\s+Race\s*#\s*(\d+)")   # \s also matches line breaks
 GEN7_SESSION = re.compile(r"Session:\s*(\d+)")
 OCR_LANE = re.compile(r"-event0*(\d+)-lane(\d+)-p\d+\.json$", re.I)
 OCR_SLIP = re.compile(r"-event0*(\d+)-heat\d+-lane\d+-p\d+\.json$", re.I)
 OCR_PAGE = re.compile(r"-p(\d{3,4})\.json$", re.I)
 MEET_EXT = (".zip", ".hy3", ".cl2", ".ev3", ".hyv")
 CLAUDE_WHO = "gala-claude"
+SETTLE = 6   # seconds a new file's size and time must stay the same before it is taken (it may still be copying)
 
 
 def _first(m):
@@ -593,6 +594,23 @@ def _unique(folder, name):
     return cand
 
 
+def _read_fixes(path):
+    """The Quick Fix list audit_report.py --quick-fixes writes as JSON: [{event, heat, lane, inFile, checks, scans}]."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for x in d if isinstance(d, list) else []:
+        if isinstance(x, dict):
+            out.append({"heat": x.get("heat"), "lane": x.get("lane"), "inFile": str(x.get("inFile") or ""),
+                        "checks": [str(c) for c in x.get("checks") or []][:12],
+                        "scans": [{"label": str(sc.get("label") or ""), "scan": str(sc.get("scan") or ""),
+                                   "page": sc.get("page")} for sc in x.get("scans") or [] if isinstance(sc, dict)][:4]})
+    return out
+
+
 def _same_file(a, b):
     try:
         if os.path.getsize(a) != os.path.getsize(b):
@@ -615,7 +633,10 @@ class Gala:
         self.store = store
         self.lock = threading.RLock()
         self.cache = {}
-        self.seen = {}          # inbox file -> (size, mtime) at the last look, to wait until it is fully written
+        # inbox file -> ((size, mtime), when this computer first saw it like that), to wait until it is fully
+        # written. Timed by this computer's clock, not the file's mtime, which on a Windows share comes from
+        # another computer's clock and may be ahead or behind.
+        self.seen = {}
         for d in (self.root, self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
             os.makedirs(d, exist_ok=True)
         self.state_file = os.path.join(self.root, "state.json")
@@ -682,15 +703,32 @@ class Gala:
                 txt = subprocess.run(["pdftotext", "-layout", p, "-"], capture_output=True, text=True,
                                      timeout=120).stdout
             except (OSError, subprocess.SubprocessError):
-                return {"events": [], "sheets": 0}
-            events, sheets = set(), 0
+                return {"events": [], "sheets": 0, "heats": {}, "lanes": {}}
+            sheets, heats, lanes = 0, {}, {}
             for page in txt.split("\f"):
                 ev = re.search(r"(?m)^\s*Event (\d+) ", page)
-                if ev and re.search(r"(?m)^\s*Lane \d+\s+Heat \d+", page):
-                    events.add(int(ev.group(1)))
+                rows = re.findall(r"(?m)^\s*Lane (\d+)\s+Heat (\d+)", page)
+                if ev and rows:
+                    e = int(ev.group(1))
                     sheets += 1
-            return {"events": sorted(events), "sheets": sheets}
-        return self._cached("lanesprint", path, run) or {"events": [], "sheets": 0}
+                    heats[e] = max([heats.get(e, 0)] + [int(h) for _, h in rows])
+                    lanes.setdefault(e, set()).update(int(ln) for ln, _ in rows)
+            return {"events": sorted(heats), "sheets": sheets, "heats": heats,
+                    "lanes": {e: sorted(v) for e, v in lanes.items()}}
+        return self._cached("lanesprint", path, run) or {"events": [], "sheets": 0, "heats": {}, "lanes": {}}
+
+    def all_prints(self):
+        """Every printed lane sheet PDF in any session: [(session, name, info)]. A print can cover several sessions."""
+        out = []
+        for n in self.sessions():
+            for f in self.meet_files(n)["lanesprint"]:
+                out.append((n, f["name"], self.lane_print(os.path.join(self.sdir(n, "meet"), f["name"]))))
+        return out
+
+    @staticmethod
+    def by_hundreds(events):
+        """True when events are numbered by session in hundreds (101-1xx session 1, 201-2xx session 2, ...)."""
+        return len({e // 100 for e in events if e >= 100}) >= 2 and all(e >= 100 for e in events)
 
     def gen7(self, path):
         """The Gen7 races in a PDF: {session, races: [{race, event, heat, desc}]} (empty races: not a Gen7 PDF)."""
@@ -699,14 +737,14 @@ class Gala:
                 txt = subprocess.run(["pdftotext", p, "-"], capture_output=True, text=True, timeout=60).stdout
             except (OSError, subprocess.SubprocessError):
                 txt = ""
-            lines = [ln.strip() for ln in txt.splitlines()]
             races = []
-            for i, ln in enumerate(lines):
-                m = GEN7_RX.search(ln)
-                if m:
-                    desc = next((lines[j] for j in range(i - 1, max(i - 4, -1), -1) if lines[j]), "")
-                    races.append({"event": int(m.group(1)), "heat": int(m.group(2)), "race": int(m.group(3)),
-                                  "desc": "" if GEN7_SESSION.search(desc) else desc[:80]})
+            # pdftotext may put "Event: 7", "Heat: 2" and "Race # 44" on lines of their own, so search the whole
+            # text; the event title is the last line before "Event:".
+            for m in GEN7_RX.finditer(txt):
+                before = [ln.strip() for ln in txt[:m.start()].splitlines() if ln.strip()]
+                desc = before[-1] if before else ""
+                races.append({"event": int(m.group(1)), "heat": int(m.group(2)), "race": int(m.group(3)),
+                              "desc": "" if GEN7_SESSION.search(desc) or "Event:" in desc else desc[:80]})
             s = GEN7_SESSION.search(txt)
             return {"session": int(s.group(1)) if s else None, "races": races}
         return self._cached("gen7", path, run) or {"session": None, "races": []}
@@ -810,7 +848,18 @@ class Gala:
     def entries(self, n):
         """Events expected in the session (from its newest entries export): {event: {heats, lanes, entries}}."""
         files = self.meet_files(n)["entries"]
-        return self.hy3(os.path.join(self.sdir(n, "meet"), files[-1]["name"])) if files else {}
+        own = self.hy3(os.path.join(self.sdir(n, "meet"), files[-1]["name"])) if files else {}
+        base = own
+        if not base:   # an entries export for the whole meet, put in another session
+            for m in self.sessions():
+                f = self.meet_files(m)["entries"] if m != n else []
+                if f:
+                    base = self.hy3(os.path.join(self.sdir(m, "meet"), f[-1]["name"]))
+                    break
+        if base and self.by_hundreds(base):
+            mine = {e: v for e, v in base.items() if e // 100 == n}
+            return mine if mine or not own else own
+        return own
 
     def scan_kind(self, name):
         low = name.lower()
@@ -867,6 +916,13 @@ class Gala:
                 return best
             return max(have) if have else 1
         if event is not None:
+            known = set()
+            for n in have:
+                f = self.meet_files(n)["entries"]
+                if f:
+                    known |= set(self.hy3(os.path.join(self.sdir(n, "meet"), f[-1]["name"])))
+            if event >= 100 and known and self.by_hundreds(known):
+                return event // 100
             for n in reversed(have):
                 if event in self.entries(n) or event in {r["event"] for r in self.gen7_races(n)}:
                     return n
@@ -874,10 +930,21 @@ class Gala:
 
     def sort_inbox(self):
         """Move every finished file in the inbox to its session. A file is finished once its size and time haven't
-        changed for one look and it is a few seconds old."""
+        changed for one look and it is a few seconds old.
+        A folder in the inbox that is a symbolic link (e.g. to the folder the Gen7 computer saves into) is watched
+        too, but its files are copied, not moved, so that folder is left as it is; each file is copied once (again
+        only if it changes)."""
         now = time.time()
-        found = {}
-        for dirpath, dirs, files in os.walk(self.inbox):
+        found, linked = {}, set()
+        inbox_real = os.path.realpath(self.inbox)
+        visited = set()
+        for dirpath, dirs, files in os.walk(self.inbox, followlinks=True):
+            real = os.path.realpath(dirpath)
+            if real in visited:          # a link loop
+                dirs[:] = []
+                continue
+            visited.add(real)
+            outside = not (real == inbox_real or real.startswith(inbox_real + os.sep))
             dirs[:] = [d for d in dirs if not d.startswith(".")]
             for n in files:
                 if SKIP_NAME.search(n):
@@ -887,24 +954,42 @@ class Gala:
                     st = os.stat(p)
                 except OSError:
                     continue
+                if outside or os.path.islink(p):
+                    done = self.state.setdefault("copied", {}).get(os.path.realpath(p))
+                    if done == [st.st_size, st.st_mtime]:
+                        continue
+                    linked.add(p)
                 found[p] = (st.st_size, st.st_mtime)
-        ready = [p for p, sig in found.items() if self.seen.get(p) == sig and now - sig[1] > 3 and sig[0] > 0]
-        self.seen = found
+        seen = {p: (sig, self.seen[p][1] if p in self.seen and self.seen[p][0] == sig else now)
+                for p, sig in found.items()}
+        ready = [p for p, (sig, since) in seen.items() if sig[0] > 0 and now - since >= SETTLE]
+        self.seen = seen
         for p in sorted(ready, key=lambda p: found[p][1]):
             try:
+                if p in linked:
+                    self.file_one(p, copy=True)
+                    with self.lock:
+                        self.state["copied"][os.path.realpath(p)] = list(found[p])
+                        self.save()
+                    continue
                 self.file_one(p)
             except Exception as e:  # never let one bad file stop the rest
                 sys.stderr.write("inbox: %s: %s\n" % (p, e))
                 try:
                     dest = os.path.join(self.root, "unsorted", _unique(os.path.join(self.root, "unsorted"),
                                                                        os.path.basename(p)))
-                    shutil.move(p, dest)
-                    self.log("Couldn't sort %s (%s): moved to unsorted" % (os.path.basename(p), e),
+                    if p in linked:
+                        shutil.copy2(p, dest)
+                        with self.lock:
+                            self.state["copied"][os.path.realpath(p)] = list(found[p])
+                    else:
+                        shutil.move(p, dest)
+                    self.log("Couldn't sort %s (%s): put in unsorted" % (os.path.basename(p), e),
                              name=os.path.basename(p), to="unsorted")
                 except OSError:
                     pass
 
-    def file_one(self, path, force_session=None, force_folder=None):
+    def file_one(self, path, force_session=None, force_folder=None, copy=False):
         name = os.path.basename(path)
         kind, folder, sess, event = self.classify(path)
         if force_folder:
@@ -920,7 +1005,8 @@ class Gala:
         note = ""
         if os.path.exists(dest):
             if _same_file(path, dest):
-                os.unlink(path)
+                if not copy:
+                    os.unlink(path)
                 self.log("%s was already in %s" % (name, label), name=name, to=label, kind=kind)
                 return label
             # A file with the same name is a rescan or a reprint: it replaces the old one, which is kept in
@@ -942,8 +1028,11 @@ class Gala:
                 if moved:
                     note += "; its %d OCR files were set aside to be read again" % moved
             note += ")"
-        shutil.move(path, dest)
-        self.log("%s → %s%s" % (name, label, note), name=name, to=label, kind=kind)
+        if copy:
+            shutil.copy2(path, dest)
+        else:
+            shutil.move(path, dest)
+        self.log("%s → %s%s" % (name, label, note + (" (copied)" if copy else "")), name=name, to=label, kind=kind)
         return label
 
     def move(self, rel, session, folder):
@@ -1008,22 +1097,31 @@ class Gala:
         scans = self.scans(n)
         ocr = [f["name"] for f in _ls(self.sdir(n, "ocr"))]
         reports = [f for f in _ls(self.sdir(n, "reports")) if not f["dir"]]
-        lanes_done = {}
+        lanes_done, slips_done = {}, {}
         for o in ocr:
             m = OCR_LANE.search(o)
             if m:
                 lanes_done.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+            m = OCR_SLIP.search(o)
+            if m:
+                slips_done.setdefault(int(m.group(1)), []).append(o)
         gen7_by_event, desc = {}, {}
         for r in races:
             gen7_by_event.setdefault(r["event"], {}).setdefault(r["heat"], r)
             if r["desc"]:
                 desc.setdefault(r["event"], r["desc"])
-        printed, prints = {}, []
-        for f in meet["lanesprint"]:
-            info = self.lane_print(os.path.join(self.sdir(n, "meet"), f["name"]))
-            prints.append({"name": f["name"], "events": info["events"], "sheets": info["sheets"]})
+        printed, prints, print_heats, print_lanes = {}, [], {}, {}
+        mine = set(expected) | {r["event"] for r in races}
+        for m, name, info in self.all_prints():
+            evs = [e for e in info["events"] if e in mine] if mine else info["events"]
+            if m != n and not evs:
+                continue
+            path = "sessions/S%d/meet/%s" % (m, name)
+            prints.append({"name": name, "path": path, "events": evs or info["events"], "sheets": info["sheets"]})
             for e in info["events"]:
-                printed.setdefault(e, []).append(f["name"])
+                printed.setdefault(e, []).append(path)
+                print_heats[e] = max(print_heats.get(e, 0), info["heats"].get(e, 0))
+                print_lanes.setdefault(e, set()).update(info["lanes"].get(e, []))
         packs = {}
         for s in scans:
             if s["kind"] == "lanes":
@@ -1033,12 +1131,30 @@ class Gala:
         events = []
         for e in sorted(set(expected) | set(gen7_by_event) | set(packs) | set(lanes_done)):
             x = expected.get(e, {})
-            heats = x.get("heats") or max(gen7_by_event.get(e, {0: 0}))
+            heats = x.get("heats") or print_heats.get(e) or max(gen7_by_event.get(e, {0: 0}))
             have = sorted(gen7_by_event.get(e, {}))
             pk = packs.get(e, [])
             report = next((f for f in reports if f["name"].lower().endswith(".html")
                            and re.search(r"(?i)\bevent\s*0*%d\b" % e, f["name"])), None)
             inputs = [(p["name"], p["mtime"]) for p in pk] + [(r["file"], r["mtime"]) for r in races if r["event"] == e]
+            # The merge results need the session's entries export and Meet Manager's empty merge results export;
+            # when they arrive after the event was done, the event is asked again (they are part of its inputs).
+            seeded = (x.get("heats") or 0) > 0
+            merge_inputs = []
+            if meet["entries"]:   # a pre-gala export (not seeded) works too: the plugin seeds from the lane sheets
+                merge_inputs.append((meet["entries"][-1]["name"], meet["entries"][-1]["mtime"]))
+            if meet["results"]:
+                merge_inputs.append((meet["results"][-1]["name"], meet["results"][-1]["mtime"]))
+            can_merge = len(merge_inputs) == 2
+            if can_merge:
+                inputs = inputs + merge_inputs
+            ev_rx = re.compile(r"(?i)\bevent\s*0*%d\b" % e)
+            merge_file = next((f["name"] for f in reports if f["name"].lower().endswith(".hy3") and ev_rx.search(f["name"])), None)
+            qf_file = next((f for f in reports if f["name"].lower().endswith(".json") and "quick" in f["name"].lower()
+                            and ev_rx.search(f["name"])), None)
+            fixes = None
+            if qf_file:
+                fixes = self._cached("qf", os.path.join(self.sdir(n, "reports"), qf_file["name"]), _read_fixes)
             sig = hashlib.sha1(json.dumps(sorted(inputs)).encode()).hexdigest()[:12]
             newest = max([t for _, t in inputs] or [0])
             ready = bool(pk) and heats > 0 and all(h in have for h in range(1, heats + 1))
@@ -1055,16 +1171,18 @@ class Gala:
                 status = "waiting"
             events.append({"event": e, "desc": desc.get(e, ""), "heats": heats, "gen7": have,
                            "gen7Missing": [h for h in range(1, heats + 1) if h not in have],
-                           "expected": bool(x), "lanes": len(x.get("lanes", [])) or None,
+                           "expected": bool(x), "lanes": len(x.get("lanes", [])) or len(print_lanes.get(e, ())) or None,
                            "packs": [p["name"] for p in pk], "printed": printed.get(e, []), "ocrLanes": len(lanes_done.get(e, ())),
                            "report": report["name"] if report else None, "ready": ready, "sig": sig,
-                           "status": status, "asked": a})
-        merged = [f["name"] for f in reports if f["name"].lower().endswith(".hy3")]
+                           "status": status, "asked": a, "merge": merge_file, "canMerge": can_merge,
+                           "seeded": seeded, "fixes": fixes, "dqSlips": len(slips_done.get(e, [])),
+                           "fixesFile": qf_file["name"][:-5] + ".html" if qf_file else None})
+        merged = [f["name"] for f in reports if f["name"].lower().endswith(".hy3") and not re.search(r"(?i)\bevent\b", f["name"])]
         finals = [f["name"] for f in reports if f["name"].lower().endswith(".html") and "final" in f["name"].lower()]
         sess_report = next((f["name"] for f in reports if f["name"].lower().endswith(".html")
                             and re.search(r"(?i)session", f["name"]) and "final" not in f["name"].lower()), None)
         return {"n": n, "meet": {k: [f["name"] for f in v] for k, v in meet.items()}, "lanePrints": prints,
-                "expected": {"events": len(expected), "heats": sum(v["heats"] for v in expected.values())},
+                "expected": {"events": len(expected), "heats": sum(e["heats"] for e in events if e["expected"])},
                 "races": len(races), "scans": scans, "events": events, "merged": merged, "finalReports": finals,
                 "sessionReport": sess_report, "dqCodes": "dq-codes.json" in ocr,
                 "folders": {k: _ls(self.sdir(n, k)) if k != "ocr" else
@@ -1087,8 +1205,29 @@ class Gala:
     def P(self, n, sub, name=""):
         return "data/sessions/S%d/%s%s" % (n, sub, ("/" + name) if name else "")
 
+    FINA_CODES = "plugins/gala-ocr/skills/gala-audit/data/dqcodesFINA.txt"
+
     def question(self, key, n):
-        """(title, body) for a piece of work, or None if it doesn't apply (yet)."""
+        """(title, body) for a piece of work, or None if it doesn't apply (yet). Every audit_report, merge_results
+        and final_audit command gets --codes when the session has the meet's own DQ code list; otherwise the
+        scripts use the full FINA list in the plugin."""
+        q = self._question(key, n)
+        if not q:
+            return q
+        own = self.meet_files(n)["codes"]
+        if own:
+            path = self.P(n, "meet", own[-1]["name"])
+            body = re.sub(r"(`(?:audit_report|merge_results|final_audit)\.py [^`]*)`", lambda m: '%s --codes "%s"`' % (m.group(1), path), q[1])
+            note = ("\n\nDQ codes: use the meet's own list `%s` (passed to the scripts as `--codes`)." % path)
+        else:
+            body = q[1]
+            note = ("\n\nDQ codes: the full FINA list is in the plugin, `%s` (the gala-audit skill's `data/` folder; "
+                    "the scripts use it by default)." % self.FINA_CODES)
+        if re.search(r"(?i)\bDQ\b", body):
+            body += note
+        return q[0], body
+
+    def _question(self, key, n):
         s = self.session(n)
         ocr, gen7, scans, rep = self.P(n, "ocr"), self.P(n, "gen7"), self.P(n, "scans"), self.P(n, "reports")
         done_events = ",".join(str(e["event"]) for e in s["events"] if e["ocrLanes"] or e["packs"])
@@ -1107,23 +1246,46 @@ class Gala:
             if ev["printed"]:
                 orig = ("Take the printed fields (names, ages, teams, seed times) from Meet Manager's printed lane sheets "
                         "%s with the skill's `original_sheets.py` (pass the PDF and the event)."
-                        % ", ".join("`%s`" % self.P(n, "meet", f) for f in ev["printed"]))
+                        % ", ".join("`data/%s`" % f for f in ev["printed"]))
             else:
                 orig = ("There are no printed lane sheets for this event yet, so read the printed fields from the scan "
                         "(and say so in your answer).")
             missing = ("\n\nGen7 heats not in yet: %s. Audit what is there and say which heats are missing."
                        % ", ".join(map(str, ev["gen7Missing"]))) if ev["gen7Missing"] else ""
+            mfile = "%s/Event %02d merge results.hy3" % (rep, e)
+            qfile = "%s/Event %02d quick fixes.html" % (rep, e)
+            if ev["canMerge"]:
+                ent = self.P(n, "meet", s["meet"]["entries"][-1])
+                tpl = self.P(n, "meet", s["meet"]["results"][-1])
+                merge_step = ("2. **Write the event's merge results** for Meet Manager with the **gala-audit** skill "
+                              "(unzip the `Hfile*.hy3` from `%s` into a temp folder if it's a zip):\n"
+                              "   `merge_results.py %s %s <entries>.hy3 \"%s\" \"%s\" --events %d`\n"
+                              % (ent, ocr, gen7, tpl, mfile, e))
+                merge_opt = ' --merge "%s"' % mfile
+            else:
+                why = []
+                if not s["meet"]["entries"]:
+                    why.append("the session's entries export isn't in")
+                if not s["meet"]["results"]:
+                    why.append("Meet Manager's empty merge results export isn't in")
+                merge_step = ("2. **Merge results: not yet**, because %s. Skip this step and say so in your answer; "
+                              "you'll be asked again when they arrive.\n" % " and ".join(why))
+                merge_opt = ""
             body = (("Event %d is in: lane sheets %s and Gen7 races for heats %s (of %s) in `%s`.%s\n\n"
                      "1. **Transcribe** the lane sheets with the **gala-ocr** skill into `%s/` (skip pages already done%s). %s\n"
-                     "2. **Audit the event** with the **gala-audit** skill:\n"
-                     "   `audit_report.py %s %s \"%s/Event %02d audit.html\" --events %d --scans %s`\n"
-                     "3. **Update the session report** (every event transcribed so far):\n   %s\n"
-                     "4. **Answer** with what the officials should look at now (pads, times in doubt, DQs, unsigned "
-                     "sheets, anything unreadable), with links to both reports.")
+                     "%s"
+                     "3. **Audit the event** with the **gala-audit** skill, with its Quick Fix list (the portal turns the "
+                     "`.json` it writes next to the `.html` into the event's quick-fix checklist):\n"
+                     "   `audit_report.py %s %s \"%s/Event %02d audit.html\" --events %d --scans %s%s --quick-fixes \"%s\"`\n"
+                     "4. **Update the session report** (every event transcribed so far):\n   %s\n"
+                     "5. **Answer** with what the officials should look at now (pads, times in doubt, DQs, unsigned "
+                     "sheets, anything unreadable), how many quick fixes there are, and links to the reports and the "
+                     "merge results file.")
                     % (e, packs, ", ".join(map(str, ev["gen7"])) or "none", ev["heats"] or "?", gen7, missing,
-                       ocr, "; a rescanned pack replaces the old one and its old OCR has been set aside, so read all its pages"
-                       if redo else "", orig,
-                       ocr, gen7, rep, e, e, scans, session_audit))
+                       ocr, "; a rescanned pack replaced the old one and its old OCR was set aside, so read its pages again"
+                       if redo and any(x["name"] in ev["packs"] and x["pages"] and x["done"] < x["pages"] for x in s["scans"])
+                       else "; if they are all done, go straight to the next step", orig, merge_step,
+                       ocr, gen7, rep, e, e, scans, merge_opt, qfile, session_audit))
             return title, body
         if kind == "scan":
             name = key.split(":", 2)[2]
@@ -1133,7 +1295,7 @@ class Gala:
             if sc["kind"] == "dq":
                 return ("Session %d: read the DQ slips in %s" % (n, name),
                         "New DQ slips: `%s`.\n\n1. Read them with the **gala-ocr** skill into `%s/` (skip slips already done).\n"
-                        "2. Give each slip its DQ code in `%s/dq-codes.json` (**gala-audit** skill); ask the referee here "
+                        "2. Give each slip its DQ code in `%s/dq-codes.json` (**gala-audit** skill, from the DQ code list below); ask the referee here "
                         "about any code you're unsure of.\n3. Update the session report:\n   %s\n"
                         "4. Answer with the DQs, their codes and anything that doesn't match the lane sheets or Gen7."
                         % (self.P(n, "scans", name), ocr, ocr, session_audit))
@@ -1148,8 +1310,9 @@ class Gala:
             if not s["meet"]["results"] or not s["meet"]["entries"]:
                 return None
             ent, res = self.P(n, "meet", s["meet"]["entries"][-1]), self.P(n, "meet", s["meet"]["results"][-1])
-            return ("Session %d: write the merge results for Meet Manager" % n,
-                    "Meet Manager's merge results export for session %d is in: `%s` (entries: `%s`).\n\n"
+            return ("Session %d: write the whole session's merge results for Meet Manager" % n,
+                    "Every event of session %d is audited. Write one merge results file for the whole session from "
+                    "Meet Manager's empty merge results export `%s` and the entries `%s`.\n\n"
                     "1. Check every event of the session has been transcribed and audited and every DQ slip has a code "
                     "(`%s/dq-codes.json`); list anything missing.\n"
                     "2. Write the merge results with the **gala-audit** skill (unzip the entries' Hfile*.hy3 into a temp "
@@ -1166,6 +1329,37 @@ class Gala:
                     "Meet Manager's final merge results for session %d are in: `%s`.\n\nRun the **gala-audit** final audit:\n"
                     "   `final_audit.py %s %s \"%s/Session %d final audit.html\" --quick-fixes \"%s/Session %d quick fixes.json\"`\n"
                     "and answer with every manual change and the Quick Fix swims left as they were." % (n, fin, ours, fin, rep, n, rep, n))
+        if kind == "remerge":
+            e = int(key.split(":")[2])
+            ev = next((x for x in s["events"] if x["event"] == e), None)
+            if not ev or not ev["canMerge"] or not ev["ocrLanes"]:
+                return None
+            ent = self.P(n, "meet", s["meet"]["entries"][-1])
+            tpl = self.P(n, "meet", s["meet"]["results"][-1])
+            mfile = "%s/Event %02d merge results.hy3" % (rep, e)
+            unread = [x["name"] for x in s["scans"] if x["kind"] == "dq" and x["pages"] and x["done"] < x["pages"]]
+            codes = "%s/dq-codes.json" % ocr
+            return ("Session %d · Event %d: regenerate the merge results" % (n, e),
+                    ("Regenerate event %d's merge results from what is **already transcribed**. **Don't read any scans "
+                     "again**: no gala-ocr, no rendering pages. The lane sheets and DQ slips are only read when their "
+                     "scans arrive.\n\n"
+                     "Event %d has %d DQ slip%s transcribed in `%s/`.%s\n\n"
+                     "1. **DQ codes:** every DQ slip of event %d in `%s/` must have a code in `%s`. Give any slip "
+                     "without one its code from the transcribed infraction and the DQ code list below. "
+                     "Don't change codes already given.\n"
+                     "2. **Write the merge results** with the **gala-audit** skill (unzip the `Hfile*.hy3` from `%s` "
+                     "into a temp folder if it's a zip), replacing the old file:\n"
+                     "   `merge_results.py %s %s <entries>.hy3 \"%s\" \"%s\" --events %d`\n"
+                     "3. **Refresh the audit and quick fixes:**\n"
+                     "   `audit_report.py %s %s \"%s/Event %02d audit.html\" --events %d --scans %s --merge \"%s\" "
+                     "--quick-fixes \"%s/Event %02d quick fixes.html\"`\n"
+                     "4. **Answer** with what changed in the merge file (DQs added, times changed) and the quick fixes "
+                     "left.")
+                    % (e, e, ev["dqSlips"], "" if ev["dqSlips"] == 1 else "s", ocr,
+                       (" DQ scans not fully transcribed yet (they'll be read on their own, not here; say so): %s."
+                        % ", ".join("`%s`" % u for u in unread)) if unread else "",
+                       e, ocr, codes, ent, ocr, gen7, tpl, mfile, e,
+                       ocr, gen7, rep, e, e, scans, mfile, rep, e))
         if kind == "check":
             return ("Session %d: check the files" % n,
                     "Look through `data/sessions/S%d/` and the portal's Checklist for session %d: which events and "
@@ -1192,6 +1386,25 @@ class Gala:
             self.save()
             self.log("Asked Claude: %s (question %d)" % (q[0], row["id"]), qid=row["id"])
             return row
+
+    def refile(self):
+        """Move Gen7 race PDFs that were filed as Meet Manager files (portal 0.3.3 and earlier didn't recognise
+        Gen7's own layout) to the session's gen7 folder."""
+        for n in self.sessions():
+            d = self.sdir(n, "meet")
+            for f in _ls(d):
+                p = os.path.join(d, f["name"])
+                if not f["dir"] and f["name"].lower().endswith(".pdf") and self.gen7(p)["races"]:
+                    g = self.sdir(n, "gen7")
+                    dest = os.path.join(g, f["name"])
+                    if os.path.exists(dest):
+                        if _same_file(p, dest):
+                            os.unlink(p)
+                            continue
+                        dest = os.path.join(g, _unique(g, f["name"]))
+                    shutil.move(p, dest)
+                    self.log("%s → S%d/gen7 (it is a Gen7 race, not a Meet Manager file)" % (f["name"], n),
+                             name=f["name"], to="S%d/gen7" % n, kind="gen7")
 
     def auto_ask(self):
         if not self.state["auto"]:
@@ -1228,6 +1441,9 @@ class Gala:
         while True:
             try:
                 self.sort_inbox()
+                if not getattr(self, "_refiled", False):
+                    self.refile()
+                    self._refiled = True
                 self.auto_ask()
             except Exception as e:
                 sys.stderr.write("gala loop: %r\n" % (e,))
@@ -2445,6 +2661,13 @@ a{color:var(--accent)}
 .gfiles li select{flex:0 0 auto;width:auto;padding:2px 6px}
 .gfiles li button{flex:0 0 auto;padding:2px 10px}
 button:disabled{opacity:.45;cursor:not-allowed}
+.cl-ev tr.qfrow td{border-top:0;padding-top:0}
+.cl-ev details summary{cursor:pointer;font-size:.9em;font-weight:600;color:var(--muted)}
+ul.qf{list-style:none;margin:6px 0 4px;padding:0}
+ul.qf>li{display:grid;grid-template-columns:28px 1fr;gap:8px;padding:6px 0;border-top:1px dashed var(--line)}
+ul.qf>li.done>div{opacity:.6}
+ul.qf ul{margin:2px 0 2px 18px;padding:0}
+ul.qf input[type=checkbox]{width:20px;height:20px;accent-color:var(--accent)}
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -2654,22 +2877,35 @@ function link(s,sub,name){return `<a href="${esc(galaHref('sessions/S'+s.n+'/'+s
 function renderChecklist(){
  const s=curSession(),box=$('#cl-body');
  if(!s){box.innerHTML='<div class="card meta">No sessions yet. Drop the session\'s Meet Manager entries export on the Gala tab (or in the inbox folder) to start.</div>';return}
- const keys=['entries','lanesprint',...s.events.map(e=>'e'+e.event),'dq','etd','codes','mmresults','merged','mmfinal','final'].map(k=>'S'+s.n+':'+k);
+ const qfKey=(e,f)=>'S'+s.n+':e'+e.event+':qf:'+f.heat+'.'+f.lane;
+ const keys=['entries','lanesprint','mmresults',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','final'].map(k=>'S'+s.n+':'+k)
+  .concat(s.events.flatMap(e=>(e.fixes||[]).map(f=>qfKey(e,f))));
  const ticked=keys.filter(k=>GALA.ticks[k]).length,pct=Math.round(100*ticked/keys.length);
  const dq=s.scans.filter(x=>x.kind==='dq'),etd=s.scans.filter(x=>x.kind==='etd');
- const ev=s.events.length?`<div class="tblwrap"><table class="cl-ev"><tr><th></th><th>Event</th><th class="c">Printed</th><th>Lane sheets</th><th class="c">Gen7 heats</th><th class="c">OCR lanes</th><th>Audit</th><th>Status</th><th></th></tr>`
+ const ev=s.events.length?`<div class="tblwrap"><table class="cl-ev"><tr><th></th><th>Event</th><th class="c">Printed</th><th>Lane sheets</th><th class="c">Gen7 heats</th><th class="c">OCR lanes</th><th>Audit</th><th>Merge</th><th class="c">Quick fixes</th><th>Status</th><th></th></tr>`
   +s.events.map(e=>{const key='S'+s.n+':e'+e.event,t=GALA.ticks[key];
    const g7=e.heats?`${e.gen7.length}/${e.heats}`:(e.gen7.length||'–');
+   const fx=e.fixes||null,fxDone=fx?fx.filter(f=>GALA.ticks[qfKey(e,f)]).length:0;
+   const fxCell=fx==null?'<span class="no">–</span>':fx.length?`<span class="${fxDone===fx.length?'ok':'gwarn'}">${fxDone}/${fx.length}</span>`:'<span class="ok" title="No quick fixes">none ✓</span>';
+   const regen=`<div><button type="button" class="sm" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'Write the merge results again from what is already transcribed, with every DQ slip read so far (no scans are read again)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export and the empty merge results export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
+   const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="${esc(!s.meet.entries.length?'No entries export':'No empty merge results export')}">waiting</span>`)+regen;
+   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10"><details${fxDone<fx.length?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} done)${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
+     <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k];
+      return `<li class="${t?'done':''}">${tickBox(k,'Heat '+f.heat+' lane '+f.lane)}<div><b>Heat ${esc(f.heat)} · Lane ${esc(f.lane)}</b> <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
+       <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
+       ${f.scans.length?`<div class="sm">${f.scans.map(sc=>`<a href="${esc(galaHref('sessions/S'+s.n+'/scans/'+sc.scan))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`).join(' · ')}</div>`:''}
+       ${t?`<div class="sm">fixed · ticked by ${esc(t.by)} · ${esc(agoShort(t.at))}</div>`:''}</div></li>`}).join('')}</ul></details></td></tr>`:'';
    return `<tr class="${t?'done':''}" data-cldrop="S${s.n}/scans">
     <td>${tickBox(key,'Event '+e.event)}</td>
     <td><span class="evname">Event ${e.event}</span>${e.desc?`<div class="sm">${esc(e.desc)}</div>`:''}${!e.expected&&s.meet.entries.length?'<div class="sm gwarn">not in the entries</div>':''}${t?`<div class="sm">ticked by ${esc(t.by)}</div>`:''}</td>
-    <td class="c">${e.printed.length?'<span class="ok" title="'+esc(e.printed.join(', '))+'">✓</span>':'<span class="no" title="No printed lane sheets for this event">–</span>'}</td>
+    <td class="c">${e.printed.length?'<span class="ok" title="'+esc(e.printed.map(x=>x.split('/').pop()).join(', '))+'">✓</span>':'<span class="no" title="No printed lane sheets for this event">–</span>'}</td>
     <td>${e.packs.length?e.packs.map(p=>link(s,'scans',p)).join('<br>'):'<span class="no">–</span>'}</td>
     <td class="c">${g7}${e.gen7Missing.length&&e.gen7.length?`<div class="sm">missing ${esc(e.gen7Missing.join(', '))}</div>`:''}</td>
     <td class="c">${e.ocrLanes?e.ocrLanes+(e.lanes?'/'+e.lanes:''):'–'}</td>
     <td>${e.report?link(s,'reports',e.report):'–'}</td>
+    <td>${mergeCell}</td><td class="c">${fxCell}</td>
     <td><span class="st ${e.status}">${esc(ST_TXT[e.status]||e.status)}</span></td>
-    <td><button type="button" data-ask="${key}" ${e.packs.length?'':'disabled title="No lane sheet pack yet"'}>${e.asked?'Ask again':'Ask Claude'}</button></td></tr>`}).join('')+'</table></div>'
+    <td><button type="button" data-ask="${key}" ${e.packs.length?'':'disabled title="No lane sheet pack yet"'}>${e.asked?'Ask again':'Ask Claude'}</button></td></tr>${fxRows}`}).join('')+'</table></div>'
   :'<div class="meta" style="padding:8px 0">No events yet. They come from the entries export, or appear as lane sheet packs and Gen7 races arrive.</div>';
  const scanFound=list=>list.map(x=>link(s,'scans',x.name)+` <span class="meta">(${x.done}/${x.pages??'?'} pages read)</span>`);
  box.innerHTML=`<div class="card clhead"><div class="gh-top"><div><h2>Session ${s.n} checklist</h2>
@@ -2678,18 +2914,19 @@ function renderChecklist(){
   <div class="card">
   <div class="cl-sec">Start of the session</div>
   ${clRow(s,'S'+s.n+':entries','Meet entries export','From Meet Manager, for this session: the events, heats and lanes to expect (<code>Meet Entries-…zip</code> or its <code>Hfile…hy3</code>).',
-    s.meet.entries.map(n=>link(s,'meet',n)+(s.expected.events?` <span class="meta">(${s.expected.events} events, ${s.expected.heats} heats)</span>`:'')),'S'+s.n+'/meet')}
+    s.meet.entries.map(n=>link(s,'meet',n)+(s.expected.events?` <span class="meta">(${s.expected.events} events, ${s.expected.heats} heats)</span>`:'')
+     +(s.events.some(e=>e.expected&&!e.seeded)?' <span class="meta">(not seeded: a pre-gala export; the merge results seed each swim from the lane sheets)</span>':'')),'S'+s.n+'/meet')}
   ${clRow(s,'S'+s.n+':lanesprint','Printed lane sheets (Meet Manager)','The lane sheet PDF Meet Manager printed for the session (not the scan). Claude copies the names, ages, teams and seed times from it, which is much more accurate than reading them off the scans. Bring it in before the first event.',
-    s.lanePrints.map(p=>link(s,'meet',p.name)+` <span class="meta">(${p.sheets} sheet${p.sheets===1?'':'s'}, event${p.events.length===1?'':'s'} ${esc(evRange(p.events))})</span>`),'S'+s.n+'/meet')}
+    s.lanePrints.map(p=>`<a href="${esc(galaHref(p.path))}" target="_blank" rel="noopener">${esc(p.name)}</a>`+` <span class="meta">(${p.sheets} sheet${p.sheets===1?'':'s'}, event${p.events.length===1?'':'s'} ${esc(evRange(p.events))})</span>`),'S'+s.n+'/meet')}
+  ${clRow(s,'S'+s.n+':mmresults','Empty merge results export (Meet Manager)','Export merge results from Meet Manager for this session before any results are in (name it with "Results"). Claude copies its header and layout into each event\'s merge results file.',s.meet.results.map(n=>link(s,'meet',n)),'S'+s.n+'/meet')}
   <div class="cl-sec">Each event, as it is swum</div>
-  <div class="meta" style="margin-bottom:4px">An event is <b>ready</b> when its lane sheet pack and every heat's Gen7 race PDF are in${GALA.auto?'; Claude is then asked to transcribe and audit it':''}. Drop a lane sheet pack on an event to add it.</div>
+  <div class="meta" style="margin-bottom:4px">An event is <b>ready</b> when its lane sheet pack and every heat's Gen7 race PDF are in${GALA.auto?'; Claude is then asked to transcribe and audit it':''}. Claude then writes the event's <b>merge results</b> (<code>.hy3</code>, to import into Meet Manager) and its <b>quick fixes</b>: the swims to check by hand, listed under the event to tick off as they're fixed. Drop a lane sheet pack on an event to add it.</div>
   ${ev}
   <div class="cl-sec">During and after the session</div>
   ${clRow(s,'S'+s.n+':dq','DQ slips','The referees\' DQ slips, scanned (name the file with "DQ"). Claude reads each batch as it arrives.',scanFound(dq),'S'+s.n+'/scans')}
   ${clRow(s,'S'+s.n+':etd','ETD programme','The programme with the Gen7 race numbers written by each heat (name the file with "ETD"). Needed for combined events and re-started heats.',scanFound(etd),'S'+s.n+'/scans')}
-  ${clRow(s,'S'+s.n+':codes','DQ codes','Each slip\'s FINA code, given by Claude; codes it wasn\'t sure of need the referee\'s OK.',s.dqCodes?[link(s,'ocr','dq-codes.json')]:[],null,true)}
-  ${clRow(s,'S'+s.n+':mmresults','Meet Manager merge results export','Exported from Meet Manager for this session (its header and layout are copied).',s.meet.results.map(n=>link(s,'meet',n)),'S'+s.n+'/meet')}
-  ${clRow(s,'S'+s.n+':merged','Merged results for Meet Manager','Written by Claude once every event is audited and the merge results export is in: the audited results to import.',s.merged.map(n=>link(s,'reports',n)).concat(s.sessionReport?['session report: '+link(s,'reports',s.sessionReport)]:[]),null,true)}
+  ${clRow(s,'S'+s.n+':codes','DQ codes','Each slip\'s code, given by Claude from '+(s.meet.codes.length?'the meet\'s own list ('+link(s,'meet',s.meet.codes[s.meet.codes.length-1])+')':'the full FINA list in the plugin (<code>gala-audit/data/dqcodesFINA.txt</code>); drop a <code>.txt</code> with the meet\'s own list in the inbox to use that instead')+'. Codes it wasn\'t sure of need the referee\'s OK.',s.dqCodes?[link(s,'ocr','dq-codes.json')]:[],null,true)}
+  ${clRow(s,'S'+s.n+':merged','Session merge results (all events)','Written by Claude once every event is audited: one file with the whole session, and the session report.',s.merged.map(n=>link(s,'reports',n)).concat(s.sessionReport?['session report: '+link(s,'reports',s.sessionReport)]:[]),null,true)}
   ${clRow(s,'S'+s.n+':mmfinal','Final merge results export','Exported from Meet Manager after the audited results were imported and finalised (name it with "final").',s.meet.final.map(n=>link(s,'meet',n)),'S'+s.n+'/meet')}
   ${clRow(s,'S'+s.n+':final','Final audit report','Written by Claude: every change made by hand in Meet Manager.',s.finalReports.map(n=>link(s,'reports',n)),null,true)}
   </div>`}

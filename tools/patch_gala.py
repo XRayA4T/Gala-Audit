@@ -8,7 +8,7 @@ import re
 import sys
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
-VERSION = "0.3.1"
+VERSION = "0.4.3"
 s = open(sys.argv[1], encoding="utf-8").read()
 piece = lambda name: open(os.path.join(SRC, name), encoding="utf-8").read()  # noqa: E731
 
