@@ -80,7 +80,7 @@ function clRow(s,key,title,why,found,folder,claude){
   <div class="cl-act">${folder?`<label class="lnk">add file<input type="file" multiple hidden data-gup="${esc(folder)}"></label>`:''}</div></div>`}
 function evRange(evs){const out=[];for(let i=0;i<evs.length;i++){let j=i;while(j+1<evs.length&&evs[j+1]===evs[j]+1)j++;out.push(j>i?evs[i]+'–'+evs[j]:''+evs[i]);i=j}return out.join(', ')}
 function link(s,sub,name){return `<a href="${esc(galaHref('sessions/S'+s.n+'/'+sub+'/'+name))}" target="_blank" rel="noopener">${esc(name)}</a>`}
-function renderChecklist(){
+function renderChecklist(){setTimeout(swAll,0);
  const s=curSession(),box=$('#cl-body');if(s)loadCodes(s.n);
  if(!s){box.innerHTML='<div class="card meta">No sessions yet. Drop the session\'s Meet Manager entries export on the Gala tab (or in the inbox folder) to start.</div>';return}
  const qfKey=(e,f)=>'S'+s.n+':e'+e.event+':qf:'+f.heat+'.'+f.lane;
@@ -101,11 +101,13 @@ function renderChecklist(){
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
        ${f.scans.length?`<div class="sm">${f.scans.map(sc=>`<a href="${esc(galaHref('sessions/S'+s.n+'/scans/'+sc.scan))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`).join(' · ')}</div>`:''}
        <form class="qffix" data-fix="${s.n}|${e.event}|${esc(f.heat)}|${esc(f.lane)}" autocomplete="off">
+        ${qfWatches(f,hf)}${qfSwimmer(s,e,f,hf)}
         <label>Result <select name="status"><option value="">as audited</option><option value="OK"${hf.status==='OK'?' selected':''}>Swam</option><option value="NS"${hf.status==='NS'?' selected':''}>No-show</option><option value="DQ"${hf.status==='DQ'?' selected':''}>DQ</option></select></label>
         <label>Time <input name="time" value="${esc(hf.time||'')}" placeholder="m:ss.hh" size="8"></label>
         <label class="qfcode"${hf.status==='DQ'?'':' hidden'}>Code <input name="code" value="${esc(hf.code||'')}" list="dqcodes" size="6"></label>
         <label class="qfnote">Note <input name="note" value="${esc(hf.note||'')}" placeholder="what was fixed"></label>
-        <button type="submit">${hf.by?'Update':'Save fix'}</button>${hf.by?'<button type="button" data-clearfix>Clear</button>':''}
+        ${(()=>{const mi=/not in the merge file/i.test(f.checks.join(' ')),wr=!!(f.row&&f.row.writtenIn)||/written in/i.test(f.checks.join(' '));
+          return `<button type="submit"${mi||wr?' class="primary"':''}>${mi||wr?(hf.add?'Confirmed · update':mi?'Confirm swim':'Confirm swimmer'):hf.by?'Update':'Save fix'}</button>`})()}${hf.by?'<button type="button" data-clearfix>Clear</button>':''}
         <span class="sm" data-fixmsg>${hf.by?esc('Fixed by '+hf.by+' · '+agoShort(hf.at)):'Or just tick it if nothing needs changing.'}</span></form>
        ${t?`<div class="sm">done · ticked by ${esc(t.by)} · ${esc(agoShort(t.at))}</div>`:''}</div></li>`}).join('')}</ul></details></td></tr>`:'';
    return `<tr class="${t?'done':''}" data-cldrop="S${s.n}/scans">
@@ -188,7 +190,15 @@ function offerRegen(key,justDone){
  if(confirm('All '+e.fixes.length+' quick fixes for event '+ev+' are done.\n\nRegenerate the event\'s merge results now, with the fixes made in the portal and every DQ slip read so far? (No scans are read again.)'))
   galaPost('/api/gala/ask',{key:'S'+n+':remerge:'+ev}).then(j=>alert('Asked Claude (question #'+j.question+').')).catch(err=>alert(err.message))}
 document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.qffix');if(!fm)return;ev.preventDefault();
- const [n,event,heat,lane]=fm.dataset.fix.split('|'),d=Object.fromEntries(new FormData(fm).entries());
+ const [n,event,heat,lane]=fm.dataset.fix.split('|'),d=Object.fromEntries([...new FormData(fm).entries()].filter(([k])=>!/^(w\d+|wt\d+|swpick|swq)$/.test(k)));
+ const watches={};let bad='';
+ fm.querySelectorAll('.qfw[data-col]').forEach(w=>{const c=w.dataset.col,ch=(w.querySelector('input[type=radio]:checked')||{}).value,tv=(w.querySelector('input[name=wt'+c+']').value||'').trim();
+  if(ch==='accept')watches[c]={accepted:true};
+  else if(ch==='capture'||tv){if(!/^(\d{1,2}:)?\d{1,2}\.\d{2}$/.test(tv))bad='Timer '+c+': type the time read off the sheet, like 1:05.32';else watches[c]={time:tv}}});
+ if(bad){fm.querySelector('[data-fixmsg]').textContent=bad;return}
+ d.watches=watches;
+ const pick=fm.querySelector('input[name=swpick]:checked');if(pick&&pick.value)d.swimmer={id:pick.value,name:pick.dataset.name};
+ const swb=fm.querySelector('.qfsw[data-add]');if(swb){if(!d.swimmer){fm.querySelector('[data-fixmsg]').textContent='Pick the swimmer first';return}d.add=true}
  if(d.time&&!/^(\d{1,2}:)?\d{1,2}\.\d{2}$/.test(d.time)){fm.querySelector('[data-fixmsg]').textContent='Time like 1:05.32 or 32.10';return}
  if(d.status==='DQ'&&!d.code){fm.querySelector('[data-fixmsg]').textContent='A DQ needs its code';return}
  if(d.code&&CODES.codes&&CODES.codes.length&&!CODES.codes.some(c=>c[0]===d.code)&&!confirm(d.code+' is not in '+(CODES.source||'the code list')+'. Save it anyway?'))return;
@@ -199,3 +209,46 @@ document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.qffix')
 document.addEventListener('click',ev=>{const b=ev.target.closest('[data-clearfix]');if(!b)return;const fm=b.closest('form.qffix');
  const [n,event,heat,lane]=fm.dataset.fix.split('|');
  galaPost('/api/gala/fix',{session:+n,event:+event,heat:+heat,lane:+lane,status:'',time:'',note:''}).then(()=>{delete fm.dataset.dirty;galaSig='';loadGala()})});
+
+// ---- quick fixes: watches read with medium/low confidence (accept as read, or type the reading), and swimmers
+// written in on the sheet (pick the entered swimmer: suggestions from the entries file, or search for another).
+function qfWatches(f,hf){
+ const row=f.row;if(!row)return '';
+ const flagged=/\bSW timer\b|watch/i.test(f.checks.join(' '));
+ const ws=row.watches.filter(w=>!w.normalized||w.confidence!=='HIGH'||w.corrected);
+ if(!flagged||!ws.length)return '';
+ const fixed=hf.watches||{};
+ return '<div class="qfws">'+ws.map(w=>{const c=w.column,fx=fixed[c]||{},readable=!!w.normalized;
+  const how=readable?`read as <b>${esc(w.normalized)}</b> (${esc((w.confidence||'').toLowerCase())} confidence${w.corrected?', overwritten on the sheet':''})`:'<b class="gwarn">couldn\'t be read</b>';
+  return `<div class="qfw" data-col="${esc(c)}"><span>Timer ${esc(c)}: written “${esc(w.written||'?')}”, ${how}</span>
+   ${readable?`<label><input type="radio" name="w${esc(c)}" value="accept"${fx.accepted?' checked':''}> accept ${esc(w.normalized)}</label>`:''}
+   <label><input type="radio" name="w${esc(c)}" value="capture"${fx.time?' checked':''}> it reads</label>
+   <input name="wt${esc(c)}" value="${esc(fx.time||'')}" placeholder="m:ss.hh" size="8">
+   ${(fx.accepted||fx.time)?'':`<label class="sm"><input type="radio" name="w${esc(c)}" value="" checked> leave</label>`}</div>`}).join('')+'</div>'}
+function qfSwimmer(s,e,f,hf){
+ const row=f.row;
+ const missing=/not in the merge file/i.test(f.checks.join(' ')),written=!!(row&&row.writtenIn)||/written in/i.test(f.checks.join(' '));
+ if(!written&&!missing&&!/written in|swimmer is not the one|different swimmer|no seeded entry|swimmer/i.test(f.checks.join(' ')))return '';
+ const name=(row&&row.name)||'',chosen=hf.swimmer;
+ return `<div class="qfsw" data-q="${esc(name)}" data-event="${e.event}" data-session="${s.n}" data-chosen="${esc(chosen?chosen.id:'')}"${missing||written?' data-add="1"':''}>
+  ${missing?`<div><b>Confirm the swim</b>: pick the swimmer (the best match from the entries is chosen) and press <b>Confirm swim</b>. It is put in the merge file for them, with an entry added if they weren't entered in this event.</div>`
+   :`<div><b>Confirm the swimmer</b> written in on the sheet: pick them (the best match from the entries is chosen) and press <b>Confirm swimmer</b>. The swim is given to them in the merge file, with an entry added if they weren't entered in this event; the printed swimmer gets no result.</div>`}
+  ${row&&row.notes?`<div class="sm">On the sheet: ${esc(row.notes)}</div>`:''}
+  <div>Swimmer on the sheet: <b>${esc(name||'?')}</b>${chosen?` · <span class="ok">chosen: ${esc(chosen.name)}</span>`:''}</div>
+  <div class="swlist sm">Looking for matches in the entries…</div>
+  <label class="sm">Search for another swimmer <input name="swq" placeholder="surname or first name" size="22"></label></div>`}
+const SWCACHE={};
+async function swFill(box,q){
+ const n=box.dataset.session,ev=box.dataset.event,key=n+'|'+ev+'|'+q,list=box.querySelector('.swlist');
+ try{SWCACHE[key]=SWCACHE[key]||(await api('/api/gala/swimmers?session='+n+'&event='+ev+'&q='+encodeURIComponent(q))).swimmers}catch(err){list.textContent='Could not search the entries: '+err.message;return}
+ const rows=SWCACHE[key],chosen=box.dataset.chosen,prev=(box.querySelector('input[name=swpick]:checked')||{}).value;
+ list.innerHTML=rows.length?rows.map((w,i)=>`<label class="swopt"><input type="radio" name="swpick" value="${esc(w.id)}" data-name="${esc(w.name)}"${(prev||chosen)===w.id||(!prev&&!chosen&&i===0&&(w.entered||w.score>=0.8))?' checked':''}>
+   ${esc(w.name)}${w.preferred&&w.preferred.toLowerCase()!==w.first.toLowerCase()?' <span class="meta">('+esc(w.preferred)+')</span>':''} <span class="meta">${esc([w.sex==='F'?'girl':w.sex==='M'?'boy':'',w.age&&('age '+w.age),w.team].filter(Boolean).join(' · '))}</span>
+   ${w.entered?'<span class="ok">entered in this event</span>':'<span class="gwarn">not entered in this event</span>'}${i===0&&q&&!prev&&!chosen?' <span class="meta">(best match)</span>':''}</label>`).join('')
+  +'<label class="swopt"><input type="radio" name="swpick" value=""> none of these</label>'
+  :'<span class="meta">No swimmer in the entries matches.</span>'}
+function swAll(){document.querySelectorAll('.qfsw').forEach(b=>{if(!b.dataset.filled){b.dataset.filled='1';swFill(b,b.dataset.q)}})}
+let swTimer=null;
+document.addEventListener('input',ev=>{const i=ev.target.closest('.qfsw input[name=swq]');if(!i)return;const box=i.closest('.qfsw');
+ clearTimeout(swTimer);swTimer=setTimeout(()=>swFill(box,i.value.trim()||box.dataset.q),300)});
+document.addEventListener('focusin',ev=>{const i=ev.target.closest('.qfw input[name^=wt]');if(i){const r=i.closest('.qfw').querySelector('input[value=capture]');if(r)r.checked=true}});

@@ -619,6 +619,7 @@ class Gala:
             fixes = None
             if qf_file:
                 fixes = self._cached("qf", os.path.join(self.sdir(n, "reports"), qf_file["name"]), _read_fixes)
+                fixes = [dict(f, row=self.sheet_row(n, e, f["heat"], f["lane"], ocr)) for f in fixes or []]
             sig = hashlib.sha1(json.dumps(sorted(inputs)).encode()).hexdigest()[:12]
             newest = max([t for _, t in inputs] or [0])
             ready = bool(pk) and heats > 0 and all(h in have for h in range(1, heats + 1))
@@ -682,9 +683,10 @@ class Gala:
             return q
         if os.path.exists(self.fixes_file(n)) and self.fixes(n):
             fx = "data/sessions/S%d/fixes.json" % n
-            body = re.sub(r"(`merge_results\.py [^`]*)`", lambda m: '%s --fixes "%s"`' % (m.group(1), fx), q[1])
-            q = (q[0], body + ("\n\nFixes made in the portal: `%s` (%d swims). It is passed to merge_results.py as "
-                               "`--fixes`; don't edit it." % (fx, len(self.fixes(n)))))
+            body = re.sub(r"(`(?:merge_results|audit_report)\.py [^`]*)`", lambda m: '%s --fixes "%s"`' % (m.group(1), fx), q[1])
+            q = (q[0], body + ("\n\nFixes made in the portal: `%s` (%d swims). It is passed to merge_results.py and "
+                               "audit_report.py as `--fixes` (plugin 1.6.3+): result fixes, watches accepted or captured "
+                               "by hand, swimmers chosen for written-in names. Don't edit it." % (fx, len(self.fixes(n)))))
         own = self.meet_files(n)["codes"]
         if own:
             path = self.P(n, "meet", own[-1]["name"])
@@ -921,6 +923,98 @@ class Gala:
             time.sleep(every)
 
     # ---------------------------------------------------------------- quick fixes done in the portal
+    def sheet_row(self, n, e, h, ln, ocr_names):
+        """The transcribed lane sheet row of a swim, for the quick-fix forms: name, notes, the watch readings."""
+        rx = re.compile(r"-event0*%d-lane%d-p\d+\.json$" % (int(e), int(ln)), re.I)
+        name = next((o for o in ocr_names if rx.search(o) and not OCR_SLIP.search(o)), None)
+        if not name or not h:
+            return None
+
+        def run(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, ValueError):
+                return None
+        d = self._cached("sheet", os.path.join(self.sdir(n, "ocr"), name), run)
+        rows = (d or {}).get("rows") or []
+        if int(h) > len(rows):
+            return None
+        r = rows[int(h) - 1]
+        notes = str(r.get("notes") or "")
+        return {"name": r.get("swimmerName") or "", "notes": notes, "status": r.get("status") or "",
+                "writtenIn": bool(re.search(r"\bname\b.*crossed out.*\bwritten\b|\bname written in\b", notes)),
+                "watches": [{"column": t.get("column"), "written": t.get("written") or "", "normalized":
+                             t.get("normalized") or "", "confidence": t.get("confidence") or "",
+                             "corrected": bool(t.get("corrected"))} for t in r.get("handTimes") or []]}
+
+    def swimmers(self, n):
+        """Every swimmer in the session's entries export (or the meet-wide one): id, name, age, team, events."""
+        files = self.meet_files(n)["entries"]
+        path = os.path.join(self.sdir(n, "meet"), files[-1]["name"]) if files else None
+        if not path:
+            for m in self.sessions():
+                f = self.meet_files(m)["entries"]
+                if f:
+                    path = os.path.join(self.sdir(m, "meet"), f[-1]["name"])
+                    break
+        if not path:
+            return []
+
+        def run(p):
+            data = b""
+            try:
+                if p.lower().endswith(".zip"):
+                    import zipfile
+                    with zipfile.ZipFile(p) as z:
+                        names = sorted((x for x in z.namelist() if x.lower().endswith(".hy3")),
+                                       key=lambda x: (not os.path.basename(x).lower().startswith("hfile"), x))
+                        data = z.read(names[0]) if names else b""
+                else:
+                    with open(p, "rb") as f:
+                        data = f.read()
+            except Exception:
+                return []
+            out, team = {}, ""
+            for ln in data.decode("latin-1").replace("\r\n", "\n").split("\n"):
+                tag = ln[:2]
+                if tag == "C1":
+                    team = ln[2:7].strip()
+                elif tag == "D1" and len(ln) > 48:
+                    sid = ln[2:8].strip()
+                    age = ln[96:99].strip() if len(ln) > 99 else ""
+                    out.setdefault(sid, {"id": sid, "surname": ln[8:28].strip(), "first": ln[28:48].strip(),
+                                         "preferred": ln[48:68].strip(),
+                                               "sex": ln[2:3], "age": age, "team": team, "events": []})
+                elif tag == "E1" and len(ln) > 42 and ln[38:42].strip().isdigit():
+                    s = out.get(ln[2:8].strip())
+                    if s is not None:
+                        s["events"].append(int(ln[38:42]))
+            return list(out.values())
+        return self._cached("swimmers", path, run) or []
+
+    def find_swimmers(self, n, q, event=None, limit=6):
+        import difflib
+        norm = lambda x: re.sub(r"[^a-z ]", "", x.lower().replace(",", " ")).split()  # noqa: E731
+        words = norm(q or "")
+        out = []
+        for s in self.swimmers(n):
+            full = norm(s["surname"] + " " + s["first"] + " " + s.get("preferred", ""))
+            if words:
+                q2 = " ".join(words)
+                score = max(difflib.SequenceMatcher(None, q2, " ".join(norm(s["surname"] + " " + x))).ratio()
+                            for x in (s["first"], s.get("preferred") or s["first"]))
+                score += 0.25 * sum(1 for w in words if any(f.startswith(w) or w.startswith(f) for f in full)) / len(words)
+            else:
+                score = 0
+            entered = bool(event) and int(event) in s["events"]
+            name_score = score
+            score += 0.3 if entered else 0
+            if (words and name_score >= 0.5) or (not words and entered):
+                out.append((score, dict(s, entered=entered, name="%s, %s" % (s["surname"], s["first"]))))
+        out.sort(key=lambda x: -x[0])
+        return [dict(x, score=round(sc, 2)) for sc, x in out[:limit]]
+
     def fixes_file(self, n):
         return os.path.join(self.sdir(n), "fixes.json")
 
@@ -946,17 +1040,40 @@ class Gala:
             raise ValueError("time must look like 1:05.32 or 32.10")
         if status == "DQ" and not code:
             raise ValueError("a DQ needs its code")
+        watches = {}
+        for col, w in (fix.get("watches") or {}).items():
+            if not str(col).isdigit() or not isinstance(w, dict):
+                continue
+            wt = str(w.get("time") or "").strip()
+            if wt:
+                if not re.fullmatch(r"(?:\d{1,2}:)?\d{1,2}\.\d{2}", wt):
+                    raise ValueError("timer %s: the time must look like 1:05.32 or 32.10" % col)
+                watches[str(col)] = {"time": wt}
+            elif w.get("accepted"):
+                watches[str(col)] = {"accepted": True}
+        sw = fix.get("swimmer") if isinstance(fix.get("swimmer"), dict) else None
+        swimmer = ({"id": str(sw.get("id") or "")[:12], "name": str(sw.get("name") or "")[:80]}
+                   if sw and sw.get("name") else None)
+        add = bool(fix.get("add")) and bool(swimmer)
         key = "%d-%d-%d" % (int(e), int(h), int(ln))
         with self.lock:
             d = self.fixes(n)
-            if not (status or t or note):
+            if not (status or t or note or watches or swimmer):
                 d.pop(key, None)
                 text = "cleared"
             else:
                 d[key] = {"status": status, "time": t, "code": code if status == "DQ" else "", "note": note,
                           "by": str(who or "someone")[:60], "at": time.time()}
+                if watches:
+                    d[key]["watches"] = watches
+                if swimmer:
+                    d[key]["swimmer"] = swimmer
+                if add:
+                    d[key]["add"] = True   # put the swim in the merge file for this swimmer (plugin 1.6.4+)
                 text = ", ".join(x for x in (status and {"OK": "swam", "NS": "no-show", "DQ": "DQ " + code}[status],
-                                             t, note and "note") if x)
+                                             t, ", ".join("timer %s %s" % (c, w.get("time") or "accepted")
+                                                          for c, w in watches.items()),
+                                             swimmer and "swimmer " + swimmer["name"], note and "note") if x)
             tmp = self.fixes_file(n) + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(d, f, indent=1, sort_keys=True)

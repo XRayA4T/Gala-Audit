@@ -8,7 +8,7 @@ import re
 import sys
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 s = open(sys.argv[1], encoding="utf-8").read()
 piece = lambda name: open(os.path.join(SRC, name), encoding="utf-8").read()  # noqa: E731
 
@@ -40,6 +40,10 @@ sub('''            if path == "/health":
             if path == "/api/gala/overview":
                 g = self._gala()
                 return self._json(200, g.overview() if g else {"root": None})
+            if path == "/api/gala/swimmers":
+                g = self._gala()
+                return self._json(200, {"swimmers": g.find_swimmers(int(q.get("session") or 1), q.get("q", ""),
+                                                                    q.get("event")) if g else []})
             if path == "/api/gala/codes":
                 g = self._gala()
                 return self._json(200, g.code_list(int(q.get("session") or 1)) if g else {"codes": []})

@@ -93,7 +93,11 @@ an event's lane sheet pack and every heat's Gen7 race are in, it asks `gala-clau
 event's merge results (`Event NN merge results.hy3`, to import into Meet Manager) and its Quick Fix list,
 which shows under the event on the Checklist tab to tick off swim by swim. Each quick fix can be **fixed in the portal**: set the result (swam,
 no-show or DQ with its code, from the FINA list or the meet's own), a corrected time and a note, and save; or
-just tick it. When the last one is done, the portal offers to regenerate the event's merge results with those
+just tick it. A watch read with medium or low confidence (or not read) can be **accepted as read** or the time
+**typed in** from the sheet. For a swimmer **written in**, the closest swimmers in the entries file are listed (the
+best match chosen) and any other can be searched for. A swim **on the lane sheet but not in the merge file** has a
+**Confirm swim** button: it goes into the merge file for the chosen swimmer, with an entry added if they weren't
+entered in the event. When the last one is done, the portal offers to regenerate the event's merge results with those
 fixes. **Regenerate** (in the event's
 Merge column) rewrites the event's merge results and quick fixes from what is already transcribed, with
 every DQ slip read since; no scans are read again, and answers with what the
