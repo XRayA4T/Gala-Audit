@@ -128,6 +128,7 @@ class Gala:
         self.state.setdefault("asked", {})
         self.state.setdefault("ticks", {})
         self.rechecks = {}
+        self.jobs = {}
 
     # ---------------------------------------------------------------- state
     def save(self):
@@ -710,16 +711,21 @@ class Gala:
                 inputs = inputs + [("not swum %s" % ",".join(map(str, not_swum)), ns.get("at", 0))]
             sig = hashlib.sha1(json.dumps(sorted(inputs)).encode()).hexdigest()[:12]
             newest = max([t for _, t in inputs] or [0])
-            ready = bool(pk) and heats > 0 and all(h in have or h in not_swum for h in range(1, heats + 1))
+            ready = bool(pk)   # Claude can read the pack as soon as it is in; the rest waits for the portal
+            read = bool(pk) and all(p["pages"] and p["done"] >= p["pages"] and not p["bad"] for p in pk)
+            pack_sig = hashlib.sha1(json.dumps(sorted([p["name"], p["mtime"]] for p in pk)).encode()).hexdigest()[:12]
             a = asked.get("S%d:e%d" % (n, e))
-            if report and report["mtime"] >= newest:
+            job = self.jobs.get("S%d:e%d:run" % (n, e)) or {}
+            if job.get("state") == "running":
+                status = "computing"
+            elif pk and not read:   # the pack (or a rescan of it) still being read
+                status = "asked" if a and a.get("sig") == pack_sig else "ready"
+            elif report and report["mtime"] >= newest:
                 status = "audited"
             elif report:
                 status = "changed"
-            elif a:
-                status = "asked"
-            elif ready:
-                status = "ready"
+            elif read:
+                status = "transcribed"
             else:
                 status = "waiting"
             events.append({"event": e, "desc": desc.get(e, ""), "heats": heats, "gen7": have,
@@ -728,7 +734,8 @@ class Gala:
                            "expected": bool(x), "lanes": len(x.get("lanes", [])) or len(print_lanes.get(e, ())) or None,
                            "packs": [p["name"] for p in pk], "printed": printed.get(e, []), "ocrLanes": len(lanes_done.get(e, ())),
                            "report": report["name"] if report else None, "ready": ready, "sig": sig,
-                           "status": status, "asked": a, "merge": merge_file, "mergeAt": merge_f["mtime"] if merge_f else None,
+                           "status": status, "asked": a, "read": read, "packSig": pack_sig, "run": job or None,
+                           "computed": self.state.get("computed", {}).get("S%d:e%d:run" % (n, e)), "merge": merge_file, "mergeAt": merge_f["mtime"] if merge_f else None,
                            "canMerge": can_merge,
                            "seeded": seeded, "fixes": fixes, "recheck": self.rechecks.get((n, e)), "dqSlips": len(slips_done.get(e, [])),
                            "fixesFile": qf_file["name"][:-5] + ".html" if qf_file else None,
@@ -740,6 +747,7 @@ class Gala:
         sess_report = next((f["name"] for f in reports if f["name"].lower().endswith(".html")
                             and re.search(r"(?i)session", f["name"]) and "final" not in f["name"].lower()), None)
         return {"n": n, "meet": {k: [f["name"] for f in v] for k, v in meet.items()}, "lanePrints": prints,
+                "jobs": {k: self.jobs.get("S%d:%s" % (n, k)) for k in ("merge", "final", "etd") if self.jobs.get("S%d:%s" % (n, k))},
                 "expected": {"events": len(expected), "heats": sum(e["heats"] for e in events if e["expected"])},
                 "races": len(races), "scans": scans, "events": events, "merged": merged, "finalReports": finals,
                 "sessionReport": sess_report, "dqCodes": "dq-codes.json" in ocr,
@@ -800,9 +808,6 @@ class Gala:
     def _question(self, key, n):
         s = self.session(n)
         ocr, gen7, scans, rep = self.P(n, "ocr"), self.P(n, "gen7"), self.P(n, "scans"), self.P(n, "reports")
-        done_events = ",".join(str(e["event"]) for e in s["events"] if e["ocrLanes"] or e["packs"])
-        session_audit = ('`audit_report.py %s %s "%s/Session %d audit.html" --events %s --scans %s`'
-                         % (ocr, gen7, rep, n, done_events or "<events>", scans))
         kind = key.split(":")[1]
         if kind.startswith("e") and kind[1:].isdigit():
             e = int(kind[1:])
@@ -810,9 +815,9 @@ class Gala:
             if not ev:
                 return None
             packs = ", ".join("`%s`" % self.P(n, "scans", p) for p in ev["packs"]) or "(no lane sheet pack yet)"
-            redo = ev["status"] in ("changed", "audited") or (ev["asked"] and ev["asked"].get("sig") != ev["sig"])
+            redo = bool(ev["report"]) or bool(ev["asked"] and ev["asked"].get("sig") != ev["packSig"])
             title = "Session %d · Event %d%s: %s" % (n, e, (" " + ev["desc"]) if ev["desc"] else "",
-                                                     "new files, audit it again" if redo else "transcribe and audit it")
+                                                     "rescanned, read it again" if redo else "transcribe the lane sheets")
             if ev["printed"]:
                 orig = ("Take the printed fields (names, ages, teams, seed times) from Meet Manager's printed lane sheets "
                         "%s with the skill's `original_sheets.py` (pass the PDF and the event)."
@@ -820,49 +825,25 @@ class Gala:
             else:
                 orig = ("There are no printed lane sheets for this event yet, so read the printed fields from the scan "
                         "(and say so in your answer).")
-            missing = ("\n\nGen7 heats not in yet: %s. Audit what is there and say which heats are missing."
-                       % ", ".join(map(str, ev["gen7Missing"]))) if ev["gen7Missing"] else ""
+            missing = ""
             if ev.get("notSwum"):
                 missing += ("\n\nHeat%s %s %s **not swum** (confirmed on the checklist by %s): there is no Gen7 race "
-                            "for %s. Don't report %s as missing; if the lane sheets have swims in %s, say so."
+                            "for %s. Don't treat %s as missing; if the lane sheets have swims in %s, say so."
                             % ("s" if len(ev["notSwum"]) > 1 else "", ", ".join(map(str, ev["notSwum"])),
                                "were" if len(ev["notSwum"]) > 1 else "was", ev.get("notSwumBy") or "an official",
                                "them" if len(ev["notSwum"]) > 1 else "it", "them" if len(ev["notSwum"]) > 1 else "it",
                                "them" if len(ev["notSwum"]) > 1 else "it"))
-            mfile = "%s/Event %02d merge results %s.hy3" % (rep, e, STAMP)
-            qfile = "%s/Event %02d quick fixes.html" % (rep, e)
-            if ev["canMerge"]:
-                ent = self.P(n, "meet", s["meet"]["entries"][-1])
-                tpl = self.P(n, "meet", s["meet"]["results"][-1])
-                merge_step = ("2. **Write the event's merge results** for Meet Manager with the **gala-audit** skill "
-                              "(unzip the `Hfile*.hy3` from `%s` into a temp folder if it's a zip). {STAMPNOTE}\n"
-                              "   `merge_results.py %s %s <entries>.hy3 \"%s\" \"%s\" --events %d`\n"
-                              % (ent, ocr, gen7, tpl, mfile, e))
-                merge_opt = ' --merge "%s"' % mfile
-            else:
-                why = []
-                if not s["meet"]["entries"]:
-                    why.append("the session's entries export isn't in")
-                if not s["meet"]["results"]:
-                    why.append("Meet Manager's empty merge results export isn't in")
-                merge_step = ("2. **Merge results: not yet**, because %s. Skip this step and say so in your answer; "
-                              "you'll be asked again when they arrive.\n" % " and ".join(why))
-                merge_opt = ""
-            body = (("Event %d is in: lane sheets %s and Gen7 races for heats %s (of %s) in `%s`.%s\n\n"
-                     "1. **Transcribe** the lane sheets with the **gala-ocr** skill into `%s/` (skip pages already done%s). %s\n"
-                     "%s"
-                     "3. **Audit the event** with the **gala-audit** skill, with its Quick Fix list (the portal turns the "
-                     "`.json` it writes next to the `.html` into the event's quick-fix checklist):\n"
-                     "   `audit_report.py %s %s \"%s/Event %02d audit.html\" --events %d --scans %s%s --quick-fixes \"%s\"`\n"
-                     "4. **Update the session report** (every event transcribed so far):\n   %s\n"
-                     "5. **Answer** with what the officials should look at now (pads, times in doubt, DQs, unsigned "
-                     "sheets, anything unreadable), how many quick fixes there are, and links to the reports and the "
-                     "merge results file.")
-                    % (e, packs, ", ".join(map(str, ev["gen7"])) or "none", ev["heats"] or "?", gen7, missing,
-                       ocr, "; a rescanned pack replaced the old one and its old OCR was set aside, so read its pages again"
+            body = (("Event %d's lane sheets are in: %s.%s\n\n"
+                     "1. **Transcribe** them with the **gala-ocr** skill into `%s/` (skip pages already done%s). %s\n"
+                     "2. **Answer** briefly: the pages read, and anything you couldn't read or are unsure of (which sheet "
+                     "and page), sheets not signed, names written in.\n\n"
+                     "**That's all.** Don't run merge_results.py or audit_report.py: as soon as every page is "
+                     "transcribed (and the Gen7 races are in) the portal writes the event's merge results, audit, "
+                     "quick fixes and the session report itself, and checks your files with validate_cache.py.")
+                    % (e, packs, missing, ocr,
+                       "; a rescanned pack replaced the old one and its old OCR was set aside, so read its pages again"
                        if redo and any(x["name"] in ev["packs"] and x["pages"] and x["done"] < x["pages"] for x in s["scans"])
-                       else "; if they are all done, go straight to the next step", orig, merge_step,
-                       ocr, gen7, rep, e, e, scans, merge_opt, qfile, session_audit))
+                       else "", orig))
             return title, body
         if kind == "scan":
             name = key.split(":", 2)[2]
@@ -873,15 +854,18 @@ class Gala:
                 return ("Session %d: read the DQ slips in %s" % (n, name),
                         "New DQ slips: `%s`.\n\n1. Read them with the **gala-ocr** skill into `%s/` (skip slips already done).\n"
                         "2. Give each slip its DQ code in `%s/dq-codes.json` (**gala-audit** skill, from the DQ code list below); ask the referee here "
-                        "about any code you're unsure of.\n3. Update the session report:\n   %s\n"
-                        "4. Answer with the DQs, their codes and anything that doesn't match the lane sheets or Gen7."
-                        % (self.P(n, "scans", name), ocr, ocr, session_audit))
+                        "about any code you're unsure of.\n"
+                        "3. Answer with the DQs and their codes, and any slip you couldn't read.\n\n"
+                        "Don't run the audit scripts: the portal rewrites the events' merge results, audits and the session "
+                        "report itself once the slips are read and coded."
+                        % (self.P(n, "scans", name), ocr, ocr))
             if sc["kind"] == "etd":
                 return ("Session %d: read the ETD programme %s" % (n, name),
                         "The ETD programme is in: `%s`.\n\n1. Read the race numbers with the **gala-ocr** skill into `%s/`.\n"
-                        "2. Check them against the Gen7 races (`check_etd.py %s %s`).\n3. Update the session report:\n   %s\n"
-                        "4. Answer with combined events, re-started heats and race numbers that don't match."
-                        % (self.P(n, "scans", name), ocr, ocr, gen7, session_audit))
+                        "2. Answer briefly: the pages read and anything you couldn't read.\n\n"
+                        "Don't run check_etd.py or the audit: the portal checks the race numbers against Gen7 and updates "
+                        "the session report itself once every page is read."
+                        % (self.P(n, "scans", name), ocr))
             return None
         if kind == "merge":
             if not s["meet"]["results"] or not s["meet"]["entries"]:
@@ -937,6 +921,28 @@ class Gala:
                         % ", ".join("`%s`" % u for u in unread)) if unread else "",
                        e, ocr, codes, ent, ocr, gen7, tpl, mfile, e,
                        ocr, gen7, rep, e, e, scans, mfile, rep, e))
+        if kind == "codes":
+            e = int(key.split(":")[2])
+            inp = self.event_inputs(n, e, s) or {}
+            slips = inp.get("uncoded") or []
+            if not slips:
+                return None
+            return ("Session %d · Event %d: DQ codes for %d slip%s" % (n, e, len(slips), "" if len(slips) == 1 else "s"),
+                    "These DQ slips of event %d are transcribed but have no code in `%s/dq-codes.json`:\n\n%s\n\n"
+                    "Give each its code from the transcribed infraction and the DQ code list below (**gala-audit** "
+                    "skill); don't change codes already given, and ask the referee here about any you're unsure of. "
+                    "**Don't read any scans and don't run the scripts**: the portal regenerates the event's merge results "
+                    "as soon as the codes are in. Answer with the codes given."
+                    % (e, ocr, "\n".join("- `%s/%s`" % (ocr, x) for x in slips)))
+        if kind == "fixocr":
+            e = int(key.split(":")[2])
+            probs = (getattr(self, "_ocr_problems", {}) or {}).get((n, e)) or []
+            if not probs:
+                return None
+            return ("Session %d · Event %d: fix the transcription files" % (n, e),
+                    "validate_cache.py (gala-ocr skill) found problems in event %d's transcription files in `%s/`:\n\n"
+                    "```\n%s\n```\n\nFix the files (re-read only the pages concerned if you need to), then answer "
+                    "briefly. The portal carries on with the event once they pass." % (e, ocr, "\n".join(probs[:40])))
         if kind == "check":
             return ("Session %d: check the files" % n,
                     "Look through `data/sessions/S%d/` and the portal's Checklist for session %d: which events and "
@@ -954,7 +960,7 @@ class Gala:
             sig = None
             if re.fullmatch(r"S\d+:e\d+", key):
                 ev = next((x for x in self.session(n)["events"] if "S%d:e%d" % (n, x["event"]) == key), None)
-                sig = ev and ev["sig"]
+                sig = ev and ev["packSig"]
             prev = self.state["asked"].get(key)
             if prev and not force and prev.get("sig") == sig:
                 return None
@@ -983,7 +989,371 @@ class Gala:
                     self.log("%s → S%d/gen7 (it is a Gen7 race, not a Meet Manager file)" % (f["name"], n),
                              name=f["name"], to="S%d/gen7" % n, kind="gen7")
 
+    # ---------------------------------------------------------------- work the portal does itself (no Claude)
+    # Claude is only asked to READ scans (lane sheet handwriting, DQ slips, the ETD programme) and to code DQ slips.
+    # Everything computed from what it has read - the merge results, the audits, the quick fixes, the session report,
+    # the session merge results, the final audit, the ETD check - the portal runs with the plugin's scripts, in the
+    # background, as soon as its inputs are complete (and again when they change). Jobs: self.jobs[key];
+    # the inputs each was last run on: state["computed"][key]["sig"].
+    STABLE = 15   # seconds the newest transcription file must be old before a pack counts as fully read
+
+    @staticmethod
+    def find_script(name):
+        """The newest installed copy of one of the gala-ocr plugin's scripts (any of its skills), or None."""
+        import glob
+        found = glob.glob(os.path.expanduser("~/.claude/plugins/**/skills/*/scripts/%s" % name), recursive=True)
+        return max(found, key=os.path.getmtime) if found else None
+
+    def _script_opts(self, n, codes=True, fixes=True):
+        out = []
+        if fixes and os.path.exists(self.fixes_file(n)) and self.fixes(n):
+            out += ["--fixes", self.fixes_file(n)]
+        own = self.meet_files(n)["codes"]
+        if codes and own:
+            out += ["--codes", os.path.join(self.sdir(n, "meet"), own[-1]["name"])]
+        return out
+
+    @staticmethod
+    def _run_script(cmd, timeout=600):
+        try:
+            r = subprocess.run([sys.executable, "-I"] + cmd, capture_output=True, text=True, timeout=timeout)
+            return r.returncode == 0, (r.stdout + "\n" + r.stderr).strip()
+        except (OSError, subprocess.SubprocessError) as ex:
+            return False, str(ex)
+
+    def _entries_hy3(self, n, tmp):
+        """The session's entries export as a .hy3 file (taken out of the zip into tmp if need be)."""
+        f = self.meet_files(n)["entries"]
+        if not f:
+            return None
+        p = os.path.join(self.sdir(n, "meet"), f[-1]["name"])
+        if not p.lower().endswith(".zip"):
+            return p
+        import zipfile
+        with zipfile.ZipFile(p) as z:
+            names = sorted((x for x in z.namelist() if x.lower().endswith(".hy3")),
+                           key=lambda x: (not os.path.basename(x).lower().startswith("hfile"), x))
+            if not names:
+                return None
+            out = os.path.join(tmp, "entries.hy3")
+            with open(out, "wb") as fh:
+                fh.write(z.read(names[0]))
+            return out
+
+    def _job(self, key):
+        return self.jobs.get(key) or {}
+
+    def _start(self, key, fn, args, who, why, sig):
+        """Run fn(*args) -> (ok, message) in the background. sig (the inputs) is recorded whatever the outcome, so a
+        failed job isn't retried until its inputs change (or someone runs it again by hand)."""
+        if self._job(key).get("state") == "running":
+            return False
+        self.jobs[key] = {"state": "running", "at": time.time(), "by": who, "why": why}
+        threading.Thread(target=self._job_thread, args=(key, fn, args, who, sig), daemon=True).start()
+        return True
+
+    def _job_thread(self, key, fn, args, who, sig):
+        try:
+            ok, msg = fn(*args)
+        except Exception as ex:   # never leave a job "running"
+            ok, msg = False, "%s: %s" % (type(ex).__name__, ex)
+        self.jobs[key] = {"state": "done" if ok else "failed", "at": time.time(), "by": who, "msg": msg[-400:]}
+        with self.lock:
+            done = self.state.setdefault("computed", {})
+            done[key] = {"sig": sig, "at": time.time(), "ok": ok, "msg": msg[-300:]}
+            self.save()
+        self.log(msg if ok else "Not finished: %s" % msg[-300:])
+
+    def event_inputs(self, n, e, s=None):
+        """What the portal needs to compute event e: {complete, missing, sig, slips_uncoded, ocr}."""
+        s = s or self.session(n)
+        ev = next((x for x in s["events"] if x["event"] == e), None)
+        ocr_dir = self.sdir(n, "ocr")
+        if not ev:
+            return None
+        packs = [x for x in s["scans"] if x["name"] in ev["packs"]]
+        now = time.time()
+        lanes = [f for f in _ls(ocr_dir) if OCR_LANE.search(f["name"]) and not OCR_SLIP.search(f["name"])
+                 and int(OCR_LANE.search(f["name"]).group(1)) == e]
+        slips = [f for f in _ls(ocr_dir) if OCR_SLIP.search(f["name"]) and int(OCR_SLIP.search(f["name"]).group(1)) == e]
+        newest = max([f["mtime"] for f in lanes] or [0])
+        read = bool(packs) and all(p["pages"] and p["done"] >= p["pages"] and not p["bad"] for p in packs) \
+            and now - newest >= self.STABLE
+        missing = []
+        if not packs:
+            missing.append("its lane sheet pack")
+        elif not read:
+            missing.append("the transcription of its lane sheets")
+        if ev["gen7Missing"] or not ev["heats"]:
+            missing.append("Gen7 heat%s %s" % ("s" if len(ev["gen7Missing"]) != 1 else "",
+                                                ", ".join(map(str, ev["gen7Missing"])) or "?"))
+        codes = {}
+        cf = os.path.join(ocr_dir, "dq-codes.json")
+        if slips and os.path.exists(cf):
+            try:
+                with open(cf, encoding="utf-8") as fh:
+                    codes = json.load(fh)
+            except (OSError, ValueError):
+                codes = {}
+        uncoded = [f["name"] for f in slips if not (codes.get(f["name"]) or {}).get("code")]
+        races = [r for r in self.gen7_races(n) if r["event"] == e]
+        meet = self.meet_files(n)
+        parts = [[f["name"], f["mtime"]] for f in lanes] + [[r["file"], r["mtime"]] for r in races] \
+            + [[f["name"], f["mtime"]] for f in slips] + [["codes", sorted((k, str(v)) for k, v in codes.items()
+                                                           if k in {f["name"] for f in slips})]] \
+            + [[k, [[f["name"], f["mtime"]] for f in meet[k][-1:]]] for k in ("entries", "results", "codes")] \
+            + [["notSwum", ev.get("notSwum") or []]]
+        return {"complete": not missing, "missing": missing, "read": read, "uncoded": uncoded, "ev": ev,
+                "sig": hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]}
+
+    def compute_event(self, n, e, who="portal", why=""):
+        """Write event e's merge results, audit, quick fixes and times, and the session report, from what is
+        transcribed (no scans are read). Returns a message, or raises ValueError if it can't be done yet."""
+        key = "S%d:e%d:run" % (n, e)
+        inp = self.event_inputs(n, e)
+        if not inp:
+            raise ValueError("no event %d in session %d" % (e, n))
+        if not inp["read"]:
+            raise ValueError("event %d isn't fully transcribed yet" % e)
+        if not self.find_script("audit_report.py"):
+            raise ValueError("the gala-ocr plugin isn't installed for this user")
+        if self._job(key).get("state") == "running":
+            return "already running"
+        self._start(key, self._compute_event, (n, e, inp), who, why, inp["sig"])
+        return "started"
+
+    def _compute_event(self, n, e, inp):
+        ev = inp["ev"]
+        rep, ocr, gen7, scans = self.sdir(n, "reports"), self.sdir(n, "ocr"), self.sdir(n, "gen7"), self.sdir(n, "scans")
+        audit, merge = self.find_script("audit_report.py"), self.find_script("merge_results.py")
+        tmp = tempfile.mkdtemp(prefix="gala-run-")
+        notes = []
+        try:
+            vc = self.find_script("validate_cache.py")
+            if vc:
+                files = [os.path.join(ocr, f["name"]) for f in _ls(ocr)
+                         if (OCR_LANE.search(f["name"]) or OCR_SLIP.search(f["name"]))
+                         and int((OCR_SLIP.search(f["name"]) or OCR_LANE.search(f["name"])).group(1)) == e]
+                ok, out = self._run_script([vc] + files, 120)
+                if not ok:
+                    bad = [ln for ln in out.splitlines() if ln.strip() and "files checked" not in ln]
+                    self.ask_fix_transcription(n, e, bad)
+                    return False, "Event %d: %d problem%s in the transcription files; Claude was asked to fix them" % (
+                        e, len(bad), "" if len(bad) == 1 else "s")
+            mfile = None
+            if ev["canMerge"] and merge:
+                ent = self._entries_hy3(n, tmp)
+                tpl = os.path.join(self.sdir(n, "meet"), self.meet_files(n)["results"][-1]["name"])
+                mfile = os.path.join(rep, "Event %02d merge results %s.hy3" % (e, time.strftime("%Y-%m-%d_%H%M")))
+                ok, out = self._run_script([merge, ocr, gen7, ent, tpl, mfile, "--events", str(e)] + self._script_opts(n))
+                if not ok:
+                    return False, "event %d merge results: %s" % (e, out.splitlines()[-1] if out else "failed")
+                notes.append("merge results %s" % os.path.basename(mfile))
+            else:
+                notes.append("no merge results yet (needs the entries export and the empty merge results export)")
+            cmd = [audit, ocr, gen7, os.path.join(rep, "Event %02d audit.html" % e), "--events", str(e), "--scans", scans,
+                   "--quick-fixes", os.path.join(rep, "Event %02d quick fixes.html" % e),
+                   "--times", os.path.join(rep, "Event %02d times.json" % e)] + (["--merge", mfile] if mfile else [])
+            ok, out = self._run_script(cmd + self._script_opts(n))
+            if not ok:
+                return False, "event %d audit: %s" % (e, out.splitlines()[-1] if out else "failed")
+            m = re.search(r"(\d+) swims? in Quick Fix", out)
+            qf = int(m.group(1)) if m else None
+            notes.append("%s quick fix%s" % (qf, "" if qf == 1 else "es") if qf is not None else "quick fixes written")
+            self.rechecks.pop((n, e), None)
+            self.compute_session_report(n)
+            if inp["uncoded"]:
+                notes.append("%d DQ slip%s without a code (Claude was asked)" % (len(inp["uncoded"]), "" if len(inp["uncoded"]) == 1 else "s"))
+                self.ask_codes(n, e, inp["uncoded"])
+            return True, "Event %d done by the portal: %s" % (e, "; ".join(notes))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def compute_session_report(self, n):
+        """The session audit report, for every event transcribed so far (synchronous; called from jobs)."""
+        audit = self.find_script("audit_report.py")
+        if not audit:
+            return False
+        s = self.session(n)
+        done = ",".join(str(x["event"]) for x in s["events"] if x["ocrLanes"])
+        if not done:
+            return False
+        out = os.path.join(self.sdir(n, "reports"), "Session %d audit.html" % n)
+        ok, msg = self._run_script([audit, self.sdir(n, "ocr"), self.sdir(n, "gen7"), out, "--events", done,
+                                    "--scans", self.sdir(n, "scans")] + self._script_opts(n))
+        if not ok:
+            self.log("Session %d report: %s" % (n, msg.splitlines()[-1] if msg else "failed"))
+        return ok
+
+    def compute_session(self, n, who="portal", why=""):
+        """The session's merge results (every event) and the session audit with its Quick Fix list."""
+        s = self.session(n)
+        if not s["meet"]["results"] or not s["meet"]["entries"]:
+            raise ValueError("needs the session's entries export and Meet Manager's merge results export")
+        self._start("S%d:merge" % n, self._compute_session, (n,), who, why, self._session_sig(n, s))
+
+    def _session_sig(self, n, s):
+        parts = [[k, v.get("sig"), v.get("at")] for k, v in sorted(self.state.get("computed", {}).items())
+                 if k.startswith("S%d:e" % n)]   # any event worked out again (a regenerate too)
+        parts += [[f["name"], f["mtime"]] for k in ("results", "entries") for f in self.meet_files(n)[k][-1:]]
+        return hashlib.sha1(json.dumps(parts, default=str).encode()).hexdigest()[:16]
+
+    def _compute_session(self, n):
+        rep, ocr, gen7 = self.sdir(n, "reports"), self.sdir(n, "ocr"), self.sdir(n, "gen7")
+        tmp = tempfile.mkdtemp(prefix="gala-run-")
+        try:
+            ent = self._entries_hy3(n, tmp)
+            tpl = os.path.join(self.sdir(n, "meet"), self.meet_files(n)["results"][-1]["name"])
+            out = os.path.join(rep, "Merge Meet Results-S%d-audit %s.hy3" % (n, time.strftime("%Y-%m-%d_%H%M")))
+            ok, msg = self._run_script([self.find_script("merge_results.py"), ocr, gen7, ent, tpl, out] + self._script_opts(n))
+            if not ok:
+                return False, "session %d merge results: %s" % (n, msg.splitlines()[-1] if msg else "failed")
+            s = self.session(n)
+            done = ",".join(str(x["event"]) for x in s["events"] if x["ocrLanes"])
+            ok, msg = self._run_script([self.find_script("audit_report.py"), ocr, gen7, os.path.join(rep, "Session %d audit.html" % n),
+                                        "--events", done, "--scans", self.sdir(n, "scans"), "--merge", out,
+                                        "--quick-fixes", os.path.join(rep, "Session %d quick fixes.html" % n)] + self._script_opts(n))
+            m = re.search(r"(\d+) swims? in Quick Fix", msg)
+            return ok, ("Session %d merge results written by the portal: %s%s" % (
+                n, os.path.basename(out), "; %s quick fixes for the session" % m.group(1) if m else "")
+                if ok else "session %d audit: %s" % (n, msg.splitlines()[-1] if msg else "failed"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def compute_final(self, n, who="portal", why=""):
+        s = self.session(n)
+        if not s["meet"]["final"] or not s["merged"]:
+            raise ValueError("needs Meet Manager's final export and the session's merge results")
+        sig = hashlib.sha1(json.dumps([s["meet"]["final"][-1], s["merged"][-1]]).encode()).hexdigest()[:16]
+        self._start("S%d:final" % n, self._compute_final, (n,), who, why, sig)
+
+    def _compute_final(self, n):
+        s = self.session(n)
+        rep = self.sdir(n, "reports")
+        fin = os.path.join(self.sdir(n, "meet"), s["meet"]["final"][-1])
+        cmd = [self.find_script("final_audit.py"), os.path.join(rep, s["merged"][-1]), fin,
+               os.path.join(rep, "Session %d final audit.html" % n)]
+        if os.path.exists(os.path.join(rep, "Session %d quick fixes.json" % n)):
+            cmd += ["--quick-fixes", os.path.join(rep, "Session %d quick fixes.json" % n)]
+        ok, msg = self._run_script(cmd + self._script_opts(n, fixes=False))
+        last = next((ln for ln in reversed(msg.splitlines()) if ln.strip() and not ln.startswith("Wrote")), "") if msg else ""
+        return ok, ("Session %d final audit written by the portal (Session %d final audit.html)%s" % (n, n, ": " + last if last else "")
+                    if ok else "session %d final audit: %s" % (n, last or "failed"))
+
+    def compute_etd(self, n, sig, who="portal"):
+        self._start("S%d:etd" % n, self._compute_etd, (n,), who, "ETD programme read", sig)
+
+    def _compute_etd(self, n):
+        script = self.find_script("check_etd.py")
+        if not script:
+            return False, "no check_etd.py in the plugin"
+        ok, msg = self._run_script([script, self.sdir(n, "ocr"), self.sdir(n, "gen7")], 300)
+        out = os.path.join(self.sdir(n, "reports"), "Session %d ETD check.txt" % n)
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(msg + "\n")
+        self.compute_session_report(n)
+        problems = [ln for ln in msg.splitlines() if ln.strip()]
+        return True, ("Session %d ETD programme checked by the portal: %s (Session %d ETD check.txt)" % (
+            n, "no problems" if ok else "%d line%s to look at" % (len(problems), "" if len(problems) == 1 else "s"), n))
+
+    def scan_read(self, n, sc):
+        """A scan whose every page is transcribed, the newest transcription a little while ago."""
+        if not sc["pages"] or sc["done"] < sc["pages"] or sc["bad"]:
+            return False
+        stem = sc["name"][:-4] + "-"
+        newest = max([f["mtime"] for f in _ls(self.sdir(n, "ocr")) if f["name"].startswith(stem)] or [0])
+        return time.time() - newest >= self.STABLE
+
+    def ask_codes(self, n, e, slips):
+        key = "S%d:codes:%d" % (n, e)
+        sig = hashlib.sha1(json.dumps(sorted(slips)).encode()).hexdigest()[:12]
+        prev = self.state["asked"].get(key)
+        if prev and prev.get("sig") == sig:
+            return
+        if self.ask(key, force=True):
+            self.state["asked"][key]["sig"] = sig
+            self.save()
+
+    def ask_fix_transcription(self, n, e, problems):
+        key = "S%d:fixocr:%d" % (n, e)
+        sig = hashlib.sha1(json.dumps(sorted(problems)).encode()).hexdigest()[:12]
+        prev = self.state["asked"].get(key)
+        if prev and prev.get("sig") == sig:
+            return
+        self._ocr_problems = getattr(self, "_ocr_problems", {})
+        self._ocr_problems[(n, e)] = problems
+        if self.ask(key, force=True):
+            self.state["asked"][key]["sig"] = sig
+            self.save()
+
+    def check_report(self, n):
+        """What is in and what is missing for the session, per event (what Claude was asked to check by hand)."""
+        s = self.session(n)
+        lines = []
+        if not s["meet"]["entries"]:
+            lines.append("No entries export yet.")
+        if not s["meet"]["results"]:
+            lines.append("No empty merge results export yet (needed for the merge results).")
+        if not s["lanePrints"]:
+            lines.append("No printed lane sheets yet.")
+        for ev in s["events"]:
+            inp = self.event_inputs(n, ev["event"], s) or {}
+            st = {"audited": "done", "changed": "done, inputs changed since"}.get(ev["status"])
+            if st:
+                lines.append("Event %d: %s." % (ev["event"], st))
+            else:
+                lines.append("Event %d: waiting for %s." % (ev["event"], ", ".join(inp.get("missing") or ["nothing"])))
+        dq = [x for x in s["scans"] if x["kind"] == "dq"]
+        unread = [x["name"] for x in dq if x["pages"] and x["done"] < x["pages"]]
+        lines.append("DQ slips: %d batch%s%s." % (len(dq), "" if len(dq) == 1 else "es",
+                                                 ", not fully read: " + ", ".join(unread) if unread else ""))
+        if not s["meet"]["final"]:
+            lines.append("No final export yet.")
+        return "\n".join(lines)
+
+    def auto_compute(self):
+        """Run what the portal can work out itself, when its inputs are complete and have changed."""
+        if not self.state["auto"]:
+            return
+        done = self.state.setdefault("computed", {})
+        for n in self.sessions():
+            s = self.session(n)
+            for ev in s["events"]:
+                key = "S%d:e%d:run" % (n, ev["event"])
+                inp = self.event_inputs(n, ev["event"], s)
+                if inp and inp["complete"] and (done.get(key) or {}).get("sig") != inp["sig"] \
+                        and self._job(key).get("state") != "running":
+                    try:
+                        self.compute_event(n, ev["event"], "portal", "inputs complete")
+                    except ValueError:
+                        pass
+            for sc in s["scans"]:
+                if sc["kind"] == "etd" and self.scan_read(n, sc):
+                    sig = "%s:%s:%s" % (sc["name"], sc["mtime"], sc["done"])
+                    if (done.get("S%d:etd" % n) or {}).get("sig") != sig and self._job("S%d:etd" % n).get("state") != "running":
+                        self.compute_etd(n, sig)
+                if sc["kind"] == "dq" and self.scan_read(n, sc):   # the events with slips rerun via their own inputs
+                    sig = "%s:%s:%s" % (sc["name"], sc["mtime"], sc["done"])
+                    k = "S%d:dq:%s" % (n, sc["name"])
+                    if (done.get(k) or {}).get("sig") != sig:
+                        done[k] = {"sig": sig, "at": time.time(), "ok": True}
+                        self.save()
+                        threading.Thread(target=self.compute_session_report, args=(n,), daemon=True).start()
+            all_done = s["events"] and all(e["status"] == "audited" and (done.get("S%d:e%d:run" % (n, e["event"])) or {}).get("ok")
+                                           for e in s["events"])
+            if all_done and s["meet"]["results"] and s["meet"]["entries"]:
+                k = "S%d:merge" % n
+                if (done.get(k) or {}).get("sig") != self._session_sig(n, s) and self._job(k).get("state") != "running":
+                    self.compute_session(n, "portal", "every event done")
+            if s["meet"]["final"] and s["merged"]:
+                k = "S%d:final" % n
+                sig = hashlib.sha1(json.dumps([s["meet"]["final"][-1], s["merged"][-1]]).encode()).hexdigest()[:16]
+                if (done.get(k) or {}).get("sig") != sig and self._job(k).get("state") != "running":
+                    self.compute_final(n, "portal", "final export in")
+
     def auto_ask(self):
+        """Ask Claude to READ what has arrived: an event's lane sheet pack (until it is fully transcribed), DQ slips
+        and the ETD programme. Everything worked out from what it read, the portal does itself (auto_compute)."""
         if not self.state["auto"]:
             return
         for n in self.sessions():
@@ -991,28 +1361,35 @@ class Gala:
             for ev in s["events"]:
                 key = "S%d:e%d" % (n, ev["event"])
                 prev = self.state["asked"].get(key)
-                if ev["ready"] and (not prev or prev.get("sig") != ev["sig"]):
+                if ev["packs"] and not ev["read"] and (not prev or prev.get("sig") != ev["packSig"]):
                     self.ask(key)
             for sc in s["scans"]:
-                if sc["kind"] in ("dq", "etd"):
+                if sc["kind"] in ("dq", "etd") and not (sc["pages"] and sc["done"] >= sc["pages"]):
                     key = "S%d:scan:%s" % (n, sc["name"])
                     if key not in self.state["asked"]:
                         self.ask(key)
-            all_audited = s["events"] and all(e["status"] == "audited" for e in s["events"])
-            if s["meet"]["results"] and s["meet"]["entries"] and all_audited:   # the end of the session
-                key = "S%d:merge" % n
-                prev = self.state["asked"].get(key)
-                if not prev or prev.get("file") != s["meet"]["results"][-1]:
-                    if self.ask(key, force=True):
-                        self.state["asked"][key]["file"] = s["meet"]["results"][-1]
-                        self.save()
-            if s["meet"]["final"] and s["merged"]:
-                key = "S%d:final" % n
-                prev = self.state["asked"].get(key)
-                if not prev or prev.get("file") != s["meet"]["final"][-1]:
-                    if self.ask(key, force=True):
-                        self.state["asked"][key]["file"] = s["meet"]["final"][-1]
-                        self.save()
+
+    def act(self, key, who):
+        """A button on the checklist: work the portal does itself, or a question for Claude."""
+        m = re.fullmatch(r"S(\d{1,2}):(remerge|merge|final|check|etd)(?::(\d{1,4}))?", key or "")
+        if m:
+            n, kind = int(m.group(1)), m.group(2)
+            if kind == "remerge":
+                return {"job": self.compute_event(n, int(m.group(3) or 0), who, "regenerate")}
+            if kind == "merge":
+                self.compute_session(n, who, "asked")
+                return {"job": "started"}
+            if kind == "final":
+                self.compute_final(n, who, "asked")
+                return {"job": "started"}
+            if kind == "etd":
+                self.compute_etd(n, "manual %s" % time.time(), who)
+                return {"job": "started"}
+            return {"report": self.check_report(n)}
+        row = self.ask(key, who, force=True)
+        if not row:
+            raise ValueError("nothing to ask yet for that (its files aren't in)")
+        return {"question": row["id"]}
 
     def run(self, every=4):
         while True:
@@ -1023,6 +1400,7 @@ class Gala:
                     self._refiled = True
                 self.ignore_strays()
                 self.auto_ask()
+                self.auto_compute()
             except Exception as e:
                 sys.stderr.write("gala loop: %r\n" % (e,))
             time.sleep(every)

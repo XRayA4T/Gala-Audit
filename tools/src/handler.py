@@ -185,10 +185,7 @@
             elif path == "/api/gala/auto":
                 g.set_auto(bool(d.get("auto")))
             elif path == "/api/gala/ask":
-                row = g.ask(str(d.get("key") or ""), who, force=True)
-                if not row:
-                    return self._json(409, {"error": "nothing to ask yet for that (its files aren't in)"})
-                return self._json(200, {"ok": True, "question": row["id"]})
+                return self._json(200, dict(g.act(str(d.get("key") or ""), who), ok=True))
             elif path == "/api/gala/move":
                 g.move(str(d.get("path") or ""), int(d.get("session") or 0), str(d.get("folder") or ""))
             elif path == "/api/gala/restart":

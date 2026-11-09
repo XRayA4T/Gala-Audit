@@ -131,3 +131,6 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .gdlg-ck{display:flex;gap:8px;align-items:flex-start;margin:4px 0 10px}
 .gdlg-ck input{width:auto!important;margin-top:3px;accent-color:var(--accent)}
 .gign{margin:0 0 6px}.gign summary{cursor:pointer}
+.st.transcribed{border-color:#0e7490;color:#0e7490}
+.st.computing{border-color:var(--accent);background:var(--accent);color:#fff}
+.gdlg-box p{white-space:pre-line}

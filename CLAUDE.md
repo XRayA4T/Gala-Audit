@@ -36,39 +36,37 @@ When the session's **printed lane sheets** are in `meet/`, always take the print
 seed times, heats) from them with gala-ocr's `original_sheets.py`, and read only the handwriting off the scans.
 The event questions name the print to use.
 
-**The portal asks you for the work, as questions on the board** (when "Ask Claude automatically" is on):
+**You read; the portal computes.** The portal asks you, as questions on the board (when "Work automatically" is
+on), only for what needs eyes:
 
-- **An event is ready** (its lane sheet pack and every heat's Gen7 race are in): transcribe the pack, write the
-  event's **merge results** (`reports/Event NN merge results YYYY-MM-DD_HHMM.hy3`, named with the date and time
-  you write it; older ones stay, `merge_results.py … --events N`, from the
-  session's entries export and Meet Manager's **empty merge results export**; a pre-gala entries export with no
-  seeding is fine, merge_results seeds each swim from the lane sheets, plugin 1.6.1+), audit the event with
-  `--merge` that file and `--quick-fixes "reports/Event NN quick fixes.html"` (the portal shows the `.json` it
-  writes as the event's quick-fix checklist, for people to tick off as they fix each swim in Meet Manager),
-  update the session report (`--events` = every event transcribed so far in the session), and answer with what the officials should look at **now**, while they are still at the pool.
-  Be quick and short: one event at a time, as they come.
-- **"Regenerate the merge results"** (a button per event): rewrite that event's merge results and quick fixes from
-  what is already transcribed, with every DQ slip read so far (code any slip without one) and the **fixes people
-  made in the portal** (`data/sessions/S<n>/fixes.json`, passed to merge_results as `--fixes`, plugin 1.6.2+;
-  never edit it). **Never read scans for this**; scans are only read when they arrive.
-- **"New files, audit it again"**: a pack was rescanned (its old OCR has been set aside) or a Gen7 race reprinted.
-- **DQ slips** or **the ETD programme** arrived: read them, give DQ codes, update the session report.
-  DQ codes come from the full FINA list in the plugin, `plugins/gala-ocr/skills/gala-audit/data/dqcodesFINA.txt`
-  (the gala-audit skill's `data/` folder, the scripts' default), unless the session's `meet/` folder has the meet's
-  own list (a `.txt`); then pass it to every script as `--codes`. The questions say which.
-- **Merge results** (once every event is audited and Meet Manager's merge results export is in) and the
-  **final audit** (once the final export is in), per session.
+- **An event's lane sheet pack is in**: transcribe it with gala-ocr into the session's `ocr/` folder (printed fields
+  from the printed lane sheets with `original_sheets.py` when the question names them), and answer briefly: pages
+  read, what you couldn't read or are unsure of, unsigned sheets, written-in names. **Don't run merge_results.py or
+  audit_report.py.** As soon as every page is transcribed and the Gen7 races are in, the portal itself checks your
+  files (`validate_cache.py`), writes the event's merge results (`reports/Event NN merge results <date_time>.hy3`),
+  audit, quick fixes and times, and updates the session report, and does it again whenever a Gen7 race is
+  reprinted, a DQ slip is coded or someone presses Regenerate.
+- **A rescanned pack** ("rescanned, read it again"): its old OCR was set aside; read the pages again.
+- **DQ slips**: read them and give each its code in `ocr/dq-codes.json`; **the ETD programme**: read the race
+  numbers. Don't run the scripts; the portal updates the reports and checks the ETD against Gen7 itself.
+- **DQ codes for slips without one** (when the portal regenerates an event): code them from the transcribed
+  infraction; don't read scans or run scripts.
+- **Fix the transcription files**: validate_cache.py found problems; fix those files (re-read only those pages).
+
+DQ codes come from the full FINA list in the plugin, `plugins/gala-ocr/skills/gala-audit/data/dqcodesFINA.txt`
+(the gala-audit skill's `data/` folder), unless the session's `meet/` folder has the meet's own list (a `.txt`);
+the questions say which. The session merge results and the final audit are written by the portal too.
 
 Swimmers' names: when the entries file has a **preferred name** (D1 columns 49-68, a nickname in place of the legal first name),
 use it, not the first name, in answers and questions (the plugin does the same from 1.6.9).
 
-The questions give the exact commands. If several are waiting, do events in event order first. Events are
+If several questions are waiting, do events in event order first. Events are
 numbered across the meet, so "event 12" is unique; heats come from the entries export.
 
 The portal's **Checklist** tab shows, per session, each event's lane sheets, Gen7 heats, OCR and audit, and the
 session's DQ slips, ETD, merge results and final audit. People tick items there; the ticks are in
-`data/state.json` (`GET /api/gala/overview` returns all of it; don't edit the file). When asked to check the
-files, say what is missing per event.
+`data/state.json` (`GET /api/gala/overview` returns all of it; don't edit the file). (The portal's "Check the
+files" button answers what is missing per event itself.)
 
 In answers, link a report as `[Event 3 audit](/api/gala/file?path=sessions/S1/reports/Event%2003%20audit.html)`
 so it opens from the portal.

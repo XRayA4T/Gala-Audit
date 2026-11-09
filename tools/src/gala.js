@@ -3,7 +3,7 @@
 let GALA=null,galaSig='',GSESS=+(store('qa-gsess')||0);
 function galaHref(rel,dl){const u=url('/api/gala/file');u.searchParams.set('path',rel);if(dl)u.searchParams.set('dl','1');return u.toString()}
 async function galaPost(path,body){return api(path,Object.assign({by:me()||'someone'},body||{}))}
-const ST_TXT={waiting:'waiting',ready:'ready',asked:'with Claude',audited:'audited',changed:'new files'};
+const ST_TXT={waiting:'waiting',ready:'ready',asked:'with Claude',transcribed:'transcribed',computing:'working…',audited:'audited',changed:'new files'};
 const FOLDER_TXT={meet:['Meet Manager files','Entries, merge results and final exports (.zip / .hy3)'],gen7:['Gen7 race PDFs','One PDF per race'],
  scans:['Scans','Lane sheet packs (one per event), DQ slips, ETD programme'],ocr:['OCR (Claude)','JSON per lane sheet, DQ slip and ETD page; dq-codes.json'],
  reports:['Reports (Claude)','Event and session audits, merge results .hy3, final audit']};
@@ -50,13 +50,15 @@ function renderSession(){
  const ent=s.meet.entries.length?`${s.expected.events} events, ${s.expected.heats} heats expected (from ${esc(s.meet.entries[s.meet.entries.length-1])})`:'<span class="gwarn">No entries export yet</span>: events are only known as their files arrive.';
  box.innerHTML=`<div class="card"><div class="gh-top"><div><h3 style="margin:0">Session ${s.n}</h3><div class="meta">${ent} · ${s.races} Gen7 race${s.races===1?'':'s'}</div></div>
    <a href="#checklist" data-goto="checklist">Checklist →</a></div>
-  <div class="gstats">${stat(c('audited'),'audited')}${stat(c('asked'),'with Claude')}${stat(c('ready'),'ready')}${stat(c('waiting'),'waiting')}${c('changed')?stat(c('changed'),'new files'):''}</div>
+  <div class="gstats">${stat(c('audited'),'audited')}${stat(c('asked'),'with Claude')}${c('transcribed')?stat(c('transcribed'),'transcribed'):''}${c('computing')?stat(c('computing'),'working'):''}${stat(c('ready'),'ready')}${stat(c('waiting'),'waiting')}${c('changed')?stat(c('changed'),'new files'):''}</div>
   <h4 style="margin:10px 0 2px">OCR progress</h4>${scans}
-  <div class="gask"><span class="meta" style="align-self:center">Ask Claude:</span>
+  <div class="gask"><span class="meta" style="align-self:center" title="Done by the portal itself, from what Claude has read (no scans are read)">Run now:</span>
    <button type="button" data-ask="S${s.n}:check">Check the files</button>
    <button type="button" data-ask="S${s.n}:merge"${s.meet.results.length&&s.meet.entries.length?'':' disabled title="Needs the entries and merge results exports"'}>Merge results</button>
    <button type="button" data-ask="S${s.n}:final"${s.meet.final.length&&s.merged.length?'':' disabled title="Needs our merge results and Meet Manager\'s final export"'}>Final audit</button>
-   <span class="meta" data-askmsg></span></div></div>
+   <span class="meta" data-askmsg>${['merge','final','etd'].map(k=>{const j=(s.jobs||{})[k];if(!j)return '';
+     const t={merge:'Merge results',final:'Final audit',etd:'ETD check'}[k];
+     return j.state==='running'?`${t}: working…`:j.state==='failed'?`<span class="gwarn">${t} failed: ${esc(j.msg||'')}</span>`:`${t}: done ${esc(agoShort(j.at))}`}).filter(Boolean).join(' · ')}</span></div></div>
   <div class="gfolders">${Object.keys(FOLDER_TXT).map(k=>{const f=s.folders[k]||[];const mine=k==='ocr'||k==='reports';
    return `<div class="card gfolder" data-gfolder="S${s.n}/${k}"><h3><span>${esc(FOLDER_TXT[k][0])} <span class="meta">(${k==='ocr'?s.ocrCount:f.filter(x=>!x.dir).length})</span></span><code>sessions/S${s.n}/${k}</code></h3>
     <div class="meta">${esc(FOLDER_TXT[k][1])}</div>${fileList(s,k,f)}${k==='ocr'&&s.ocrCount>f.length?`<div class="meta">Newest ${f.length} of ${s.ocrCount}.</div>`:''}
@@ -99,7 +101,7 @@ function renderChecklist(){setTimeout(swAll,0);
    const fx=e.fixes||null,fxDone=fx?fx.filter(f=>GALA.ticks[qfKey(e,f)]).length:0;
    const fxCell=fx==null?'<span class="no">–</span>':fx.length?(fxDone===fx.length?`<span class="ok" title="All ${fx.length} ticked">done ✓ <span class="sm">(${fx.length})</span></span>`:`<span class="gwarn">${fxDone}/${fx.length}</span>`):'<span class="ok" title="No quick fixes">none ✓</span>';
    const lastFix=Math.max(0,...Object.values(e.handFixes||{}).map(h=>h.at||0)),needRegen=fx&&fx.length&&fxDone===fx.length&&lastFix>(e.mergeAt||0);
-   const regen=`<div><button type="button" class="primary regen" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'Write the merge results again from what is already transcribed, with every DQ slip read so far (no scans are read again)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export and the empty merge results export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
+   const regen=`<div><button type="button" class="primary regen" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'The portal writes the merge results, audit and quick fixes again from what is already transcribed, with the fixes made here and every DQ slip read and coded so far (no scans are read, no Claude)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export and the empty merge results export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
    const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="${esc(!s.meet.entries.length?'No entries export':'No empty merge results export')}">waiting</span>`)+regen;
    const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${needRegen?`<div class="qfdone">All quick fixes for event ${e.event} are done, and fixes were made since its merge results were written. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries and the empty merge results export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details data-qfd="S${s.n}:e${e.event}"${(QF_OPEN['S'+s.n+':e'+e.event]??(fxDone<fx.length))?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} ticked${fx.some(x=>x.cleared)?', '+fx.filter(x=>x.cleared).length+' settled by the re-check':''})${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
      <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
@@ -125,7 +127,7 @@ function renderChecklist(){setTimeout(swAll,0);
     <td class="c">${e.ocrLanes?e.ocrLanes+(e.lanes?'/'+e.lanes:''):'–'}</td>
     <td>${e.report?link(s,'reports',e.report):'–'}</td>
     <td>${mergeCell}</td><td class="c">${fxCell}</td>
-    <td><span class="st ${e.status}">${esc(ST_TXT[e.status]||e.status)}</span></td>
+    <td><span class="st ${e.status}">${esc(ST_TXT[e.status]||e.status)}</span>${e.computed&&!e.computed.ok&&e.status!=='computing'?`<div class="sm gwarn" title="${esc(e.computed.msg||'')}">portal: ${esc((e.computed.msg||'failed').slice(0,90))}</div>`:''}</td>
     <td><button type="button" data-ask="${key}" ${e.packs.length?'':'disabled title="No lane sheet pack yet"'}>${e.asked?'Ask again':'Ask Claude'}</button></td></tr>${fxRows}`}).join('')+'</table></div>'
   :'<div class="meta" style="padding:8px 0">No events yet. They come from the entries export, or appear as lane sheet packs and Gen7 races arrive.</div>';
  const scanFound=list=>list.map(x=>link(s,'scans',x.name)+` <span class="meta">(${x.done}/${x.pages??'?'} pages read)</span>`);
@@ -149,7 +151,7 @@ function renderChecklist(){setTimeout(swAll,0);
   ${clRow(s,'S'+s.n+':codes','DQ codes','Each slip\'s code, given by Claude from '+(s.meet.codes.length?'the meet\'s own list ('+link(s,'meet',s.meet.codes[s.meet.codes.length-1])+')':'the full FINA list in the plugin (<code>gala-audit/data/dqcodesFINA.txt</code>); drop a <code>.txt</code> with the meet\'s own list in the inbox to use that instead')+'. Codes it wasn\'t sure of need the referee\'s OK.',s.dqCodes?[link(s,'ocr','dq-codes.json')]:[],null,true)}
   ${clRow(s,'S'+s.n+':merged','Session merge results (all events)','Written by Claude once every event is audited: one file with the whole session, and the session report.',s.merged.map(n=>link(s,'reports',n)).concat(s.sessionReport?['session report: '+link(s,'reports',s.sessionReport)]:[]),null,true)}
   ${clRow(s,'S'+s.n+':mmfinal','Final merge results export','Exported from Meet Manager after the audited results were imported and finalised (name it with "final").',s.meet.final.map(n=>link(s,'meet',n)),'S'+s.n+'/meet')}
-  ${clRow(s,'S'+s.n+':final','Final audit report','Written by Claude: every change made by hand in Meet Manager.',s.finalReports.map(n=>link(s,'reports',n)),null,true)}
+  ${clRow(s,'S'+s.n+':final','Final audit report','Written by the portal when the final export is in: every change made by hand in Meet Manager.',s.finalReports.map(n=>link(s,'reports',n)),null,true)}
   </div>`}
 async function galaUpload(folder,files,card){
  const msg=card&&card.querySelector('[data-gmsg]');const say=t=>{if(msg)msg.textContent=t};
@@ -165,7 +167,10 @@ function galaClicks(e){
  if(e.target.closest('[data-newsess]')){galaPost('/api/gala/session').then(()=>{GSESS=(GALA&&GALA.sessions.length?Math.max(...GALA.sessions.map(s=>s.n)):0)+1;store('qa-gsess',GSESS);galaSig='';loadGala()});return}
  const go=e.target.closest('[data-goto]');if(go){e.preventDefault();showView(go.dataset.goto);return}
  const ab=e.target.closest('[data-ask]');if(ab){ab.disabled=true;
-  galaPost('/api/gala/ask',{key:ab.dataset.ask}).then(j=>{ab.textContent='Asked (#'+j.question+')';galaSig='';setTimeout(loadGala,1500)})
+  galaPost('/api/gala/ask',{key:ab.dataset.ask}).then(j=>{
+    if(j.report){ab.disabled=false;galaDialog({title:'Session files',text:j.report,ok:'OK',cancel:false});return}
+    if(j.job){ab.disabled=false;galaNotice(j.job==='already running'?'Already working on it.':'Working on it: the result shows here and in the activity log in a minute.');galaSig='';setTimeout(loadGala,1500);return}
+    ab.textContent='Asked (#'+j.question+')';galaSig='';setTimeout(loadGala,1500)})
    .catch(err=>{ab.disabled=false;galaNotice(err.message,'error')});return}
  const mv=e.target.closest('[data-move]');if(mv){const li=mv.closest('li');
   galaPost('/api/gala/move',{path:mv.dataset.move,session:+li.querySelector('[data-mvs]').value,folder:li.querySelector('[data-mvf]').value})
@@ -208,7 +213,7 @@ function offerRegen(key,justDone){
  galaDialog({title:'All quick fixes for event '+ev+' are done',
   text:'Regenerate the event\'s merge results now, with the fixes made in the portal and every DQ slip read so far? No scans are read again.',
   ok:'Regenerate the merge results',cancel:'Not now'}).then(yes=>{if(!yes)return;
-  galaPost('/api/gala/ask',{key:'S'+n+':remerge:'+ev}).then(j=>galaNotice('Asked Claude to regenerate event '+ev+'\'s merge results (question #'+j.question+').'))
+  galaPost('/api/gala/ask',{key:'S'+n+':remerge:'+ev}).then(j=>{galaNotice('Regenerating event '+ev+'\'s merge results (the portal does it; a minute).');galaSig='';setTimeout(loadGala,1500)})
    .catch(err=>galaNotice(err.message,'error'))})}
 document.addEventListener('submit',async ev=>{const fm=ev.target.closest('form.qffix');if(!fm)return;ev.preventDefault();
  const [n,event,heat,lane]=fm.dataset.fix.split('|'),d=Object.fromEntries([...new FormData(fm).entries()].filter(([k])=>!/^(w\d+|wt\d+|swpick|swq)$/.test(k)));

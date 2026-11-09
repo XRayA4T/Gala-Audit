@@ -120,26 +120,31 @@ Move button. A Gen7 race for an event that isn't in the meet entries (e.g. Gen7'
 is **ignored**: it goes to `data/ignored` and is listed under **Ignored** on the Gala tab, where it can be moved into a
 session if it does belong.
 
-**Claude works event by event.** From the session's entries export the portal knows the events and heats. When
-an event's lane sheet pack and every heat's Gen7 race are in, it asks `gala-claude` (a question on the
-**Questions** tab) to transcribe the pack, audit that event and update the session report, and Claude writes the
-event's merge results (`Event NN merge results.hy3`, to import into Meet Manager) and its Quick Fix list,
-which shows under the event on the Checklist tab to tick off swim by swim. Each quick fix can be **fixed in the portal**: set the result (swam,
-no-show or DQ with its code, from the FINA list or the meet's own), a corrected time and a note, and save; or
-just tick it. Every quick fix starts with the swim's **times**: TP, PB, each stopwatch, the SW median and the
-final time. Correct a misread stopwatch time there (or tick "OK as read" for a medium or low confidence reading):
-the median and the differences from TP and PB update as you type, and **Save & recalculate** checks the swim
-again (plugin 1.6.6+). For a swimmer **written in**, the closest swimmers in the entries file are listed (the
-best match chosen) and any other can be searched for. A swim **on the lane sheet but not in the merge file** has a
-**Confirm swim** button: it goes into the merge file for the chosen swimmer, with an entry added if they weren't
-entered in the event. When the last one is done, the portal offers to regenerate the event's merge results with those
-fixes. **Regenerate** (in the event's
-Merge column) rewrites the event's merge results and quick fixes from what is already transcribed, with
-every DQ slip read since; no scans are read again, and answers with what the
-officials should look at. DQ slip batches and the ETD programme are handed over as they arrive.
-At the end of the session, once every event is audited and Meet Manager's merge results export is in, Claude
-writes the session's merge results `.hy3`; when the final export arrives, it runs the final audit. Untick
-**Ask Claude automatically** to do it by hand with the **Ask Claude** buttons instead.
+**Claude reads; the portal works out the rest.** As soon as an event's lane sheet pack is in, the portal asks
+`gala-claude` (a question on the **Questions** tab) to transcribe it, and that's all Claude does for the event. When
+every page is transcribed and every heat's Gen7 race is in (or confirmed not swum), the portal itself, with the
+gala-ocr plugin's scripts and no Claude: checks the transcription files (`validate_cache.py`; Claude is asked to fix any
+that fail), writes the event's merge results (`Event NN merge results <date_time>.hy3`, to import into Meet Manager),
+its audit, its Quick Fix list (under the event on the Checklist tab, to tick off swim by swim) and the swims' times, and
+updates the session report. It does it again by itself when a Gen7 race is reprinted or a DQ slip is read or coded, and
+the status shows **working…** meanwhile; what it did is in the activity log.
+
+Each quick fix can be **fixed in the portal**: set the result (swam, no-show or DQ with its code, from the FINA list or
+the meet's own), a corrected time and a note, and save; or just tick it. Every quick fix starts with the swim's
+**times**: TP, PB, each stopwatch, the SW median and the final time. Correct a misread stopwatch time there (or tick
+"OK as read" for a medium or low confidence reading): the median and the differences from TP and PB update as you type,
+and **Save & recalculate** checks the swim again. For a swimmer **written in**, the closest swimmers in the entries file
+are listed (the best match chosen) and any other can be searched for. A swim **on the lane sheet but not in the merge
+file** has a **Confirm swim** button. When the last one is done, the portal offers to regenerate the event's merge
+results with those fixes. **Regenerate** (in the event's Merge column) does that at any time: the portal rewrites the
+merge results, audit and quick fixes from what is already transcribed, with every DQ slip read so far, in a few seconds
+(DQ slips without a code are sent to Claude to code, and the event is regenerated again when they are).
+
+DQ slip batches and the ETD programme go to Claude to read (and code the DQs); the portal then updates the reports and
+checks the ETD race numbers against Gen7 (`Session N ETD check.txt`). At the end of the session, once every event is
+done and Meet Manager's merge results export is in, the portal writes the session's merge results `.hy3`; when the
+final export arrives, it runs the final audit. **Run now** on the Gala tab does either by hand, and **Check the files**
+lists what each event is still waiting for. Untick **Work automatically** to do it all with the buttons instead.
 
 **Gala tab:** the inbox drop zone, the sessions, each session's progress (events audited, with Claude, ready,
 waiting), OCR progress per scan, its folders, and the activity log.
