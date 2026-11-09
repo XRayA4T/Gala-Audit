@@ -301,6 +301,23 @@ class Gala:
             v.sort(key=lambda f: f["mtime"])
         return out
 
+    def meet_wide(self, n, kind):
+        """The newest file of a kind in session n's meet folder, else in any session's: (session, file) or
+        (None, None). The empty merge results export (and a meet-wide entries export) is needed once per gala."""
+        own = self.meet_files(n)[kind]
+        if own and kind != "results":   # the empty results export: always the gala's newest, wherever it is
+            return n, own[-1]
+        best = (None, None)
+        for m in self.sessions():
+            f = self.meet_files(m)[kind] if m != n or kind == "results" else []
+            if f and (best[1] is None or f[-1]["mtime"] > best[1]["mtime"]):
+                best = (m, f[-1])
+        return best
+
+    def meet_path(self, n, kind):
+        m, f = self.meet_wide(n, kind)
+        return os.path.join(self.sdir(m, "meet"), f["name"]) if f else None
+
     def meet_kind(self, path):
         name = os.path.basename(path).lower()
         ext = os.path.splitext(name)[1]
@@ -380,6 +397,9 @@ class Gala:
                 return best
             free = [n for n in have if not self.meet_files(n)["entries"]]
             return free[0] if free else (max(have) + 1 if have else 1)
+        if kind == "results":   # one per gala: next to the one there is, else the first session
+            there = [n for n in have if self.meet_files(n)["results"]]
+            return there[0] if there else (min(have) if have else 1)
         if kind in ("results", "final"):
             evs = set(self.hy3(path))
             known = lambda n: set(self.entries(n)) | {r["event"] for r in self.gen7_races(n)}  # noqa: E731
@@ -677,10 +697,10 @@ class Gala:
             # when they arrive after the event was done, the event is asked again (they are part of its inputs).
             seeded = (x.get("heats") or 0) > 0
             merge_inputs = []
-            if meet["entries"]:   # a pre-gala export (not seeded) works too: the plugin seeds from the lane sheets
-                merge_inputs.append((meet["entries"][-1]["name"], meet["entries"][-1]["mtime"]))
-            if meet["results"]:
-                merge_inputs.append((meet["results"][-1]["name"], meet["results"][-1]["mtime"]))
+            for kind_ in ("entries", "results"):   # a pre-gala entries export works too; the empty results export is per gala
+                f_ = self.meet_wide(n, kind_)[1]
+                if f_:
+                    merge_inputs.append((f_["name"], f_["mtime"]))
             can_merge = len(merge_inputs) == 2
             if can_merge:
                 inputs = inputs + merge_inputs
@@ -746,7 +766,12 @@ class Gala:
         finals = [f["name"] for f in reports if f["name"].lower().endswith(".html") and "final" in f["name"].lower()]
         sess_report = next((f["name"] for f in reports if f["name"].lower().endswith(".html")
                             and re.search(r"(?i)session", f["name"]) and "final" not in f["name"].lower()), None)
+        tm, tf = self.meet_wide(n, "results")
+        em, ef = self.meet_wide(n, "entries")
         return {"n": n, "meet": {k: [f["name"] for f in v] for k, v in meet.items()}, "lanePrints": prints,
+                "template": "sessions/S%d/meet/%s" % (tm, tf["name"]) if tf else None,
+                "templateName": tf["name"] if tf else None, "templateSession": tm,
+                "entriesFile": "sessions/S%d/meet/%s" % (em, ef["name"]) if ef else None,
                 "jobs": {k: self.jobs.get("S%d:%s" % (n, k)) for k in ("merge", "final", "etd") if self.jobs.get("S%d:%s" % (n, k))},
                 "expected": {"events": len(expected), "heats": sum(e["heats"] for e in events if e["expected"])},
                 "races": len(races), "scans": scans, "events": events, "merged": merged, "finalReports": finals,
@@ -868,9 +893,9 @@ class Gala:
                         % (self.P(n, "scans", name), ocr))
             return None
         if kind == "merge":
-            if not s["meet"]["results"] or not s["meet"]["entries"]:
+            if not s["template"] or not s["entriesFile"]:
                 return None
-            ent, res = self.P(n, "meet", s["meet"]["entries"][-1]), self.P(n, "meet", s["meet"]["results"][-1])
+            ent, res = "data/" + s["entriesFile"], "data/" + s["template"]
             return ("Session %d: write the whole session's merge results for Meet Manager" % n,
                     "Every event of session %d is audited. Write one merge results file for the whole session from "
                     "Meet Manager's empty merge results export `%s` and the entries `%s`.\n\n"
@@ -895,8 +920,7 @@ class Gala:
             ev = next((x for x in s["events"] if x["event"] == e), None)
             if not ev or not ev["canMerge"] or not ev["ocrLanes"]:
                 return None
-            ent = self.P(n, "meet", s["meet"]["entries"][-1])
-            tpl = self.P(n, "meet", s["meet"]["results"][-1])
+            ent, tpl = "data/" + s["entriesFile"], "data/" + s["template"]
             mfile = "%s/Event %02d merge results %s.hy3" % (rep, e, STAMP)
             unread = [x["name"] for x in s["scans"] if x["kind"] == "dq" and x["pages"] and x["done"] < x["pages"]]
             codes = "%s/dq-codes.json" % ocr
@@ -1023,10 +1047,9 @@ class Gala:
 
     def _entries_hy3(self, n, tmp):
         """The session's entries export as a .hy3 file (taken out of the zip into tmp if need be)."""
-        f = self.meet_files(n)["entries"]
-        if not f:
+        p = self.meet_path(n, "entries")
+        if not p:
             return None
-        p = os.path.join(self.sdir(n, "meet"), f[-1]["name"])
         if not p.lower().endswith(".zip"):
             return p
         import zipfile
@@ -1101,7 +1124,8 @@ class Gala:
         parts = [[f["name"], f["mtime"]] for f in lanes] + [[r["file"], r["mtime"]] for r in races] \
             + [[f["name"], f["mtime"]] for f in slips] + [["codes", sorted((k, str(v)) for k, v in codes.items()
                                                            if k in {f["name"] for f in slips})]] \
-            + [[k, [[f["name"], f["mtime"]] for f in meet[k][-1:]]] for k in ("entries", "results", "codes")] \
+            + [[k, [[f["name"], f["mtime"]] for f in [self.meet_wide(n, k)[1]] if f]] for k in ("entries", "results")] \
+            + [["codes", [[f["name"], f["mtime"]] for f in meet["codes"][-1:]]]] \
             + [["notSwum", ev.get("notSwum") or []]]
         return {"complete": not missing, "missing": missing, "read": read, "uncoded": uncoded, "ev": ev,
                 "sig": hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]}
@@ -1143,7 +1167,7 @@ class Gala:
             mfile = None
             if ev["canMerge"] and merge:
                 ent = self._entries_hy3(n, tmp)
-                tpl = os.path.join(self.sdir(n, "meet"), self.meet_files(n)["results"][-1]["name"])
+                tpl = self.meet_path(n, "results")
                 mfile = os.path.join(rep, "Event %02d merge results %s.hy3" % (e, time.strftime("%Y-%m-%d_%H%M")))
                 ok, out = self._run_script([merge, ocr, gen7, ent, tpl, mfile, "--events", str(e)] + self._script_opts(n))
                 if not ok:
@@ -1188,14 +1212,14 @@ class Gala:
     def compute_session(self, n, who="portal", why=""):
         """The session's merge results (every event) and the session audit with its Quick Fix list."""
         s = self.session(n)
-        if not s["meet"]["results"] or not s["meet"]["entries"]:
-            raise ValueError("needs the session's entries export and Meet Manager's merge results export")
+        if not s["template"] or not s["entriesFile"]:
+            raise ValueError("needs the entries export and Meet Manager's empty merge results export")
         self._start("S%d:merge" % n, self._compute_session, (n,), who, why, self._session_sig(n, s))
 
     def _session_sig(self, n, s):
         parts = [[k, v.get("sig"), v.get("at")] for k, v in sorted(self.state.get("computed", {}).items())
                  if k.startswith("S%d:e" % n)]   # any event worked out again (a regenerate too)
-        parts += [[f["name"], f["mtime"]] for k in ("results", "entries") for f in self.meet_files(n)[k][-1:]]
+        parts += [[f["name"], f["mtime"]] for k in ("results", "entries") for f in [self.meet_wide(n, k)[1]] if f]
         return hashlib.sha1(json.dumps(parts, default=str).encode()).hexdigest()[:16]
 
     def _compute_session(self, n):
@@ -1203,7 +1227,7 @@ class Gala:
         tmp = tempfile.mkdtemp(prefix="gala-run-")
         try:
             ent = self._entries_hy3(n, tmp)
-            tpl = os.path.join(self.sdir(n, "meet"), self.meet_files(n)["results"][-1]["name"])
+            tpl = self.meet_path(n, "results")
             out = os.path.join(rep, "Merge Meet Results-S%d-audit %s.hy3" % (n, time.strftime("%Y-%m-%d_%H%M")))
             ok, msg = self._run_script([self.find_script("merge_results.py"), ocr, gen7, ent, tpl, out] + self._script_opts(n))
             if not ok:
@@ -1290,10 +1314,10 @@ class Gala:
         """What is in and what is missing for the session, per event (what Claude was asked to check by hand)."""
         s = self.session(n)
         lines = []
-        if not s["meet"]["entries"]:
+        if not s["entriesFile"]:
             lines.append("No entries export yet.")
-        if not s["meet"]["results"]:
-            lines.append("No empty merge results export yet (needed for the merge results).")
+        if not s["template"]:
+            lines.append("No empty merge results export yet (one for the whole gala; needed for the merge results).")
         if not s["lanePrints"]:
             lines.append("No printed lane sheets yet.")
         for ev in s["events"]:
@@ -1341,7 +1365,7 @@ class Gala:
                         threading.Thread(target=self.compute_session_report, args=(n,), daemon=True).start()
             all_done = s["events"] and all(e["status"] == "audited" and (done.get("S%d:e%d:run" % (n, e["event"])) or {}).get("ok")
                                            for e in s["events"])
-            if all_done and s["meet"]["results"] and s["meet"]["entries"]:
+            if all_done and s["template"] and s["entriesFile"]:
                 k = "S%d:merge" % n
                 if (done.get(k) or {}).get("sig") != self._session_sig(n, s) and self._job(k).get("state") != "running":
                     self.compute_session(n, "portal", "every event done")

@@ -81,7 +81,7 @@ them on the **Gala** tab). Within a few seconds each one is sorted into its sess
 | What | How it's recognised | Goes to |
 |---|---|---|
 | Meet entries export (`Meet Entries-…zip` / `Hfile…hy3`) | `.zip` / `.hy3`, "entr" in the name | `sessions/S<n>/meet` |
-| Merge results export / final export | "result" / "final" in the name | `sessions/S<n>/meet` |
+| Empty merge results export (**once per gala**) / final export (per session) | "result" / "final" in the name | `sessions/S<n>/meet` (the empty one: the first session) |
 | Printed lane sheets (Meet Manager's PDF, not the scan) | its text (Event, Lane, Heat) | `sessions/S<n>/meet` |
 | Gen7 race PDF | its text (Event, Heat, Race #, Session) | `sessions/S<n>/gen7` |
 | Lane sheet pack | a scanned PDF, "Event 3" in the name | `sessions/S<n>/scans` |
@@ -142,7 +142,7 @@ merge results, audit and quick fixes from what is already transcribed, with ever
 
 DQ slip batches and the ETD programme go to Claude to read (and code the DQs); the portal then updates the reports and
 checks the ETD race numbers against Gen7 (`Session N ETD check.txt`). At the end of the session, once every event is
-done and Meet Manager's merge results export is in, the portal writes the session's merge results `.hy3`; when the
+done, the portal writes the session's merge results `.hy3`; when the
 final export arrives, it runs the final audit. **Run now** on the Gala tab does either by hand, and **Check the files**
 lists what each event is still waiting for. Untick **Work automatically** to do it all with the buttons instead.
 
@@ -151,7 +151,7 @@ waiting), OCR progress per scan, its folders, and the activity log.
 
 **Checklist tab:** per session, in order: the entries export; the printed lane sheets (Claude copies the
 names, ages, teams and seed times from them rather than reading them off the scans); a row per event (printed ✓, lane sheets, Gen7 heats in and
-missing, OCR lanes, audit report, status, Ask Claude); then DQ slips, ETD, DQ codes, the merge results export,
+missing, OCR lanes, audit report, status, Ask Claude); then DQ slips, ETD, DQ codes,
 our merge results, the final export and the final audit. Tick items off once you've checked them; ticks are
 shared. Ticking an event complete while some of its heats have no Gen7 race asks you to confirm those races weren't
 swum; Claude then audits the event without them. Drop a file on a row to add it.
