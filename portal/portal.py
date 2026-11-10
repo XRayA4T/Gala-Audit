@@ -110,6 +110,8 @@ class Store:
         self.lock = threading.Lock()
         self.max_doc_bytes = max_doc_bytes
         self.attention = None   # {"reason", "by", "ts"} while the session is waiting for a person
+        self.presence = {}      # open board pages: {page id: {who, view, term, hidden, ts}}
+        self.terminals = None   # tmux clients attached to Claude's session, from the watcher: {count, ts}
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.docdir = os.path.join(os.path.dirname(os.path.abspath(path)), "docs")
@@ -427,7 +429,66 @@ class Store:
             lines += ["  doc %d by %s: %s" % (r["id"], r["author"], r["title"]) for r in recent_docs]
         if lines:
             lines.append("(Use the qaboard tools: get_question / answer_question / resolve_question / get_document.)")
+        w = self.watching_line()
+        if w:
+            lines.append("[QA board] " + w)
         return "\n".join(lines)
+
+    # -- who is looking: each open board page checks in every 15 s (POST /api/presence) with the name chosen
+    # next to "I am", its tab and whether the terminal window is open; silent for 75 s = gone.
+    PRESENCE_TTL = 75
+
+    def touch_presence(self, pid, who, view, term, hidden, gone=False):
+        pid = re.sub(r"[^A-Za-z0-9_-]", "", str(pid or ""))[:32]
+        if not pid:
+            raise ValueError("id required")
+        with self.lock:
+            if gone:
+                self.presence.pop(pid, None)
+            else:
+                self.presence[pid] = {"who": clean_name(who) if who else "", "view": str(view or "")[:20],
+                                      "term": bool(term), "hidden": bool(hidden), "ts": time.time()}
+                if len(self.presence) > 500:   # a runaway client: keep the newest
+                    for k in sorted(self.presence, key=lambda k: self.presence[k]["ts"])[:-500]:
+                        del self.presence[k]
+
+    def watchers(self):
+        """One entry per person (pages merged): {who, term, live, board, background}."""
+        now, people = time.time(), {}
+        with self.lock:
+            for k in [k for k, v in self.presence.items() if now - v["ts"] > self.PRESENCE_TTL]:
+                del self.presence[k]
+            for v in self.presence.values():
+                p = people.setdefault(v["who"] or "someone", {"who": v["who"] or "someone", "term": False,
+                                                              "live": False, "board": False, "background": True})
+                p["term"] = p["term"] or v["term"]
+                p["live"] = p["live"] or (v["view"] == "live" and not v["hidden"])
+                p["board"] = True
+                p["background"] = p["background"] and v["hidden"] and not v["term"]
+            term_pages = sum(1 for v in self.presence.values() if v["term"])
+            t = self.terminals
+        others = 0
+        if t and now - t["ts"] < 60:   # terminals attached to the session that aren't a board page's window
+            others = max(0, t["count"] - term_pages)
+        return sorted(people.values(), key=lambda p: (not p["term"], not p["live"], p["background"], p["who"])), others
+
+    def watching_line(self):
+        """"Watching your session now: raymond (terminal open), lorretta (Live tab); on the board: bob", or ""."""
+        people, others = self.watchers()
+        watching = [p for p in people if p["term"] or p["live"]]
+        rest = [p for p in people if not (p["term"] or p["live"])]
+        if not watching and not rest and not others:
+            return ""
+        out = []
+        if watching or others:
+            names = ["%s (%s)" % (p["who"], "terminal open" if p["term"] else "Live tab") for p in watching]
+            if others:
+                names.append("%d other terminal%s attached (name unknown)" % (others, "" if others == 1 else "s"))
+            out.append("Watching your session now: " + ", ".join(names))
+        if rest:
+            out.append(("on the board" if out else "On the board now (not watching your session)") + ": "
+                       + ", ".join(p["who"] + (" (in the background)" if p["background"] else "") for p in rest))
+        return "; ".join(out) + "."
 
     # ---------------------------------------------------------------- documents
     def spool(self, chunks):
@@ -2652,6 +2713,14 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "who_is_watching",
+        "description": "Who is watching your session from the board right now: people with the board's terminal "
+                       "window open (who can type to you), on its Live tab, or just on the board, by the name they "
+                       "chose there, and how many other terminals are attached. Check before asking someone to do "
+                       "something at the keyboard (a sign-in, an approval) or when deciding whether to wait for an answer.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "post_question",
         "description": "Post a question to the shared team Q&A board. `to` is required: the person or Claude "
                        "who should answer (e.g. 'alice', 'bob', 'dev-claude'). Only use 'anyone' when the user "
@@ -2874,6 +2943,8 @@ def call_tool(store, who, name, args, base_url=""):
     if name == "check_inbox":
         text = store.digest(who)
         return [_text(text or "Nothing waiting for %s on the QA board." % who)]
+    if name == "who_is_watching":
+        return [_text(store.watching_line() or "Nobody is on the board right now (no board page open).")]
     if name == "post_question":
         to = (args.get("to") or "").strip()
         if not to:
@@ -3463,6 +3534,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, found[0]) if found else self._json(404, {"error": "no such deployment"})
             if path == "/api/digest":
                 return self._send(200, store.digest(q.get("to") or self._who(q)), "text/plain")
+            if path == "/api/presence":
+                people, others = store.watchers()
+                return self._json(200, {"people": people, "otherTerminals": others, "line": store.watching_line()})
             if path == "/api/docs":
                 return self._json(200, {
                     "documents": store.list_documents(q.get("q"), q.get("question"), q.get("archived") == "1",
@@ -3531,8 +3605,15 @@ class Handler(BaseHTTPRequestHandler):
                     store.set_setting("css", css.strip() or None)
                 self._apply_settings()
                 return self._json(200, self._settings_out())
+            if path == "/api/presence":   # a board page checking in (or saying goodbye, gone: true)
+                d = self._body(8 * 1024)
+                store.touch_presence(d.get("id"), d.get("who"), d.get("view"), d.get("term"), d.get("hidden"), d.get("gone"))
+                people, others = store.watchers()
+                return self._json(200, {"people": people, "otherTerminals": others})
             if path == "/api/live":   # console snapshot from the board watcher
                 d = self._body(2 * 1024 * 1024)
+                if isinstance(d.get("clients"), int):   # terminals attached to Claude's tmux session
+                    store.terminals = {"count": max(0, d["clients"]), "ts": time.time()}
                 text = str(d.get("text") or "")[-400000:]
                 prev = getattr(self.server, "live", None) or {}
                 now = time.time()
@@ -3872,6 +3953,7 @@ h1 .ver{font-size:13.2px;font-weight:500;letter-spacing:0;text-transform:none;op
 .setbtns{justify-content:flex-end;align-items:center;gap:8px}.setbtns button{flex:0 0 auto}.setbtns .meta{margin-right:auto}
 .brand img.setlogo{width:auto;max-width:140px;object-fit:contain}
 @media (max-width:640px){.setgrid{grid-template-columns:1fr}}
+.watchers{flex:1 1 auto;text-align:right;margin-right:8px}.watchers b{color:var(--fg)}
 .updbtn{font:600 12px/1 system-ui,sans-serif;letter-spacing:0;text-transform:none;margin-left:6px;padding:4px 9px;border-radius:99px;
  border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer;vertical-align:2px}
 .updlg{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.45);display:grid;place-items:center;padding:16px}
@@ -4315,7 +4397,7 @@ made here and the activity log. Linked inbox folders (the Gen7 or scanner shares
   <span class="attnacts"><a class="attnlink" id="liveopen" target="_blank" rel="noopener noreferrer" hidden>Open link &#8599;</a>
   <span class="attncode" id="livecode" hidden>Code <b id="livecodetext"></b> <button id="livecopy">Copy</button></span>
   <button id="liveclear" hidden>Mark as handled</button></span></div>
-<div class="livehead"><div class="meta" id="livestate">Loading…</div>
+<div class="livehead"><div class="meta" id="livestate">Loading…</div><div class="meta watchers" id="watchers"></div>
 <button id="openterm" class="primary" title="Open the Claude Code web terminal in a window over the board">Open terminal</button></div>
 <div class="livebox" id="livebox" hidden><pre id="livepre"></pre></div>
 <div class="meta" style="margin-top:8px">Read-only copy of the Claude Code console on the server, refreshed every 2 seconds. To type to Claude, use the web terminal.</div>
@@ -4820,7 +4902,7 @@ let view=['#gala','#checklist','#restart','#questions','#docs','#live','#users',
 {const m=new URLSearchParams(location.search).get('me');if(m&&!store('qa-me'))store('qa-me',m)}
 function showView(v){view=v;store('qa-view',v);if(v!=='deploys')focusDep=null;
  document.querySelectorAll('#views button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
- $('#v-gala').hidden=v!=='gala';$('#v-checklist').hidden=v!=='checklist';$('#v-restart').hidden=v!=='restart';$('#v-questions').hidden=v!=='questions';$('#v-docs').hidden=v!=='docs';$('#v-live').hidden=v!=='live';$('#v-users').hidden=v!=='users';$('#v-deploys').hidden=v!=='deploys';if(v==='users'){loadSettings();if(!UPD)checkUpdate(false)}refresh()}
+ $('#v-gala').hidden=v!=='gala';$('#v-checklist').hidden=v!=='checklist';$('#v-restart').hidden=v!=='restart';$('#v-questions').hidden=v!=='questions';$('#v-docs').hidden=v!=='docs';$('#v-live').hidden=v!=='live';$('#v-users').hidden=v!=='users';$('#v-deploys').hidden=v!=='deploys';if(v==='users'){loadSettings();if(!UPD)checkUpdate(false)}if(typeof presence==='function')setTimeout(presence,50);refresh()}
 $('#views').onclick=e=>{const b=e.target.closest('button');if(b&&b.dataset.v)showView(b.dataset.v)};
 $('#mini').onclick=()=>{showView('live');window.scrollTo(0,0)};
 function refresh(){loadUsers();(view==='gala'||view==='checklist'||view==='restart')?loadGala():view==='docs'?loadDocs():view==='live'?loadLive():view==='users'?null:view==='deploys'?loadDeps():load()}
@@ -5219,6 +5301,22 @@ function openUpd(){const u=UPD||{};
     const st=await api('/api/board/update');if(st.update&&st.update.state==='failed'){updBox('<h3>The board wasn\'t updated</h3><div class="bad">'+esc(st.update.msg||'')+'</div><div class="meta">It is still running '+esc(from)+'.</div><div class="btns"><button type="button" data-updno>Close</button></div>');return}}catch(e){}
    setTimeout(poll,2000)};setTimeout(poll,2000)}}
 setTimeout(()=>checkUpdate(false),1500);setInterval(()=>{if(!document.hidden)checkUpdate(false)},3600*1000);
+
+// ---- presence: this page checks in every 15 s with who you are, the tab and whether the terminal window is open,
+// so the board (and Claude) can see who is watching the session
+const PAGEID=(()=>{const r=()=>Math.random().toString(36).slice(2,12);try{let c=sessionStorage.getItem('qa-page');if(!c){c=r();sessionStorage.setItem('qa-page',c)}return c}catch(e){return r()}})();
+let WATCH=null;
+function presenceBody(gone){return {id:PAGEID,who:me()||'',view,term:!!$('#termwin')&&!$('#termwin').hidden,hidden:document.hidden,gone:!!gone}}
+function presence(){api('/api/presence',presenceBody()).then(j=>{WATCH=j;renderWatch()}).catch(()=>{})}
+function renderWatch(){const el=$('#watchers');if(!el||!WATCH)return;const ppl=(WATCH.people||[]).filter(p=>p.term||p.live);
+ const bits=ppl.map(p=>'<b>'+esc(p.who)+'</b>'+(p.term?' (terminal)':''));
+ if(WATCH.otherTerminals)bits.push(WATCH.otherTerminals+' other terminal'+(WATCH.otherTerminals===1?'':'s'));
+ el.innerHTML=bits.length?'Watching: '+bits.join(', '):''}
+setInterval(presence,15000);setTimeout(presence,800);
+document.addEventListener('visibilitychange',presence);
+addEventListener('pagehide',()=>{try{navigator.sendBeacon(url('/api/presence'),new Blob([JSON.stringify(presenceBody(true))],{type:'application/json'}))}catch(e){}});
+$('#me').addEventListener('change',()=>setTimeout(presence,50));
+for(const id of ['openterm','termclose'])$('#'+id).addEventListener('click',()=>setTimeout(presence,100));
 
 // ---- Settings tab: branding (saved on the board) and updates
 let SET=null;

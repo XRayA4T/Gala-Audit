@@ -148,9 +148,11 @@ def live_loop():
                 h = hashlib.sha1(text.encode()).hexdigest()
                 if h != last_hash or time.time() - last_sent > 30:
                     visible = (screen() or "").lower()
+                    cl = tmux("list-clients", "-t", CFG["tmux_session"])   # terminals attached (web or ssh)
+                    clients = len([x for x in cl.stdout.splitlines() if x.strip()]) if cl.returncode == 0 else None
                     board_post("/api/live", {"text": text, "busy": "esc to interrupt" in visible,
                                              "prompt": any(m in visible for m in PROMPT_MARKERS),
-                                             "title": CFG.get("title", "")})
+                                             "title": CFG.get("title", ""), "clients": clients})
                     last_hash, last_sent = h, time.time()
                     if failing:
                         log("live view: sending again")
