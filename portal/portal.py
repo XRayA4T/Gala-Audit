@@ -191,17 +191,28 @@ class Store:
         ]
         return q
 
-    def post(self, title, body, author, to):
+    def post(self, title, body, author, to, documents=None):
+        """documents: ids of documents uploaded while writing the question (pasted screenshots, files); those not
+        attached to a question yet are attached to this one."""
         title = (title or "").strip()
         if not title:
             raise ValueError("title is required")
         now = time.time()
+        docs = []
+        for d in documents or []:
+            try:
+                docs.append(int(d))
+            except (TypeError, ValueError):
+                pass
         with self.lock:
             cur = self.db.execute(
                 "INSERT INTO questions(title, body, author, to_whom, status, created, updated) "
                 "VALUES(?,?,?,?, 'open', ?, ?)",
                 (title, (body or "").strip(), clean_name(author), clean_name(to or "anyone"), now, now),
             )
+            for d in docs[:50]:
+                self.db.execute("UPDATE documents SET question_id=? WHERE id=? AND question_id IS NULL",
+                                (cur.lastrowid, d))
             self.db.commit()
             return self.get(cur.lastrowid)
 
@@ -244,6 +255,8 @@ class Store:
     # -- deployments: progress reports (the whole state each time; a report replaces the earlier one)
     def put_deployment(self, dep_id, state):
         state = clean_deployment(dep_id, state)
+        prev = self.deployments(dep_id=dep_id)
+        deployment_times(state, prev[0] if prev else {})
         now = time.time()
         with self.lock:
             self.db.execute("INSERT OR REPLACE INTO deployments(id, state, updated) VALUES(?,?,?)",
@@ -2542,6 +2555,46 @@ def clean_deployment(dep_id, state):
     return state
 
 
+def iso_now():
+    """The time now in ISO 8601 with this computer's offset, e.g. 2026-11-09T14:32:05+02:00."""
+    z = time.strftime("%z")
+    return time.strftime("%Y-%m-%dT%H:%M:%S") + (z[:3] + ":" + z[3:] if len(z) == 5 else "")
+
+
+def deployment_times(state, prev):
+    """Fill in the times a report leaves out, from the previous report or the time it arrives, so the board can
+    show when the deployment and each step started and finished, how long they took and an ETA:
+    the deployment's started (kept from the first report), updated and finished (once done or failed), and each
+    step's started (when first seen running) and finished (when first seen done or failed)."""
+    now = iso_now()
+    state["started"] = state.get("started") or prev.get("started") or now
+    state["updated"] = state.get("updated") or now
+    if state.get("status") in ("done", "failed"):
+        state["finished"] = state.get("finished") or prev.get("finished") or now
+    else:
+        state.pop("finished", None)
+    old = {x.get("id"): x for x in prev.get("steps") or [] if isinstance(x, dict) and x.get("id")}
+    last_end = state["started"]
+    for x in state.get("steps") or []:
+        if not isinstance(x, dict):
+            continue
+        p = old.get(x.get("id")) or {}
+        st = x.get("status")
+        if st in ("running", "done", "failed") and not x.get("started"):
+            # first seen running now; reported straight as done: it started when the step before it ended
+            x["started"] = p.get("started") or (now if st == "running" else last_end)
+        if st in ("done", "failed") and not x.get("finished"):
+            x["finished"] = p.get("finished") or now
+        if "estimate" in x:   # seconds the step is expected to take
+            try:
+                x["estimate"] = max(0.0, float(x["estimate"]))
+            except (TypeError, ValueError):
+                x.pop("estimate")
+        if x.get("finished"):
+            last_end = x["finished"]
+    return state
+
+
 def clean_attention(reason, url=None, code=None, by="someone"):
     """Validate a needs-attention signal: one-line reason, an optional http(s) link, an optional short code."""
     reason = " ".join(str(reason or "").split())[:200]
@@ -2648,7 +2701,11 @@ TOOLS = [
                        "bar at the top of every page and the full step list on the Deploys tab. Send the WHOLE "
                        "state every time (a report replaces the previous one for that deployment id), when a step "
                        "starts or finishes and when you start waiting for someone. status: running, waiting, done "
-                       "or failed. waitingFor ({reason, url, code}) raises the board's Needs-you banner and is cleared "
+                       "or failed. Times (ISO 8601 with timezone, e.g. from `date -Iseconds`): the deployment's started "
+                       "(once, kept), each step's started and finished, kept in every later report; give eta and a "
+                       "step's estimate (seconds) when you can tell, and the board shows the time left (otherwise it "
+                       "guesses from the steps done; times you leave out are filled in when the reports arrive). "
+                       "waitingFor ({reason, url, code}) raises the board's Needs-you banner and is cleared "
                        "when you send it as null. error: {step, message, log} with the full log uploaded as a "
                        "document ('doc 812').",
         "inputSchema": {
@@ -2662,10 +2719,13 @@ TOOLS = [
                 "questions": {"type": "array", "items": {"type": "integer"}, "description": "Board questions it ships"},
                 "branches": {"type": "array", "items": {"type": "string"}},
                 "commit": {"type": "string"},
-                "started": {"type": "string", "description": "ISO 8601 time"},
-                "updated": {"type": "string", "description": "ISO 8601 time"},
-                "steps": {"type": "array", "description": "In order: {id, label, status, finished?, detail?, "
-                          "stages?: [{name, status}]}", "items": {"type": "object"}},
+                "started": {"type": "string", "description": "ISO 8601 time the deployment began (keep it the same in every report)"},
+                "updated": {"type": "string", "description": "ISO 8601 time of this report"},
+                "finished": {"type": "string", "description": "ISO 8601 time it ended (done or failed)"},
+                "eta": {"type": "string", "description": "ISO 8601 time you expect it to finish, if you can tell"},
+                "steps": {"type": "array", "description": "In order: {id, label, status, started?, finished?, "
+                          "estimate? (seconds the step usually takes), detail?, stages?: [{name, status}]}. "
+                          "started/finished are ISO 8601 times", "items": {"type": "object"}},
                 "waitingFor": {"type": ["object", "null"], "description": "{reason, url?, code?} or null"},
                 "error": {"type": ["object", "null"], "description": "{step, message, log?} or null"},
             },
@@ -2769,7 +2829,8 @@ INSTRUCTIONS = (
     "Put documents the team should be able to read (specs, reports, notes, screenshots) in the document store "
     "with upload_document, and link them from questions or answers as 'doc <id>'. "
     "When you run a deployment or another long multi-step job, report it with deployment_progress (the whole "
-    "state each time a step starts or finishes) so the team can follow it on the board. "
+    "state each time a step starts or finishes, with each step's started and finished times and an eta or step "
+    "estimates when you can tell) so the team can follow it on the board. "
     "A question with status on_hold has been put on hold by the team: don't answer, chase, follow up on or ask "
     "about it (not even your own) until it is taken off hold; it is left out of your inbox until then. "
     "Posts are Markdown; to show an image (PNG, JPEG, GIF, WebP or SVG) from the document store in a post, "
@@ -3317,6 +3378,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, g.update_status(q.get("fetch") == "1") if g else {"git": False})
             if path == "/api/gala/file":
                 return self._gala_file(q)
+            if path == "/api/board/update":
+                return self._json(200, self.server.updater.status(q.get("check") == "1"))
             if path == "/api/questions":
                 return self._json(200, {"questions": store.list(q.get("status", "unresolved"), q.get("to"), q.get("limit", 100))})
             if path.startswith("/api/questions/"):
@@ -3367,6 +3430,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(401, {"error": "missing or wrong key"})
         store = self.server.store
         try:
+            if path == "/api/board/update":   # the board's own updater is off in the portal (it updates with git)
+                return self._json(200, {"ok": True, "update": self.server.updater.start(self._who(q))})
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
             if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck",
@@ -3429,7 +3494,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(202)
                 return self._json(200, out)
             if path == "/api/questions":
-                return self._json(201, store.post(data.get("title"), data.get("body"), data.get("author"), data.get("to")))
+                return self._json(201, store.post(data.get("title"), data.get("body"), data.get("author"), data.get("to"),
+                                                  data.get("documents") if isinstance(data.get("documents"), list) else None))
             parts = path.split("/")
             if len(parts) == 5 and parts[1:3] == ["api", "questions"]:
                 qid = int(parts[3])
@@ -3477,6 +3543,141 @@ def render_page(brand, accent, terminal_url=""):
                 .replace("{ACCENT}", accent))
 
 
+# --------------------------------------------------------------------------- updating itself from GitHub
+
+UPDATE_URL = "https://raw.githubusercontent.com/XRayA4T/Claude-QA-Board/main/server/qaboard.py"
+UPDATE_REPO = "XRayA4T/Claude-QA-Board"
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:4])
+
+
+class Updater:
+    """The board updates itself with --self-update: it checks GitHub for a newer qaboard.py (at most hourly,
+    or when asked), and on request downloads it, checks it compiles and serves /health on a spare port, keeps
+    the old file as qaboard.py.prev, puts the new one in place and exits, so the container's restart policy
+    (or a service manager) starts the new version. The file must be writable (not a read-only mount)."""
+
+    def __init__(self, path, url=UPDATE_URL, repo=UPDATE_REPO, enabled=False):
+        self.path, self.url, self.repo, self.enabled = path, url, repo, enabled
+        self.cache, self.checked, self.state = None, 0, {"state": "idle"}
+        self.lock = threading.Lock()
+
+    def _get(self, url, limit=4 * 1024 * 1024):
+        req = urllib.request.Request(url, headers={"User-Agent": "qaboard/%s" % VERSION})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.read(limit + 1)[:limit + 1]
+
+    def status(self, force=False):
+        out = {"enabled": self.enabled, "version": VERSION, "update": self.state}
+        if not self.enabled:
+            return out
+        out["writable"] = os.access(self.path, os.W_OK) and os.access(os.path.dirname(self.path), os.W_OK)
+        out["previous"] = os.path.exists(self.path + ".prev")
+        if force or not self.cache or time.time() - self.checked > 3600:
+            info = {"checked": time.time()}
+            try:
+                src = self._get(self.url).decode("utf-8", "replace")
+                m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
+                info["latest"] = m.group(1) if m else None
+            except Exception as e:   # offline, rate limited: say so, keep running
+                info["error"] = str(e)[:200]
+            if info.get("latest") and version_tuple(info["latest"]) > version_tuple(VERSION):
+                try:   # what's new: the commit messages of the versions since this one ("Board 1.18.0: ...")
+                    api = "https://api.github.com/repos/%s/commits?path=server/qaboard.py&per_page=20" % self.repo
+                    notes = []
+                    for c in json.loads(self._get(api, 1024 * 1024).decode("utf-8")):
+                        msg = (c.get("commit") or {}).get("message", "").split("\n")[0]
+                        m = re.match(r"Board (\d+(?:\.\d+)+)", msg)
+                        if m and version_tuple(m.group(1)) <= version_tuple(VERSION):
+                            break
+                        notes.append(msg[:200])
+                    info["notes"] = notes[:15]
+                except Exception:
+                    pass
+            self.cache, self.checked = info, time.time()
+        out.update(self.cache)
+        out["available"] = bool(out.get("latest")) and version_tuple(out["latest"]) > version_tuple(VERSION)
+        return out
+
+    def start(self, who):
+        if not self.enabled:
+            raise ValueError("this board doesn't update itself (start it with --self-update)")
+        with self.lock:
+            if self.state.get("state") == "running":
+                return self.state
+            self.state = {"state": "running", "by": who, "at": time.time(), "msg": "downloading"}
+        threading.Thread(target=self._update, args=(who,), daemon=True).start()
+        return self.state
+
+    def _update(self, who):
+        def fail(msg):
+            self.state = {"state": "failed", "by": who, "at": time.time(), "msg": msg}
+            sys.stderr.write("update failed: %s\n" % msg)
+        try:
+            if not (os.access(self.path, os.W_OK) and os.access(os.path.dirname(self.path), os.W_OK)):
+                return fail("qaboard.py can't be replaced here (a read-only mount?): redeploy the board instead")
+            src = self._get(self.url)
+            if len(src) > 4 * 1024 * 1024:
+                return fail("the download is too big")
+            m = re.search(rb'^VERSION = "([^"]+)"', src, re.M)
+            new_v = m.group(1).decode() if m else ""
+            if not new_v or version_tuple(new_v) <= version_tuple(VERSION):
+                return fail("GitHub has %s, not newer than %s" % (new_v or "no version", VERSION))
+            new = self.path + ".new"
+            with open(new, "wb") as f:
+                f.write(src)
+            self.state["msg"] = "testing %s" % new_v
+            import py_compile
+            import shutil
+            try:
+                py_compile.compile(new, cfile=os.path.join(tempfile.gettempdir(), "qaboard-new.pyc"), doraise=True)
+            except py_compile.PyCompileError as e:
+                os.unlink(new)
+                return fail("the new version doesn't compile: %s" % e)
+            # does it start and answer /health? (a spare port, an empty board in a temp folder)
+            tmp = tempfile.mkdtemp(prefix="qaboard-test-")
+            import socket
+            sk = socket.socket()
+            sk.bind(("127.0.0.1", 0))
+            port = sk.getsockname()[1]
+            sk.close()
+            import subprocess
+            p = subprocess.Popen([sys.executable, new, "serve", "--host", "127.0.0.1", "--port", str(port),
+                                  "--db", os.path.join(tmp, "test.db")], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE)
+            ok, err = False, ""
+            try:
+                for _ in range(40):
+                    time.sleep(0.25)
+                    if p.poll() is not None:
+                        err = (p.stderr.read() or b"").decode("utf-8", "replace")[-300:]
+                        break
+                    try:
+                        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                                "http://127.0.0.1:%d/health" % port, timeout=2) as r:
+                            ok = json.loads(r.read().decode()).get("version") == new_v
+                            break
+                    except Exception:
+                        continue
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                shutil.rmtree(tmp, ignore_errors=True)
+            if not ok:
+                os.unlink(new)
+                return fail("the new version didn't start: %s" % (err.strip().splitlines()[-1] if err.strip() else "no answer"))
+            shutil.copy2(self.path, self.path + ".prev")
+            os.replace(new, self.path)
+            self.state = {"state": "restarting", "by": who, "at": time.time(), "msg": "updated to %s" % new_v}
+            sys.stderr.write("updated to %s by %s; restarting\n" % (new_v, who))
+            time.sleep(1.5)   # let the answer reach the browser
+            os._exit(0)       # the container's restart policy starts the new version
+        except Exception as e:
+            fail("%s: %s" % (type(e).__name__, e))
+
+
 def serve(args):
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
@@ -3484,6 +3685,7 @@ def serve(args):
     srv.key = args.key
     srv.brand = args.name
     srv.accent = args.accent if re.fullmatch(r"#[0-9a-fA-F]{6}", args.accent or "") else "#3949ab"
+    srv.updater = Updater(os.path.abspath(__file__), args.update_url or UPDATE_URL, UPDATE_REPO, args.self_update)
     srv.brand_dir = os.path.abspath(args.brand_dir) if args.brand_dir else None
     srv.term_ports = {k: v for k, v in (("rw", args.term_rw_port), ("ro", args.term_ro_port)) if v}
     srv.admin_key = args.admin_key or ""
@@ -3560,6 +3762,13 @@ h1 span{display:block;font-size:15.6px;font-weight:500;color:var(--muted);letter
 .brand{display:flex;gap:10px;align-items:center}
 .brand img{border-radius:8px;flex:0 0 auto}
 h1 .ver{font-size:13.2px;font-weight:500;letter-spacing:0;text-transform:none;opacity:.75;margin-left:4px}
+.updbtn{font:600 12px/1 system-ui,sans-serif;letter-spacing:0;text-transform:none;margin-left:6px;padding:4px 9px;border-radius:99px;
+ border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer;vertical-align:2px}
+.updlg{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.45);display:grid;place-items:center;padding:16px}
+.updlg[hidden]{display:none}
+.updbox{background:var(--card);color:var(--fg,inherit);border-radius:12px;max-width:520px;width:100%;padding:18px 20px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+.updbox h3{margin:0 0 8px}.updbox ul{margin:6px 0 10px;padding-left:20px;max-height:220px;overflow:auto}
+.updbox .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}.updbox .bad{color:#e5484d}
 header{border-top:4px solid var(--accent);padding-top:12px}
 .me{display:flex;gap:6px;align-items:center;color:var(--muted);font-size:16.8px}
 input,textarea,select{font:inherit;color:var(--fg);background:var(--field);border:1px solid var(--line);
@@ -3688,7 +3897,8 @@ main>section{padding-top:14px}
 .depsteps li{display:grid;grid-template-columns:22px 1fr auto;gap:8px;align-items:baseline}
 .depsteps .ic{text-align:center;font-weight:700}.depsteps .done .ic{color:var(--ans)}.depsteps .failed .ic{color:#e5484d}
 .depsteps .running .ic{color:var(--accent)}.depsteps .waiting{color:var(--muted)}
-.depsteps .when{color:var(--muted);font-size:14px;font-variant-numeric:tabular-nums}
+.depsteps .when{color:var(--muted);font-size:14px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.depeta{font-variant-numeric:tabular-nums}.depeta.late{color:#e5484d}
 .stages{grid-column:2/4;display:flex;flex-wrap:wrap;gap:6px;margin-top:2px}
 .stage{font-size:13px;border:1px solid var(--line);border-radius:6px;padding:1px 8px;background:var(--bg)}
 .stage.done{color:var(--ans);border-color:var(--ans)}.stage.running{color:var(--accent);border-color:var(--accent);font-weight:600}
@@ -3948,9 +4158,9 @@ made here and the activity log. Linked inbox folders (the Gen7 or scanner shares
 <section id="v-questions">
 <details class="card new" id="newbox"><summary>Ask a question</summary>
 <div class="row"><input id="title" placeholder="Question (one line)"></div>
-<div class="row"><textarea id="qbody" placeholder="Details, context, links, code"></textarea></div>
+<div class="row"><textarea id="qbody" placeholder="Details, context, links, code. Paste a screenshot (Ctrl+V) or drop files to show them here."></textarea></div>
 <div class="drop qdropzone" id="qdrop">Drop files here, or <label style="color:var(--accent);cursor:pointer;text-decoration:underline">choose files<input type="file" id="qfile" multiple hidden></label>
-<div class="meta" id="qfilelist">They're attached to the question when you post it. You can also paste a screenshot (Ctrl+V).</div></div>
+<div class="meta" id="qfilelist">They're uploaded straight away and shown in the question where your cursor is; you can also paste a screenshot (Ctrl+V).</div></div>
 <div class="row forwhom"><span class="meta forlabel">For whom?</span><div class="topills" id="topills"></div><input type="hidden" id="to">
 <button class="primary" id="post" style="flex:0 0 auto">Post</button></div>
 <div class="warnbox" id="anywarn" hidden>
@@ -4785,21 +4995,39 @@ $('#list').onclick=async e=>{const t=e.target;
   try{await api(`/api/questions/${t.dataset.answer}/answers`,{body:ta.value,author:me()});ta.value='';draftSet('a'+t.dataset.answer,'');ta.blur();load()}catch(err){alertBox(err.message)}}
  if(t.dataset.status){const[id,s]=t.dataset.status.split(':');try{await api(`/api/questions/${id}/status`,{status:s});load()}catch(err){alertBox(err.message)}}};
 function alertBox(m){$('#perr').textContent=m;$('#newbox').open=true;setTimeout(()=>$('#perr').textContent='',4000)}
-let qFiles=[];
-function showQFiles(){$('#qfilelist').innerHTML=qFiles.length?qFiles.map((f,i)=>`${esc(f.name)} (${size(f.size)}) <a href="#" data-rmq="${i}">remove</a>`).join(' · '):'They\'re attached to the question when you post it. You can also paste a screenshot (Ctrl+V).'}
-function addQFiles(list){for(const f of list){if(f.size>maxMB*1048576){alertBox(`${f.name} is larger than the ${maxMB} MB limit.`);continue}qFiles.push(f)}showQFiles()}
-$('#qfile').onchange=e=>{addQFiles([...e.target.files]);e.target.value=''};
-$('#qfilelist').onclick=e=>{if(e.target.dataset.rmq){e.preventDefault();qFiles.splice(+e.target.dataset.rmq,1);showQFiles()}};
+// Files for a new question (paste, drop, choose files) are uploaded straight away, like an answer's, and an image
+// (or a link for other files) goes into the question where the cursor is; posting attaches them to the question.
+let qFiles=[];   // [{id, name, size, line}]
+const QHINT='They\'re uploaded straight away and shown in the question where your cursor is; you can also paste a screenshot (Ctrl+V).';
+function showQFiles(t){$('#qfilelist').innerHTML=t?esc(t):qFiles.length?qFiles.map((f,i)=>`${esc(f.name)} (${size(f.size)}) <a href="#" data-rmq="${i}">remove</a>`).join(' · '):QHINT}
+async function addQFiles(list){
+ if(!me()){alertBox('Choose who you are next to "I am" first.');return}
+ const ta=$('#qbody'),failed=[];
+ for(const [i,f] of list.entries()){
+  if(f.size>maxMB*1048576){failed.push(`${f.name}: larger than the ${maxMB} MB limit`);continue}
+  showQFiles(list.length>1?`Uploading ${i+1} of ${list.length}: ${f.name}…`:`Uploading ${f.name}…`);
+  try{const d=await upload(f);noteDocs([{id:d.id,title:d.title,filename:d.filename||f.name,mime:d.mime||f.type}]);
+   const name=f.name.replace(/[\[\]]/g,''),line=(/^image\//.test(f.type)?`![${name}](/api/docs/${d.id}/view)`:`[${name}](/api/docs/${d.id}/view)`);
+   const a=ta.selectionStart??ta.value.length,b=ta.selectionEnd??a;
+   ta.setRangeText((a>0&&ta.value[a-1]!=='\n'?'\n':'')+line+'\n',a,b,'end');draftSet('ask-body',ta.value);
+   qFiles.push({id:d.id,name:f.name,size:f.size,line})}catch(err){failed.push(`${f.name}: ${err.message}`)}}
+ showQFiles();ta.focus();
+ if(failed.length)alertBox('Not uploaded: '+failed.join('; '))}
+// the documents a new question shows or links to (also ones from a draft kept over a reload)
+function qDocIds(){const ids=new Set(qFiles.map(f=>f.id));for(const m of $('#qbody').value.matchAll(/\/api\/docs\/(\d+)\/view/g))ids.add(+m[1]);return [...ids]}
+$('#qfile').onchange=e=>{const fs=[...e.target.files];e.target.value='';if(fs.length)addQFiles(fs)};
+$('#qfilelist').onclick=async e=>{if(!e.target.dataset.rmq)return;e.preventDefault();
+ const f=qFiles.splice(+e.target.dataset.rmq,1)[0];if(!f)return;
+ const ta=$('#qbody');ta.value=ta.value.replace(f.line+'\n','').replace(f.line,'');draftSet('ask-body',ta.value);showQFiles();
+ api('/api/docs/'+f.id+'/archive',{archived:true}).catch(()=>{})};
 const qdrop=$('#newbox');
 ['dragenter','dragover'].forEach(ev=>qdrop.addEventListener(ev,e=>{if(e.dataTransfer&&[...e.dataTransfer.types].includes('Files')){e.preventDefault();$('#qdrop').classList.add('over')}}));
 ['dragleave','drop'].forEach(ev=>qdrop.addEventListener(ev,()=>$('#qdrop').classList.remove('over')));
 qdrop.addEventListener('drop',e=>{if(e.dataTransfer&&e.dataTransfer.files.length){e.preventDefault();qdrop.open=true;addQFiles([...e.dataTransfer.files])}});
 async function postQuestion(to){
  const btns=[$('#post'),$('#postany')];btns.forEach(b=>b.disabled=true);
- try{const q=await api('/api/questions',{title:$('#title').value,body:$('#qbody').value,to,author:me()});
+ try{const q=await api('/api/questions',{title:$('#title').value,body:$('#qbody').value,to,author:me(),documents:qDocIds()});
   const failed=[];
-  for(const [i,f] of qFiles.entries()){$('#qfilelist').textContent=`Attaching ${f.name} (${i+1} of ${qFiles.length})…`;
-   try{await upload(f,{question:q.id})}catch(err){failed.push(f.name+': '+err.message)}}
   qFiles=[];showQFiles();
   $('#title').value=$('#qbody').value=$('#to').value='';toTouched=false;draftSet('ask-title','');draftSet('ask-body','');$('#anywarn').hidden=true;renderToPills();
   if(failed.length)alertBox(`Question #${q.id} was posted, but these files weren't attached: ${failed.join('; ')}`);else $('#newbox').open=false;
@@ -4841,6 +5069,31 @@ const drop=$('#drop');
 ['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over')}));
 drop.addEventListener('drop',e=>uploadMany([...e.dataTransfer.files]));
 let verFor=null;
+// ---- the board updating itself from GitHub (started with --self-update): an "update to x.y.z" button by the version
+let UPD=null;
+async function checkUpdate(force){try{UPD=await api('/api/board/update'+(force?'?check=1':''))}catch(e){return}renderUpd()}
+function renderUpd(){const v=document.querySelector('header .ver');if(!v||!UPD||!UPD.enabled)return;let b=$('#updbtn');
+ if(UPD.available){if(!b){b=document.createElement('button');b.id='updbtn';b.type='button';b.className='updbtn';v.after(b);b.onclick=openUpd}
+  b.textContent='update to '+UPD.latest;b.title='A newer version of the board is on GitHub'}
+ else if(b)b.remove()}
+function updBox(html){let d=$('#updlg');if(!d){d=document.createElement('div');d.id='updlg';d.className='updlg';document.body.appendChild(d);
+  d.onclick=e=>{if(e.target===d||e.target.closest('[data-updno]'))d.hidden=true}}
+ d.innerHTML='<div class="updbox" role="dialog" aria-modal="true">'+html+'</div>';d.hidden=false;return d}
+function openUpd(){const u=UPD||{};
+ const notes=(u.notes||[]).length?'<ul>'+u.notes.map(n=>'<li>'+esc(n)+'</li>').join('')+'</ul>':'';
+ const d=updBox(`<h3>Update the board to ${esc(u.latest||'')}?</h3><div>This board is ${esc(u.version||'')}. What's new:</div>${notes||'<div class="meta">(see the repository)</div>'}
+  <div class="meta">The board downloads the new version from GitHub, checks it starts, and restarts with it, which takes a few seconds; the questions, documents and settings are kept, and the old version is kept as qaboard.py.prev.</div>
+  ${u.writable===false?'<div class="bad">This board can\'t replace its own file (it is mounted read-only): redeploy it to update.</div>':''}
+  <div class="btns"><button type="button" data-updno>Not now</button><button type="button" class="primary" id="updgo"${u.writable===false?' disabled':''}>Update now</button></div>`);
+ $('#updgo').onclick=async()=>{$('#updgo').disabled=true;$('#updgo').textContent='Updating…';
+  try{await api('/api/board/update'+(me()?'?who='+encodeURIComponent(me()):''),{})}catch(e){d.querySelector('.btns').insertAdjacentHTML('beforebegin','<div class="bad">'+esc(e.message)+'</div>');return}
+  const from=u.version,t0=Date.now();
+  const poll=async()=>{if(Date.now()-t0>120000){updBox('<h3>The update didn\'t finish</h3><div>The board hasn\'t come back with the new version after two minutes. Look at its log (docker logs).</div><div class="btns"><button type="button" data-updno>Close</button></div>');return}
+   try{const r=await fetch(url('/health'),{cache:'no-store'});if(r.ok){const j=await r.json();if(j.version&&j.version!==from){location.reload();return}}
+    const st=await api('/api/board/update');if(st.update&&st.update.state==='failed'){updBox('<h3>The board wasn\'t updated</h3><div class="bad">'+esc(st.update.msg||'')+'</div><div class="meta">It is still running '+esc(from)+'.</div><div class="btns"><button type="button" data-updno>Close</button></div>');return}}catch(e){}
+   setTimeout(poll,2000)};setTimeout(poll,2000)}}
+setTimeout(()=>checkUpdate(false),1500);setInterval(()=>{if(!document.hidden)checkUpdate(false)},3600*1000);
+
 // ---- deployments: a progress bar under the tabs while one is running (or just finished), full detail on Deploys
 let DEPS=[],depTimer=null,focusDep=null;
 // Finished deployments hidden from the bar under the tabs (per browser): {id: the report time that was hidden}.
@@ -4849,6 +5102,27 @@ let HIDDEN={};try{HIDDEN=JSON.parse(store('qa-dephidden')||'{}')||{}}catch(e){HI
 function hideDep(d){HIDDEN[d.deployment]=d.received;const k=Object.keys(HIDDEN);
  if(k.length>50)for(const x of k.slice(0,k.length-50))delete HIDDEN[x];store('qa-dephidden',JSON.stringify(HIDDEN))}
 function depTime(t){const d=t?new Date(t):null;return d&&!isNaN(d)?d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):''}
+// times: ISO strings (or epoch seconds) -> seconds; durations as 45s, 2m 05s, 1h 04m
+function tsec(t){if(t==null||t==='')return null;const d=typeof t==='number'?new Date(t*1000):new Date(t);return isNaN(d)?null:d.getTime()/1000}
+function fdur(s){s=Math.max(0,Math.round(s));if(s<60)return s+'s';const m=Math.floor(s/60);
+ return m<60?m+'m '+String(s%60).padStart(2,'0')+'s':Math.floor(m/60)+'h '+String(m%60).padStart(2,'0')+'m'}
+function stepDur(x,now){const a=tsec(x.started),b=tsec(x.finished);return a==null?null:(b!=null?b:(x.status==='running'?now:null))-a}
+// elapsed time, and the time left: from the report's eta, else the steps' estimates, else (a guess) the
+// average time of the steps done so far
+function depTimes(d){const now=Date.now()/1000,st=(d.steps||[]).filter(x=>x&&typeof x==='object');
+ const start=tsec(d.started),fin=d.status==='done'||d.status==='failed'?(tsec(d.finished)||d.received):null;
+ const out={start,elapsed:start!=null?(fin||now)-start:null,finished:fin,left:null,eta:null,guess:false};
+ if(fin)return out;
+ const todo=st.filter(x=>x.status!=='done'&&x.status!=='failed');
+ if(tsec(d.eta)!=null){out.eta=tsec(d.eta);out.left=out.eta-now;return out}
+ if(todo.length&&todo.every(x=>typeof x.estimate==='number')){
+  out.left=todo.reduce((n,x)=>n+Math.max(0,x.estimate-(x.status==='running'?(stepDur(x,now)||0):0)),0)}
+ else{const durs=st.filter(x=>x.status==='done').map(x=>stepDur(x,now)).filter(v=>v!=null&&v>=0);
+  if(durs.length&&todo.length){const avg=durs.reduce((a,b)=>a+b,0)/durs.length;out.guess=true;
+   out.left=todo.reduce((n,x)=>n+(typeof x.estimate==='number'?x.estimate:avg)-(x.status==='running'?Math.min(stepDur(x,now)||0,typeof x.estimate==='number'?x.estimate:avg):0),0)}}
+ if(out.left!=null)out.eta=now+out.left;
+ return out}
+function depLeft(t){if(t.left==null)return '';return t.left<0?'overdue by '+fdur(-t.left):(t.guess?'about ':'~')+fdur(t.left)+' left'}
 function depPct(d){
  if(typeof d.progress==='number')return Math.round(d.progress*100);
  const st=(d.steps||[]).filter(x=>x&&typeof x==='object');if(!st.length)return d.status==='done'?100:0;
@@ -4866,7 +5140,7 @@ function renderDepStrip(){const act=DEPS.filter(d=>depActive(d)&&HIDDEN[d.deploy
  box.hidden=!act.length;
  box.innerHTML=act.map(d=>{const p=depPct(d);return `<button class="deprow s-${esc(d.status)}${d.waitingFor?' needs':''}" data-dep="${esc(d.deployment)}" title="Open on the Deploys tab">
   <span class="depname">${esc(d.target||d.deployment)}</span><span class="depbar"><i style="width:${p}%"></i></span>
-  <span class="deppct">${p}%</span><span class="depstep">${esc(depCur(d)||(d.status==='done'?'finished '+depTime(d.updated):''))}</span>
+  <span class="deppct">${p}%</span><span class="depstep">${esc((()=>{const t=depTimes(d),l=depLeft(t);return (depCur(d)||(d.status==='done'?'finished '+depTime(d.finished||d.updated)+(t.elapsed!=null?' · took '+fdur(t.elapsed):''):''))+(l?' · '+l:'')})())}</span>
   ${d.status==='done'||d.status==='failed'?`<span class="dstat ${depState(d)} hide" data-hide="${esc(d.deployment)}" title="Hide from the bar (still on the Deploys tab)">${esc(depLabel(d))} ✕</span>`
     :`<span class="dstat ${depState(d)}">${esc(depLabel(d))}</span>`}</button>`}).join('')}
 const ICON={done:'✓',running:'●',failed:'✕',waiting:'○'};
@@ -4874,14 +5148,19 @@ function depCard(d){const p=depPct(d),st=(d.steps||[]).filter(x=>x&&typeof x==='
  const qs=(d.questions||[]).map(n=>`<a href="#" data-goq="${+n}">#${+n}</a>`).join(' ');
  return `<div class="card depcard s-${esc(d.status)}${wf?' needs':''}${d.deployment===focusDep?' focus':''}" id="dep-${esc(d.deployment)}">
  <h3>${esc(d.target||'Deployment')} <span class="dstat ${depState(d)}">${esc(depLabel(d))}</span><span class="meta" style="font-weight:400">${esc(d.deployment)}</span></h3>
- <div class="depmeta">${d.started?`<span>started ${esc(depTime(d.started))}</span>`:''}<span>updated ${ago(d.received)}</span>
+ <div class="depmeta">${(()=>{const t=depTimes(d),l=depLeft(t);return (d.started?`<span>started ${esc(depTime(d.started))}</span>`:'')
+   +(t.elapsed!=null?`<span>${t.finished?'took':'running for'} ${esc(fdur(t.elapsed))}</span>`:'')
+   +(t.eta!=null?`<span class="depeta${t.left<0?' late':''}" title="${esc(t.guess?'A guess from the average time of the steps done so far':d.eta?'The ETA in the report':'From the steps\' estimates')}">ETA ${esc(depTime(t.eta*1000))} · ${esc(l)}</span>`:'')})()}<span>updated ${ago(d.received)}</span>
   ${d.commit?`<span>commit <code>${esc(d.commit)}</code></span>`:''}${(d.branches||[]).length?`<span>${(d.branches||[]).map(b=>`<code>${esc(b)}</code>`).join(' ')}</span>`:''}
   ${qs?`<span>questions ${qs}</span>`:''}</div>
  <div class="depbar"><i style="width:${p}%"></i></div>
  <ol class="depsteps">${st.map(x=>{const s=['done','running','failed','waiting'].includes(x.status)?x.status:'waiting';
   const sg=(x.stages||[]).filter(g=>g&&typeof g==='object');
   return `<li class="${s}"><span class="ic">${ICON[s]}</span><span>${esc(x.label||x.id||'')}${x.detail?` <span class="meta">· ${linkDocs(esc(String(x.detail)))}</span>`:''}</span>
-   <span class="when">${x.finished?esc(depTime(x.finished)):''}</span>
+   <span class="when">${esc((()=>{const now=Date.now()/1000,du=stepDur(x,now),est=typeof x.estimate==='number'?x.estimate:null;
+     if(s==='done'||s==='failed')return (x.finished?depTime(x.finished):'')+(du!=null?' · '+fdur(du):'')+(est!=null&&du!=null?' (est. '+fdur(est)+')':'');
+     if(s==='running')return (x.started?'since '+depTime(x.started):'')+(du!=null?' · '+fdur(du):'')+(est!=null?' of ~'+fdur(est):'');
+     return est!=null?'~'+fdur(est):''})())}</span>
    ${sg.length?`<div class="stages">${sg.map(g=>`<span class="stage ${['done','running','failed'].includes(g.status)?g.status:'waiting'}">${esc(g.name||'')}</span>`).join('')}</div>`:''}</li>`}).join('')}</ol>
  ${wf?`<div class="depwait"><b>Needs you:</b> ${esc(wf.reason||'')}${wf.url&&/^https?:\/\//.test(wf.url)?` · <a href="${esc(wf.url)}" target="_blank" rel="noopener noreferrer">Open link</a>`:''}${wf.code?` · code <code>${esc(wf.code)}</code>`:''}</div>`:''}
  ${er?`<div class="deperr"><b>Failed${er.step?' at '+esc(er.step):''}:</b> ${esc(er.message||'')}${er.log?` · log: ${linkDocs(esc(String(er.log)))}`:''}</div>`:''}
@@ -4927,7 +5206,8 @@ document.addEventListener('click',async e=>{   // any link to a document's view:
  e.preventDefault();
  if(isMd(await docMeta(id)))openMd(id,v);else window.open(a.href,'_blank','noopener')});
 // Paste an image (e.g. a screenshot) from the clipboard:
-//  - in the Ask form: it's attached to the question when you post it
+//  - in the Ask form: it's uploaded straight away and ![…](/api/docs/ID/view) is put in the question, so it
+//    shows there; posting attaches it to the question
 //  - in an open question (its answer box): it's uploaded and attached to that question straight away,
 //    and ![…](/api/docs/ID/view) is put in the answer box so it shows in your answer
 //  - on the Documents tab: it's stored as a new document
@@ -5026,6 +5306,10 @@ def main():
     s = sub.add_parser("serve", help="run the board")
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=8787)
+    s.add_argument("--self-update", action="store_true", help="let the board update itself from GitHub (an Update "
+                   "button when there's a newer version; qaboard.py must be writable and something must restart "
+                   "the board when it exits, e.g. docker --restart unless-stopped)")
+    s.add_argument("--update-url", default=None, help="where the newest qaboard.py is (default: the GitHub repository)")
     s.add_argument("--db", default="qaboard.db")
     s.add_argument("--key", default=None, help="optional shared secret; clients add ?key=... or X-QA-Key")
     s.add_argument("--max-doc-mb", type=float, default=20, help="largest document accepted (default 20)")

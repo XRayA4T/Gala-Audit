@@ -53,16 +53,14 @@ sub('''            if path == "/health":
                 return self._json(200, g.update_status(q.get("fetch") == "1") if g else {"git": False})
             if path == "/api/gala/file":
                 return self._gala_file(q)''')
-sub('''        store = self.server.store
-        try:
-            if path == "/api/live":''', '''        store = self.server.store
-        try:
+sub('''            if path == "/api/board/update":
+                return self._json(200, {"ok": True, "update": self.server.updater.start(self._who(q))})''', '''            if path == "/api/board/update":   # the board's own updater is off in the portal (it updates with git)
+                return self._json(200, {"ok": True, "update": self.server.updater.start(self._who(q))})
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
             if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck",
                         "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update"):
-                return self._gala_post(path, q)
-            if path == "/api/live":''')
+                return self._gala_post(path, q)''')
 # the web terminal, through the portal (before the key check: it takes the key or its own cookie)
 sub('''        if path.startswith("/brand/"):   # the board's look: stylesheet, fonts, logo (no key needed)
             return self._brand_file(path[len("/brand/"):])
