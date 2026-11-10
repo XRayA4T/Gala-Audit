@@ -134,3 +134,5 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .st.transcribed{border-color:#0e7490;color:#0e7490}
 .st.computing{border-color:var(--accent);background:var(--accent);color:#fff}
 .gdlg-box p{white-space:pre-line}
+/* the portal updates itself from its Restart tab (git), not the QA board's own updater */
+#set-update{display:none}

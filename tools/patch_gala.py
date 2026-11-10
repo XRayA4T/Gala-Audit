@@ -62,13 +62,11 @@ sub('''            if path == "/api/board/update":
                         "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update"):
                 return self._gala_post(path, q)''')
 # the web terminal, through the portal (before the key check: it takes the key or its own cookie)
-sub('''        if path.startswith("/brand/"):   # the board's look: stylesheet, fonts, logo (no key needed)
-            return self._brand_file(path[len("/brand/"):])
-        if not self._authorized(q):''', '''        if path.startswith("/brand/"):   # the board's look: stylesheet, fonts, logo (no key needed)
-            return self._brand_file(path[len("/brand/"):])
+sub('''        if path == "/brand-logo":   # the logo set on the Settings tab (no key needed, like the favicon)
+            return self._logo()''', '''        if path == "/brand-logo":   # the logo set on the Settings tab (no key needed, like the favicon)
+            return self._logo()
         if path.startswith("/terminal/"):
-            return self._terminal()
-        if not self._authorized(q):''')
+            return self._terminal()''')
 sub("    if terminal_url and not re.fullmatch(", '    if terminal_url and terminal_url != "/terminal/" and not re.fullmatch(')
 # quieter log: the page and the watcher poll every few seconds
 sub('''    def log_message(self, fmt, *args):
@@ -88,7 +86,7 @@ sub("    srv.page = render_page(srv.brand, srv.accent, args.terminal_url)",
     "    srv.term_ports = {k: v for k, v in ((\"rw\", args.term_rw_port), (\"ro\", args.term_ro_port)) if v}\n"
     "    srv.admin_key = args.admin_key or \"\"\n"
     "    if srv.term_ports:\n"
-    "        args.terminal_url = \"/terminal/\"\n"
+    "        args.terminal_url = srv.terminal_url = \"/terminal/\"\n"
     "    srv.gala = Gala(args.gala_data, args.inbox, srv.store) if args.gala_data else None\n"
     "    if srv.gala:\n"
     "        threading.Thread(target=srv.gala.run, daemon=True).start()\n"
@@ -112,7 +110,7 @@ sub('<span>Q&amp;A Board <small class="ver">', '<span>Gala Audit Portal <small c
 sub('<nav class="views" id="views"><button data-v="questions">Questions</button>',
     '<nav class="views" id="views"><button data-v="gala">Gala</button><button data-v="checklist">Checklist</button>'
     '<button data-v="questions">Questions</button>')
-sub('<button data-v="users">Users</button></nav>', '<button data-v="users">Users</button><button data-v="restart">Restart</button></nav>')
+sub('<button data-v="users">Settings</button></nav>', '<button data-v="users">Settings</button><button data-v="restart">Restart</button></nav>')
 sub('<section id="v-questions">', piece("section.html") + '<section id="v-questions">')
 sub("\n.drop{border:2px dashed", "\n" + piece("gala.css") + "\n.drop{border:2px dashed")
 sub("let view=['#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'questions');",

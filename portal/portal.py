@@ -148,6 +148,10 @@ class Store:
                 name TEXT PRIMARY KEY,
                 kind TEXT NOT NULL DEFAULT 'person',
                 created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS settings(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS document_versions(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 doc_id INTEGER NOT NULL REFERENCES documents(id),
@@ -251,6 +255,24 @@ class Store:
             if cur.rowcount == 0:
                 raise KeyError("no question #%s" % qid)
             return self.get(qid)
+
+    # -- settings made on the board's Settings tab (branding); they win over the command line's
+    SETTING_KEYS = ("name", "accent", "css", "logo")
+
+    def settings(self):
+        with self.lock:
+            return {r["key"]: r["value"] for r in self.db.execute("SELECT key, value FROM settings")}
+
+    def set_setting(self, key, value):
+        if key not in self.SETTING_KEYS:
+            raise ValueError("unknown setting %r" % key)
+        with self.lock:
+            if value is None or value == "":
+                self.db.execute("DELETE FROM settings WHERE key=?", (key,))
+            else:
+                self.db.execute("INSERT OR REPLACE INTO settings(key, value, updated) VALUES(?,?,?)",
+                                (key, value, time.time()))
+            self.db.commit()
 
     # -- deployments: progress reports (the whole state each time; a report replaces the earlier one)
     def put_deployment(self, dep_id, state):
@@ -3084,10 +3106,45 @@ class Handler(BaseHTTPRequestHandler):
 
     def _page(self):
         page = self.server.page
+        extra = ""
         if os.path.isfile(os.path.join(self._brand_dir(), "brand.css")):
             v = int(os.path.getmtime(os.path.join(self._brand_dir(), "brand.css")))
-            page = page.replace("</style>", '</style>\n<link rel="stylesheet" href="/brand/brand.css?v=%d">' % v, 1)
+            extra += '\n<link rel="stylesheet" href="/brand/brand.css?v=%d">' % v
+        st = self.server.store.settings()
+        if st.get("css"):   # the Settings tab's own CSS, after brand.css so it wins
+            extra += '\n<style id="settings-css">%s</style>' % re.sub(r"(?i)</style", "<\\/style", st["css"])
+        if extra:
+            page = page.replace("</style>", "</style>" + extra, 1)
+        if st.get("logo"):
+            page = page.replace('<div class="brand"><img src="/favicon.svg" alt="" width="34" height="34">',
+                                '<div class="brand"><img src="/brand-logo?v=%d" alt="" height="34" class="setlogo">'
+                                % (zlib_crc(st["logo"]) & 0xffff), 1)
         return page
+
+    def _logo(self):
+        st = self.server.store.settings()
+        try:
+            d = json.loads(st.get("logo") or "{}")
+            data = base64.b64decode(d.get("data") or "")
+        except (ValueError, TypeError):
+            data = b""
+        if not data:
+            return self._favicon()
+        return self._send(200, data, d.get("mime") or "image/png", {"Cache-Control": "public, max-age=3600",
+                                                                     "X-Content-Type-Options": "nosniff"})
+
+    def _settings_out(self):
+        st, srv = self.server.store.settings(), self.server
+        return {"name": st.get("name") or "", "accent": st.get("accent") or "", "css": st.get("css") or "",
+                "logo": bool(st.get("logo")), "defaults": {"name": srv.cli_brand, "accent": srv.cli_accent},
+                "effective": {"name": srv.brand, "accent": srv.accent},
+                "brandCss": os.path.isfile(os.path.join(self._brand_dir(), "brand.css")), "version": VERSION}
+
+    def _apply_settings(self):
+        st, srv = self.server.store.settings(), self.server
+        srv.brand = st.get("name") or srv.cli_brand
+        srv.accent = st.get("accent") or srv.cli_accent
+        srv.page = render_page(srv.brand, srv.accent, srv.terminal_url)
 
     def _send_file(self, path, ver, inline, q):
         mime = ver["mime"]
@@ -3353,6 +3410,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._favicon()
         if path.startswith("/brand/"):   # the board's look: stylesheet, fonts, logo (no key needed)
             return self._brand_file(path[len("/brand/"):])
+        if path == "/brand-logo":   # the logo set on the Settings tab (no key needed, like the favicon)
+            return self._logo()
         if path.startswith("/terminal/"):
             return self._terminal()
         if not self._authorized(q):
@@ -3380,6 +3439,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._gala_file(q)
             if path == "/api/board/update":
                 return self._json(200, self.server.updater.status(q.get("check") == "1"))
+            if path == "/api/settings":
+                return self._json(200, self._settings_out())
             if path == "/api/questions":
                 return self._json(200, {"questions": store.list(q.get("status", "unresolved"), q.get("to"), q.get("limit", 100))})
             if path.startswith("/api/questions/"):
@@ -3437,6 +3498,39 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck",
                         "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update"):
                 return self._gala_post(path, q)
+            if path == "/api/settings/logo":   # the image itself as the body; empty body removes it
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > 512 * 1024:
+                    return self._json(413, {"error": "the logo must be 512 KB or less"})
+                data = self.rfile.read(n) if n else b""
+                mime = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if data and mime not in ("image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"):
+                    return self._json(400, {"error": "the logo must be a PNG, JPEG, GIF, WebP or SVG image"})
+                store.set_setting("logo", json.dumps({"mime": mime, "data": base64.b64encode(data).decode()}) if data else None)
+                self._apply_settings()
+                return self._json(200, self._settings_out())
+            if path == "/api/settings":
+                d = self._body(256 * 1024)
+                for k in d.get("reset") or []:
+                    if k in Store.SETTING_KEYS:
+                        store.set_setting(k, None)
+                if "name" in d:
+                    name = re.sub(r"\s+", " ", str(d.get("name") or "")).strip()
+                    if len(name) > 60:
+                        raise ValueError("the name can be at most 60 characters")
+                    store.set_setting("name", name or None)
+                if "accent" in d:
+                    acc = str(d.get("accent") or "").strip()
+                    if acc and not re.fullmatch(r"#[0-9a-fA-F]{6}", acc):
+                        raise ValueError("the accent colour must look like #cd2529")
+                    store.set_setting("accent", acc.lower() or None)
+                if "css" in d:
+                    css = str(d.get("css") or "")
+                    if len(css) > 64 * 1024:
+                        raise ValueError("the CSS can be at most 64 KB")
+                    store.set_setting("css", css.strip() or None)
+                self._apply_settings()
+                return self._json(200, self._settings_out())
             if path == "/api/live":   # console snapshot from the board watcher
                 d = self._body(2 * 1024 * 1024)
                 text = str(d.get("text") or "")[-400000:]
@@ -3530,6 +3624,11 @@ def lighten(hex_colour, amount=0.45):
     r, g, b = (int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
     r, g, b = (round(c + (255 - c) * amount) for c in (r, g, b))
     return "#%02x%02x%02x" % (r, g, b)
+
+
+def zlib_crc(text):
+    import zlib
+    return zlib.crc32(text.encode("utf-8"))
 
 
 def render_page(brand, accent, terminal_url=""):
@@ -3686,11 +3785,14 @@ def serve(args):
     srv.brand = args.name
     srv.accent = args.accent if re.fullmatch(r"#[0-9a-fA-F]{6}", args.accent or "") else "#3949ab"
     srv.updater = Updater(os.path.abspath(__file__), args.update_url or UPDATE_URL, UPDATE_REPO, args.self_update)
+    srv.cli_brand, srv.cli_accent, srv.terminal_url = srv.brand, srv.accent, args.terminal_url
+    st = srv.store.settings()   # name and colour changed on the Settings tab win over --name and --accent
+    srv.brand, srv.accent = st.get("name") or srv.brand, st.get("accent") or srv.accent
     srv.brand_dir = os.path.abspath(args.brand_dir) if args.brand_dir else None
     srv.term_ports = {k: v for k, v in (("rw", args.term_rw_port), ("ro", args.term_ro_port)) if v}
     srv.admin_key = args.admin_key or ""
     if srv.term_ports:
-        args.terminal_url = "/terminal/"
+        args.terminal_url = srv.terminal_url = "/terminal/"
     srv.gala = Gala(args.gala_data, args.inbox, srv.store) if args.gala_data else None
     if srv.gala:
         threading.Thread(target=srv.gala.run, daemon=True).start()
@@ -3762,6 +3864,14 @@ h1 span{display:block;font-size:15.6px;font-weight:500;color:var(--muted);letter
 .brand{display:flex;gap:10px;align-items:center}
 .brand img{border-radius:8px;flex:0 0 auto}
 h1 .ver{font-size:13.2px;font-weight:500;letter-spacing:0;text-transform:none;opacity:.75;margin-left:4px}
+.setcard h3{margin:0 0 6px}.sethead{margin:18px 0 8px}
+.setgrid{display:grid;grid-template-columns:150px 1fr;gap:10px 14px;align-items:center;margin-top:12px}
+.setgrid>label{color:var(--muted)}.setgrid textarea{min-height:120px;font:13px/1.4 ui-monospace,Menlo,monospace}
+.setacc{display:flex;gap:8px;align-items:center}.setacc input[type=color]{width:44px;height:34px;padding:2px;flex:0 0 auto}.setacc #set-accent{max-width:140px}
+.setlogo-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}#set-logoimg{height:40px;max-width:160px;object-fit:contain;border:1px solid var(--line);border-radius:6px;padding:2px;background:var(--card)}
+.setbtns{justify-content:flex-end;align-items:center;gap:8px}.setbtns button{flex:0 0 auto}.setbtns .meta{margin-right:auto}
+.brand img.setlogo{width:auto;max-width:140px;object-fit:contain}
+@media (max-width:640px){.setgrid{grid-template-columns:1fr}}
 .updbtn{font:600 12px/1 system-ui,sans-serif;letter-spacing:0;text-transform:none;margin-left:6px;padding:4px 9px;border-radius:99px;
  border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer;vertical-align:2px}
 .updlg{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.45);display:grid;place-items:center;padding:16px}
@@ -4094,6 +4204,8 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .st.transcribed{border-color:#0e7490;color:#0e7490}
 .st.computing{border-color:var(--accent);background:var(--accent);color:#fff}
 .gdlg-box p{white-space:pre-line}
+/* the portal updates itself from its Restart tab (git), not the QA board's own updater */
+#set-update{display:none}
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -4111,7 +4223,7 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 <header><div class="brand"><img src="/favicon.svg" alt="" width="34" height="34"><h1>{BRAND_HTML}<span>Gala Audit Portal <small class="ver">v{VERSION}</small></span></h1></div>
 <button class="mini" id="mini" hidden title="Claude's console - open the Live view" aria-label="Open the Live view"><pre id="minipre"></pre><span class="led"></span></button>
 <label class="me">I am <select id="me"><option value="">choose…</option></select></label></header>
-<nav class="views" id="views"><button data-v="gala">Gala</button><button data-v="checklist">Checklist</button><button data-v="questions">Questions</button><button data-v="docs">Documents</button><button data-v="live">Live</button><button data-v="deploys">Deploys</button><button data-v="users">Users</button><button data-v="restart">Restart</button></nav>
+<nav class="views" id="views"><button data-v="gala">Gala</button><button data-v="checklist">Checklist</button><button data-v="questions">Questions</button><button data-v="docs">Documents</button><button data-v="live">Live</button><button data-v="deploys">Deploys</button><button data-v="users">Settings</button><button data-v="restart">Restart</button></nav>
 <div class="deps" id="deps" hidden></div>
 </div>
 
@@ -4178,11 +4290,24 @@ made here and the activity log. Linked inbox folders (the Gen7 or scanner shares
 <div id="deplist"><div class="empty">No deployments yet.</div></div>
 </section>
 <section id="v-users" hidden>
+<div class="card setcard" id="set-brand"><h3>Branding</h3>
+<div class="meta">How this board looks to everyone. Saved on the board, so redeploying keeps it; empty fields fall back to how the board was started.</div>
+<div class="setgrid">
+ <label for="set-name">Board name</label><input id="set-name" maxlength="60" autocomplete="off">
+ <label for="set-accent">Accent colour</label><span class="setacc"><input type="color" id="set-accentpick"><input id="set-accent" placeholder="#3949ab" maxlength="7" autocomplete="off"></span>
+ <label>Logo</label><span class="setlogo-row"><img id="set-logoimg" alt="" hidden><label class="lnk">upload an image<input type="file" id="set-logofile" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml" hidden></label><a href="#" id="set-logorm" hidden>remove</a><span class="meta">PNG, JPEG, GIF, WebP or SVG, up to 512 KB; shown in the header</span></span>
+ <label for="set-css">Your own CSS</label><textarea id="set-css" spellcheck="false" placeholder=":root{--accent:#cd2529}  /* the board's variables: --bg --card --fg --muted --line --accent --open --ans --res --field --drop */"></textarea>
+</div>
+<div class="row setbtns"><span class="meta" id="set-msg"></span><button type="button" id="set-reset">Reset to how it was started</button><button type="button" class="primary" id="set-save">Save</button></div>
+</div>
+<h3 class="sethead">Users</h3>
 <div class="card"><div class="row" style="margin-top:0"><input id="newuser" placeholder="Name, e.g. alice or bob-claude" autocomplete="off">
 <select id="newkind" style="flex:0 0 130px"><option value="person">Person</option><option value="claude">Claude</option></select>
 <button class="primary" id="adduser" style="flex:0 0 auto">Add user</button></div>
 <div class="meta" id="usermsg" style="margin-top:6px">People choose themselves next to "I am". Claudes are listed first under "For whom?".</div></div>
 <div id="userlist"></div>
+<div class="card setcard" id="set-update"><h3>Updates</h3><div id="set-upinfo" class="meta">Checking…</div>
+<div class="row setbtns"><button type="button" id="set-check">Check for updates</button><button type="button" class="primary" id="set-upgo" hidden>Update now</button></div></div>
 </section>
 
 <section id="v-live" hidden>
@@ -4689,12 +4814,13 @@ async function galaTermClick(){if(TERM_DEFAULT!=='/terminal/')return changeTermU
  galaTermBar();$('#termnew').href=termUrl();if(!$('#termwin').hidden)$('#termframe').src=termUrl()}
 
 // ---- views
+if(location.hash==='#settings')location.hash='#users';
 let view=['#gala','#checklist','#restart','#questions','#docs','#live','#users','#deploys'].includes(location.hash)?location.hash.slice(1):(store('qa-view')||'gala');
 // ?me=NAME (from start-portal.sh) picks "I am" the first time
 {const m=new URLSearchParams(location.search).get('me');if(m&&!store('qa-me'))store('qa-me',m)}
 function showView(v){view=v;store('qa-view',v);if(v!=='deploys')focusDep=null;
  document.querySelectorAll('#views button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
- $('#v-gala').hidden=v!=='gala';$('#v-checklist').hidden=v!=='checklist';$('#v-restart').hidden=v!=='restart';$('#v-questions').hidden=v!=='questions';$('#v-docs').hidden=v!=='docs';$('#v-live').hidden=v!=='live';$('#v-users').hidden=v!=='users';$('#v-deploys').hidden=v!=='deploys';refresh()}
+ $('#v-gala').hidden=v!=='gala';$('#v-checklist').hidden=v!=='checklist';$('#v-restart').hidden=v!=='restart';$('#v-questions').hidden=v!=='questions';$('#v-docs').hidden=v!=='docs';$('#v-live').hidden=v!=='live';$('#v-users').hidden=v!=='users';$('#v-deploys').hidden=v!=='deploys';if(v==='users'){loadSettings();if(!UPD)checkUpdate(false)}refresh()}
 $('#views').onclick=e=>{const b=e.target.closest('button');if(b&&b.dataset.v)showView(b.dataset.v)};
 $('#mini').onclick=()=>{showView('live');window.scrollTo(0,0)};
 function refresh(){loadUsers();(view==='gala'||view==='checklist'||view==='restart')?loadGala():view==='docs'?loadDocs():view==='live'?loadLive():view==='users'?null:view==='deploys'?loadDeps():load()}
@@ -4781,7 +4907,7 @@ function renderToPills(){
  const cur=$('#to').value,box=$('#topills');
  box.innerHTML=USERS.map(u=>`<button type="button" class="topill${u.name===cur?' on':''}" data-to="${esc(u.name)}" aria-pressed="${u.name===cur}">${isClaude(u)?'<span class="cl">Claude</span>':''}${esc(u.name)}</button>`).join('')
   +`<button type="button" class="topill any${cur==='anyone'?' on':''}" data-to="anyone" aria-pressed="${cur==='anyone'}">anyone</button>`
-  +(USERS.length?'':'<span class="meta">Add people in the Users tab.</span>')}
+  +(USERS.length?'':'<span class="meta">Add people on the Settings tab.</span>')}
 $('#topills').onclick=e=>{const b=e.target.closest('button');if(!b)return;toTouched=true;
  $('#to').value=b.dataset.to===$('#to').value?'':b.dataset.to;$('#anywarn').hidden=true;renderToPills()};
 function renderUsers(){
@@ -5072,7 +5198,7 @@ let verFor=null;
 // ---- the board updating itself from GitHub (started with --self-update): an "update to x.y.z" button by the version
 let UPD=null;
 async function checkUpdate(force){try{UPD=await api('/api/board/update'+(force?'?check=1':''))}catch(e){return}renderUpd()}
-function renderUpd(){const v=document.querySelector('header .ver');if(!v||!UPD||!UPD.enabled)return;let b=$('#updbtn');
+function renderUpd(){if(typeof renderSetUpdate==='function')renderSetUpdate();const v=document.querySelector('header .ver');if(!v||!UPD||!UPD.enabled)return;let b=$('#updbtn');
  if(UPD.available){if(!b){b=document.createElement('button');b.id='updbtn';b.type='button';b.className='updbtn';v.after(b);b.onclick=openUpd}
   b.textContent='update to '+UPD.latest;b.title='A newer version of the board is on GitHub'}
  else if(b)b.remove()}
@@ -5093,6 +5219,49 @@ function openUpd(){const u=UPD||{};
     const st=await api('/api/board/update');if(st.update&&st.update.state==='failed'){updBox('<h3>The board wasn\'t updated</h3><div class="bad">'+esc(st.update.msg||'')+'</div><div class="meta">It is still running '+esc(from)+'.</div><div class="btns"><button type="button" data-updno>Close</button></div>');return}}catch(e){}
    setTimeout(poll,2000)};setTimeout(poll,2000)}}
 setTimeout(()=>checkUpdate(false),1500);setInterval(()=>{if(!document.hidden)checkUpdate(false)},3600*1000);
+
+// ---- Settings tab: branding (saved on the board) and updates
+let SET=null;
+async function loadSettings(){try{SET=await api('/api/settings')}catch(e){return}renderSettings();renderSetUpdate()}
+function renderSettings(){if(!SET)return;const a=document.activeElement;
+ const keep=a&&a.closest&&a.closest('#set-brand')&&$('#set-brand').dataset.dirty;   // don't overwrite what's being typed
+ if(!keep){$('#set-name').value=SET.name;$('#set-name').placeholder=SET.defaults.name||'';
+  $('#set-accent').value=SET.accent;$('#set-accent').placeholder=SET.defaults.accent||'';
+  $('#set-accentpick').value=SET.accent||SET.defaults.accent||'#3949ab';$('#set-css').value=SET.css;delete $('#set-brand').dataset.dirty}
+ $('#set-logoimg').hidden=!SET.logo;$('#set-logorm').hidden=!SET.logo;if(SET.logo)$('#set-logoimg').src='/brand-logo?t='+Date.now();
+ if(SET.brandCss&&!$('#set-brand .brandnote'))$('#set-brand .meta').insertAdjacentHTML('afterend','<div class="meta brandnote">This board also has a brand folder (brand.css), which can change the look too.</div>')}
+function setMsg(t,bad){const m=$('#set-msg');m.textContent=t;m.style.color=bad?'#e5484d':'';if(t&&!bad)setTimeout(()=>{if(m.textContent===t)m.textContent=''},4000)}
+$('#set-brand').addEventListener('input',e=>{$('#set-brand').dataset.dirty='1';
+ if(e.target.id==='set-accentpick')$('#set-accent').value=e.target.value;
+ if(e.target.id==='set-accent'&&/^#[0-9a-fA-F]{6}$/.test(e.target.value))$('#set-accentpick').value=e.target.value;
+ if(e.target.id==='set-accentpick'||e.target.id==='set-accent'){const v=$('#set-accent').value;if(/^#[0-9a-fA-F]{6}$/.test(v))document.documentElement.style.setProperty('--accent',v)}});
+function afterBrand(){setTimeout(()=>location.reload(),600)}
+$('#set-save').onclick=async()=>{const acc=$('#set-accent').value.trim();
+ if(acc&&!/^#[0-9a-fA-F]{6}$/.test(acc))return setMsg('The accent colour must look like #cd2529.',true);
+ try{SET=await api('/api/settings',{name:$('#set-name').value,accent:acc,css:$('#set-css').value});delete $('#set-brand').dataset.dirty;setMsg('Saved. Reloading to show it…');afterBrand()}
+ catch(e){setMsg(e.message,true)}};
+$('#set-reset').onclick=()=>{updBox(`<h3>Reset the branding?</h3><div>The name, colour, logo and CSS set here are cleared, and the board looks the way it was started (${esc(SET&&SET.defaults.name||'')}, ${esc(SET&&SET.defaults.accent||'')}).</div>
+  <div class="btns"><button type="button" data-updno>Cancel</button><button type="button" class="primary" id="set-resetgo">Reset</button></div>`);
+ $('#set-resetgo').onclick=async()=>{$('#updlg').hidden=true;
+  try{SET=await api('/api/settings',{reset:['name','accent','css','logo']});setMsg('Reset. Reloading…');afterBrand()}catch(e){setMsg(e.message,true)}}};
+$('#set-logofile').onchange=async e=>{const f=e.target.files[0];e.target.value='';if(!f)return;
+ if(f.size>512*1024)return setMsg('The logo must be 512 KB or less.',true);
+ try{const r=await fetch(url('/api/settings/logo'),{method:'POST',headers:{'Content-Type':f.type},body:f});const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(j.error||r.status);SET=j;setMsg('Logo saved. Reloading…');afterBrand()}catch(err){setMsg(err.message,true)}};
+$('#set-logorm').onclick=async e=>{e.preventDefault();
+ try{const r=await fetch(url('/api/settings/logo'),{method:'POST',headers:{'Content-Type':'image/png'},body:''});SET=await r.json();setMsg('Logo removed. Reloading…');afterBrand()}catch(err){setMsg(err.message,true)}};
+function renderSetUpdate(){const u=UPD,box=$('#set-upinfo');if(!box)return;
+ if(!u){box.textContent='Checking…';return}
+ let h='This board is <b>v'+esc(u.version||'')+'</b>.';
+ if(!u.enabled)h+=' It doesn\'t update itself (started without <code>--self-update</code>): update it the way it was installed, e.g. by deploying it again.';
+ else{if(u.error)h+=' <span style="color:#e5484d">Couldn\'t reach GitHub: '+esc(u.error)+'</span>';
+  else if(u.available)h+=' <b>Version '+esc(u.latest)+' is available.</b>'+((u.notes||[]).length?'<ul>'+u.notes.map(n=>'<li>'+esc(n)+'</li>').join('')+'</ul>':'');
+  else if(u.latest)h+=' It is up to date (GitHub has v'+esc(u.latest)+').';
+  if(u.checked)h+=' <span class="meta">Checked '+esc(ago(u.checked))+'.</span>';
+  if(u.writable===false)h+='<div style="color:#e5484d">It can\'t replace its own file (mounted read-only): redeploy it to update.</div>'}
+ box.innerHTML=h;$('#set-upgo').hidden=!(u.enabled&&u.available&&u.writable!==false);$('#set-check').hidden=!u.enabled}
+$('#set-check').onclick=async()=>{$('#set-upinfo').textContent='Checking GitHub…';await checkUpdate(true);renderSetUpdate()};
+$('#set-upgo').onclick=()=>openUpd();
 
 // ---- deployments: a progress bar under the tabs while one is running (or just finished), full detail on Deploys
 let DEPS=[],depTimer=null,focusDep=null;
