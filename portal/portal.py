@@ -314,6 +314,12 @@ class Store:
             out.append(d)
         return out
 
+    def answer_info(self, aid):
+        row = self.db.execute("SELECT id, question_id, author, created FROM answers WHERE id=?", (aid,)).fetchone()
+        if not row:
+            raise KeyError("no answer %s" % aid)
+        return dict(row)
+
     def get(self, qid):
         row = self.db.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
         if not row:
@@ -2917,6 +2923,8 @@ INSTRUCTIONS = (
     "Your identity on the board is set by the connection. Use check_inbox at the start of work. "
     "When you need a decision, fact or context only a teammate has, post_question instead of guessing. "
     "Answer questions addressed to you with concrete, verified information. "
+    "Refer to questions as 'question 902' (or #902) and to answers as 'answer 872': the board turns them into links "
+    "that open them. "
     "Put documents the team should be able to read (specs, reports, notes, screenshots) in the document store "
     "with upload_document, and link them from questions or answers as 'doc <id>'. "
     "When you run a deployment or another long multi-step job, report it with deployment_progress (the whole "
@@ -3522,6 +3530,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"questions": store.list(q.get("status", "unresolved"), q.get("to"), q.get("limit", 100))})
             if path.startswith("/api/questions/"):
                 return self._json(200, store.get(int(path.split("/")[3])))
+            if re.fullmatch(r"/api/answers/\d+", path):   # which question an answer is on ("answer 872" links)
+                return self._json(200, store.answer_info(int(path.split("/")[3])))
             if path == "/api/people":
                 return self._json(200, {"people": store.people()})
             if path == "/api/users":
@@ -3961,6 +3971,8 @@ h1 .ver{font-size:13.2px;font-weight:500;letter-spacing:0;text-transform:none;op
 .brand img.setlogo{width:auto;max-width:140px;object-fit:contain}
 @media (max-width:640px){.setgrid{grid-template-columns:1fr}}
 .watchers{flex:1 1 auto;text-align:right;margin-right:8px}.watchers b{color:var(--fg)}
+.qref{text-decoration-style:dotted}.aref{font-size:12.5px;color:var(--muted);margin-left:6px;text-decoration:none}.aref:hover{text-decoration:underline}
+@keyframes qflash{from{box-shadow:0 0 0 3px var(--accent)}to{box-shadow:0 0 0 3px transparent}}.flash{animation:qflash 2.2s ease-out}
 .updbtn{font:600 12px/1 system-ui,sans-serif;letter-spacing:0;text-transform:none;margin-left:6px;padding:4px 9px;border-radius:99px;
  border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer;vertical-align:2px}
 .updlg{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.45);display:grid;place-items:center;padding:16px}
@@ -5074,7 +5086,7 @@ function tabs(){$('#tabs').innerHTML=FILTERS.map(([k,l])=>`<button data-f="${k}"
 $('#tabs').onclick=e=>{const f=e.target.dataset.f;if(f){filter=f;store('qa-filter',f);tabs();load()}};
 function card(q){const open=expanded.has(q.id);const forMe=me()&&q.status==='open'&&(q.to===me()||q.to==='anyone')&&q.author!==me();
  const docs=q.documents||[];
- let h=`<div class="card q ${forMe?'forme':''}${q.status==='on_hold'?' held':''}" data-id="${q.id}"><h3 data-toggle="${q.id}"><span class="pill ${q.status}">${q.status.replace('_',' ')}</span>#${q.id} ${esc(q.title)}</h3>
+ let h=`<div class="card q ${forMe?'forme':''}${q.status==='on_hold'?' held':''}" data-id="${q.id}" id="q-${q.id}"><h3 data-toggle="${q.id}"><span class="pill ${q.status}">${q.status.replace('_',' ')}</span>#${q.id} ${esc(q.title)}</h3>
  <div class="meta">${esc(q.author)} → ${esc(q.to)} · ${ago(q.created)} · ${q.answers.length} answer${q.answers.length===1?'':'s'}${docs.length?` · ${docs.length} document${docs.length===1?'':'s'}`:''}${DRAFTS['a'+q.id]?' · <span class="drafted" title="Your unsent answer is kept in this browser">✎ your draft</span>':''}</div>`;
  if(open){if(q.body)h+=`<div class="body md">${md(q.body)}</div>`;
   if(docs.length)h+=`<div class="att">Attached: ${docs.map(d=>`<a href="${url('/api/docs/'+d.id+'/view')}" target="_blank" rel="noopener">${esc(d.title)}</a>`).join('')}</div>`;
@@ -5085,8 +5097,8 @@ function card(q){const open=expanded.has(q.id);const forMe=me()&&q.status==='ope
   if(q.answers.some(a=>early(a)&&!folded.includes(a)))bar.push(`<a href="#" data-foldall="${q.id}">fold earlier replies</a>`);
   if(bar.length)h+=`<div class="foldbar">${bar.join(' · ')}</div>`;
   for(const a of q.answers){
-   if(folded.includes(a))h+=`<div class="ans folded" data-unfold="${a.id}" title="Show this reply"><div class="meta"><span class="chev">▸</span> ${esc(a.author)} · ${ago(a.created)} <span class="peek">${esc(peek(a.body))}</span></div></div>`;
-   else h+=`<div class="ans"><div class="meta"><a href="#" class="chev" data-fold="${a.id}" title="Fold this reply">▾</a> ${esc(a.author)} · ${ago(a.created)}</div><div class="body md" style="margin-top:4px">${md(a.body)}</div></div>`}
+   if(folded.includes(a))h+=`<div class="ans folded" id="a-${a.id}" data-unfold="${a.id}" title="Show this reply"><div class="meta"><span class="chev">▸</span> ${esc(a.author)} · ${ago(a.created)} <span class="peek">${esc(peek(a.body))}</span></div></div>`;
+   else h+=`<div class="ans" id="a-${a.id}"><div class="meta"><a href="#" class="chev" data-fold="${a.id}" title="Fold this reply">▾</a> ${esc(a.author)} · ${ago(a.created)} <a href="#a-${a.id}" class="aref" data-goa="${a.id}" title="Link to this answer (refer to it as answer ${a.id})">answer ${a.id}</a></div><div class="body md" style="margin-top:4px">${md(a.body)}</div></div>`}
   h+=`<div class="row"><textarea data-draft="${q.id}" placeholder="Write an answer. Drop files on the question, use Attach files, or paste a screenshot (Ctrl+V) to attach them and show them here."></textarea></div>
   <div class="row" style="justify-content:flex-end"><span class="meta attmsg" data-attmsg="${q.id}"></span><button data-attach="${q.id}" style="flex:0 0 auto" title="Attach one or more files (or drop them on the question, or paste a screenshot)">Attach files</button><button class="primary" data-answer="${q.id}" style="flex:0 0 auto">Answer</button>
   ${q.status==='on_hold'?`<button data-status="${q.id}:reopen" style="flex:0 0 auto" title="Back in everyone's inbox; Claude picks it up again">Take off hold</button>`
@@ -5094,6 +5106,11 @@ function card(q){const open=expanded.has(q.id);const forMe=me()&&q.status==='ope
   ${q.status==='resolved'?`<button data-status="${q.id}:reopen" style="flex:0 0 auto">Reopen</button>`:`<button data-status="${q.id}:resolved" style="flex:0 0 auto">Mark resolved</button>`}</div>`}
  return h+'</div>'}
 function linkDocs(html){return html.replace(/\bdoc (\d+)\b/gi,(m,id)=>`<a href="${url('/api/docs/'+id+'/view')}" target="_blank" rel="noopener">${m}</a>`)}
+// "answer 872", "question 902", "question #902" and "#902" link to them on the board
+function linkRefs(html){
+ return html.replace(/\b(answer|question)s? #?(\d{1,7})\b|(^|[\s(\[,;])#(\d{1,7})(?![\w-])/gi,(m,w,id,pre,hid)=>{
+  if(hid)return `${pre}<a href="#q-${hid}" class="qref" data-goq="${hid}">#${hid}</a>`;
+  return /^a/i.test(w)?`<a href="#a-${id}" class="qref" data-goa="${id}">${m}</a>`:`<a href="#q-${id}" class="qref" data-goq="${id}">${m}</a>`})}
 // Markdown for posts (what Claude writes): **bold**, *italic*, `code`, ``` blocks, lists, # headings, links,
 // and images from the board's own document store: ![caption](/api/docs/12/view).
 // The text is HTML-escaped first, so a post can never add its own HTML.
@@ -5121,7 +5138,7 @@ function mdInline(t){
  t=t.replace(/(^|[^_\w])__(?=\S)([^\n]*?\S)__(?![_\w])/g,'$1<strong>$2</strong>');
  t=t.replace(/(^|[^_\w])_(?=\S)([^_\n]*?\S)_(?![_\w])/g,'$1<em>$2</em>');   // not inside snake_case words
  t=t.replace(/~~(?=\S)([^\n]*?\S)~~/g,'<del>$1</del>');
- t=linkDocs(t);
+ t=linkRefs(linkDocs(t));
  t=t.replace(/\u0001(\d+)\u0001/g,(m,i)=>keep[+i]);
  return t.replace(/\u0000(\d+)\u0000/g,(m,i)=>'<code>'+codes[+i]+'</code>');
 }
@@ -5476,6 +5493,21 @@ async function openMd(id,v){
 function closeMd(){$('#mdshade').hidden=$('#mdwin').hidden=true;$('#mdbody').innerHTML='';document.body.classList.remove('mdopen')}
 $('#mdclose').onclick=closeMd;$('#mdshade').onclick=closeMd;
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#mdwin').hidden){e.preventDefault();closeMd()}});
+// Going to a question or an answer: open it (switching to All if it's resolved), unfold the answer, scroll to it
+async function goQuestion(qid,aid){qid=+qid;expanded.add(qid);if(aid){openAns.add(+aid);closedAns.delete(+aid)}
+ if(!QUESTIONS.some(q=>q.id===qid)&&filter!=='all'){filter='all';store('qa-filter','all');tabs()}
+ if(view!=='questions')showView('questions');await load();
+ const el=document.getElementById(aid?'a-'+aid:'q-'+qid)||document.getElementById('q-'+qid);
+ if(!el){alertBox((aid?'Answer '+aid:'Question '+qid)+' isn\'t on the board.');return}
+ el.scrollIntoView({block:'center',behavior:'smooth'});el.classList.add('flash');setTimeout(()=>el.classList.remove('flash'),2200)}
+async function goAnswer(aid){aid=+aid;let q=QUESTIONS.find(x=>x.answers.some(a=>a.id===aid));
+ if(!q){try{const j=await api('/api/answers/'+aid);q={id:j.question_id}}catch(e){alertBox('Answer '+aid+' isn\'t on the board.');return}}
+ goQuestion(q.id,aid)}
+document.addEventListener('click',e=>{if(e.button!==0||e.ctrlKey||e.metaKey||e.shiftKey)return;
+ const a=e.target.closest&&e.target.closest('[data-goa],a.qref[data-goq]');if(!a)return;e.preventDefault();e.stopPropagation();
+ a.dataset.goa?goAnswer(a.dataset.goa):goQuestion(a.dataset.goq)},true);
+// a link to the board with #a-872 or #q-902 opens that answer or question
+addEventListener('load',()=>{const m=/^#([aq])-(\d+)$/.exec(location.hash);if(m)setTimeout(()=>m[1]==='a'?goAnswer(m[2]):goQuestion(m[2]),600)});
 document.addEventListener('click',async e=>{   // any link to a document's view: .md files open in the pop-up
  if(e.defaultPrevented||e.button!==0||e.ctrlKey||e.metaKey||e.shiftKey||e.altKey)return;
  const a=e.target.closest&&e.target.closest('a[href]');if(!a||a.classList.contains('mdimg')||a.id==='mdtext')return;
