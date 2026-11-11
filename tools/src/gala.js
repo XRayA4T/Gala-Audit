@@ -419,22 +419,3 @@ async function rsRestore(name,hasQ){const s=(GALA&&GALA.summary)||{};
   galaNotice('Restored '+name+'.'+(j.archive?' What was here is in data/archive/'+j.archive+'.':''));GSESS=0;galaSig='';loadGala()}
  catch(err){galaNotice(err.message,'error')}}
 
-// ---- the web terminal through the portal: watch with the portal's key, type with the admin key
-{const a=new URLSearchParams(location.search).get('admin');if(a)store('qa-admin',a)}
-function galaAdmin(){return store('qa-admin')||''}
-function galaTermUrl(){const a=galaAdmin();
- return location.origin+'/terminal/'+(a?'rw':'ro')+'/?key='+encodeURIComponent(KEY||'')+(a?'&admin='+encodeURIComponent(a):'')}
-function galaTermBar(){const b=$('#termurl');
- if(TERM_DEFAULT!=='/terminal/'){b.textContent=termUrl().replace(/^https?:\/\//,'');return}
- b.textContent=galaAdmin()?'Typing to Claude · click to watch only':'Watching (read-only) · click to type';
- b.title=galaAdmin()?'This browser can type to Claude (it has the admin key). Click to go back to watching.':'Enter the admin key to type to Claude'}
-async function galaTermClick(){if(TERM_DEFAULT!=='/terminal/')return changeTermUrl();
- if(galaAdmin()){if(!await galaDialog({title:'Watch only?',text:'This browser forgets the admin key and goes back to watching Claude without typing.',ok:'Watch only',cancel:'Keep typing'}))return;
-  try{localStorage.removeItem('qa-admin')}catch(e){}}
- else{const v=await galaDialog({title:'Type to Claude',text:'Typing in the terminal needs the admin key. start-portal.sh prints it (the admin link) on the portal computer.',
-   input:'',placeholder:'admin key',ok:'Type',validate:x=>x.trim()?'':'Enter the admin key'});
-  if(v===null)return;
-  const r=await fetch('/terminal/rw/?key='+encodeURIComponent(KEY||'')+'&admin='+encodeURIComponent(v.trim()),{cache:'no-store'}).catch(()=>null);
-  if(!r||!r.ok){galaNotice(r&&r.status===403?'That isn\'t the admin key.':'The terminal didn\'t answer ('+(r?r.status:'no connection')+').','error');return}
-  store('qa-admin',v.trim())}
- galaTermBar();$('#termnew').href=termUrl();if(!$('#termwin').hidden)$('#termframe').src=termUrl()}
