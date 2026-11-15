@@ -169,6 +169,9 @@ class Store:
             """
         )
         self.db.commit()
+        if "edited" not in [r[1] for r in self.db.execute("PRAGMA table_info(answers)")]:   # boards before 1.25
+            self.db.execute("ALTER TABLE answers ADD COLUMN edited REAL")
+            self.db.commit()
         self._seed_users()
         # Leftovers from interrupted uploads
         for f in os.listdir(self.tmpdir):
@@ -180,7 +183,7 @@ class Store:
     # ---------------------------------------------------------------- questions
     def _answers(self, qid):
         rows = self.db.execute(
-            "SELECT id, body, author, created FROM answers WHERE question_id=? ORDER BY id", (qid,)
+            "SELECT id, body, author, created, edited FROM answers WHERE question_id=? ORDER BY id", (qid,)
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -231,14 +234,37 @@ class Store:
             q = self.db.execute("SELECT status FROM questions WHERE id=?", (qid,)).fetchone()
             if not q:
                 raise KeyError("no question #%s" % qid)
-            self.db.execute(
+            cur = self.db.execute(
                 "INSERT INTO answers(question_id, body, author, created) VALUES(?,?,?,?)",
                 (qid, body, clean_name(author), now),
             )
             new_status = "answered" if q["status"] == "open" else q["status"]
             self.db.execute("UPDATE questions SET status=?, updated=? WHERE id=?", (new_status, now, qid))
             self.db.commit()
-            return self.get(qid)
+            out = self.get(qid)
+            out["answer_id"] = cur.lastrowid
+            return out
+
+    def update_answer(self, aid, body, author):
+        """Replace the text of an answer (its author only), e.g. a "seen, starting now" note with the real answer.
+        The question moves back to the top of the list as if newly answered."""
+        body = (body or "").strip()
+        if not body:
+            raise ValueError("answer text is required")
+        now = time.time()
+        with self.lock:
+            row = self.db.execute("SELECT question_id, author FROM answers WHERE id=?", (aid,)).fetchone()
+            if not row:
+                raise KeyError("no answer %s" % aid)
+            if clean_name(author) != row["author"]:
+                raise ValueError("answer %s is %s's; only they can change it" % (aid, row["author"]))
+            self.db.execute("UPDATE answers SET body=?, edited=? WHERE id=?", (body, now, aid))
+            self.db.execute("UPDATE questions SET updated=?, status=CASE WHEN status='open' THEN 'answered' "
+                            "ELSE status END WHERE id=?", (now, row["question_id"]))
+            self.db.commit()
+            out = self.get(row["question_id"])
+            out["answer_id"] = aid
+            return out
 
     def set_status(self, qid, status):
         """status: open, answered, resolved, on_hold - or reopen: back to answered if it has answers,
@@ -2764,10 +2790,25 @@ TOOLS = [
     {
         "name": "answer_question",
         "description": "Post an answer to a question. Be specific; include commands, file paths and "
-                       "code where useful.",
+                       "code where useful. Returns the answer's id (answer_id): when you start on something that "
+                       "takes a while, post a short note first (e.g. 'Seen by dev-claude, starting now…') and "
+                       "replace it with the real answer with update_answer when you're done, instead of posting "
+                       "a second answer.",
         "inputSchema": {
             "type": "object",
             "properties": {"id": {"type": "integer"}, "answer": {"type": "string"}},
+            "required": ["id", "answer"],
+        },
+    },
+    {
+        "name": "update_answer",
+        "description": "Replace the text of one of your own answers, e.g. a 'Seen by dev-claude, starting now…' "
+                       "note with the real answer once you have it, or a correction. Give the whole new text. "
+                       "The question moves to the top of the board and the answer shows as edited.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer", "description": "The answer's id (answer_id from answer_question)"},
+                           "answer": {"type": "string", "description": "The whole new text"}},
             "required": ["id", "answer"],
         },
     },
@@ -2923,6 +2964,9 @@ INSTRUCTIONS = (
     "Your identity on the board is set by the connection. Use check_inbox at the start of work. "
     "When you need a decision, fact or context only a teammate has, post_question instead of guessing. "
     "Answer questions addressed to you with concrete, verified information. "
+    "When a question will take you a while, answer at once with a short note ('Seen by dev-claude, starting now…') "
+    "so the asker knows, then replace that note with the real answer using update_answer (the answer_id "
+    "answer_question gave you) instead of posting a second answer. "
     "Refer to questions as 'question 902' (or #902) and to answers as 'answer 872': the board turns them into links "
     "that open them. "
     "Put documents the team should be able to read (specs, reports, notes, screenshots) in the document store "
@@ -2974,7 +3018,11 @@ def call_tool(store, who, name, args, base_url=""):
         return [_text(hold + json.dumps(q, indent=1))]
     if name == "answer_question":
         q = store.answer(int(args["id"]), args.get("answer"), who)
-        return [_text("Answer added to #%d.\n%s" % (q["id"], json.dumps(q, indent=1)))]
+        return [_text("Answer %d added to #%d (replace it later with update_answer id=%d).\n%s"
+                      % (q["answer_id"], q["id"], q["answer_id"], json.dumps(q, indent=1)))]
+    if name == "update_answer":
+        q = store.update_answer(int(args["id"]), args.get("answer"), who)
+        return [_text("Answer %d on #%d updated." % (q["answer_id"], q["id"]))]
     if name == "resolve_question":
         q = store.set_status(int(args["id"]), "reopen" if args.get("reopen") else "resolved")
         return [_text("Question #%d is now %s." % (q["id"], q["status"]))]
@@ -3692,6 +3740,8 @@ class Handler(BaseHTTPRequestHandler):
                 qid = int(parts[3])
                 if parts[4] == "answers":
                     return self._json(201, store.answer(qid, data.get("body"), data.get("author")))
+            if len(parts) == 4 and parts[1:3] == ["api", "answers"] and parts[3].isdigit():   # edit an answer
+                return self._json(200, store.update_answer(int(parts[3]), data.get("body"), data.get("author") or self._who(q)))
                 if parts[4] == "status":
                     return self._json(200, store.set_status(qid, data.get("status")))
             if path == "/api/users":
@@ -3971,6 +4021,7 @@ h1 .ver{font-size:13.2px;font-weight:500;letter-spacing:0;text-transform:none;op
 .brand img.setlogo{width:auto;max-width:140px;object-fit:contain}
 @media (max-width:640px){.setgrid{grid-template-columns:1fr}}
 .watchers{flex:1 1 auto;text-align:right;margin-right:8px}.watchers b{color:var(--fg)}
+.ansedit{min-height:140px}
 .qref{text-decoration-style:dotted}.aref{font-size:12.5px;color:var(--muted);margin-left:6px;text-decoration:none}.aref:hover{text-decoration:underline}
 @keyframes qflash{from{box-shadow:0 0 0 3px var(--accent)}to{box-shadow:0 0 0 3px transparent}}.flash{animation:qflash 2.2s ease-out}
 .updbtn{font:600 12px/1 system-ui,sans-serif;letter-spacing:0;text-transform:none;margin-left:6px;padding:4px 9px;border-radius:99px;
@@ -5098,7 +5149,7 @@ function card(q){const open=expanded.has(q.id);const forMe=me()&&q.status==='ope
   if(bar.length)h+=`<div class="foldbar">${bar.join(' · ')}</div>`;
   for(const a of q.answers){
    if(folded.includes(a))h+=`<div class="ans folded" id="a-${a.id}" data-unfold="${a.id}" title="Show this reply"><div class="meta"><span class="chev">▸</span> ${esc(a.author)} · ${ago(a.created)} <span class="peek">${esc(peek(a.body))}</span></div></div>`;
-   else h+=`<div class="ans" id="a-${a.id}"><div class="meta"><a href="#" class="chev" data-fold="${a.id}" title="Fold this reply">▾</a> ${esc(a.author)} · ${ago(a.created)} <a href="#a-${a.id}" class="aref" data-goa="${a.id}" title="Link to this answer (refer to it as answer ${a.id})">answer ${a.id}</a></div><div class="body md" style="margin-top:4px">${md(a.body)}</div></div>`}
+   else h+=`<div class="ans" id="a-${a.id}"><div class="meta"><a href="#" class="chev" data-fold="${a.id}" title="Fold this reply">▾</a> ${esc(a.author)} · ${ago(a.created)}${a.edited?` · <span title="${esc(new Date(a.edited*1000).toLocaleString())}">edited ${ago(a.edited)}</span>`:''} <a href="#a-${a.id}" class="aref" data-goa="${a.id}" title="Link to this answer (refer to it as answer ${a.id})">answer ${a.id}</a>${me()&&a.author===me()?` <a href="#" class="aref" data-editans="${a.id}" title="Change this answer">edit</a>`:''}</div><div class="body md" style="margin-top:4px">${md(a.body)}</div></div>`}
   h+=`<div class="row"><textarea data-draft="${q.id}" placeholder="Write an answer. Drop files on the question, use Attach files, or paste a screenshot (Ctrl+V) to attach them and show them here."></textarea></div>
   <div class="row" style="justify-content:flex-end"><span class="meta attmsg" data-attmsg="${q.id}"></span><button data-attach="${q.id}" style="flex:0 0 auto" title="Attach one or more files (or drop them on the question, or paste a screenshot)">Attach files</button><button class="primary" data-answer="${q.id}" style="flex:0 0 auto">Answer</button>
   ${q.status==='on_hold'?`<button data-status="${q.id}:reopen" style="flex:0 0 auto" title="Back in everyone's inbox; Claude picks it up again">Take off hold</button>`
@@ -5493,6 +5544,17 @@ async function openMd(id,v){
 function closeMd(){$('#mdshade').hidden=$('#mdwin').hidden=true;$('#mdbody').innerHTML='';document.body.classList.remove('mdopen')}
 $('#mdclose').onclick=closeMd;$('#mdshade').onclick=closeMd;
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#mdwin').hidden){e.preventDefault();closeMd()}});
+// Editing your own answer: the text becomes a box with Save and Cancel (the list doesn't refresh while you type)
+document.addEventListener('click',async e=>{const t=e.target.closest&&e.target.closest('[data-editans],[data-editsave],[data-editcancel]');if(!t)return;
+ e.preventDefault();e.stopPropagation();
+ if(t.dataset.editcancel){const ta=document.querySelector(`[data-editbox="${t.dataset.editcancel}"]`);if(ta){ta.value='';ta.blur()}load();return}
+ if(t.dataset.editsave){const id=+t.dataset.editsave,ta=document.querySelector(`[data-editbox="${id}"]`);if(!ta||!ta.value.trim())return;
+  t.disabled=true;try{await api('/api/answers/'+id,{body:ta.value,author:me()});ta.value='';ta.blur();load()}catch(err){t.disabled=false;alertBox(err.message)}return}
+ const id=+t.dataset.editans,a=QUESTIONS.flatMap(q=>q.answers).find(x=>x.id===id),box=document.getElementById('a-'+id);if(!a||!box)return;
+ const body=box.querySelector('.body');if(!body)return;
+ body.outerHTML=`<div class="row"><textarea class="ansedit" data-editbox="${id}">${esc(a.body)}</textarea></div>
+  <div class="row" style="justify-content:flex-end"><button type="button" data-editcancel="${id}" style="flex:0 0 auto">Cancel</button><button type="button" class="primary" data-editsave="${id}" style="flex:0 0 auto">Save</button></div>`;
+ const ta=box.querySelector('textarea');ta.focus();ta.setSelectionRange(ta.value.length,ta.value.length)},true);
 // Going to a question or an answer: open it (switching to All if it's resolved), unfold the answer, scroll to it
 async function goQuestion(qid,aid){qid=+qid;expanded.add(qid);if(aid){openAns.add(+aid);closedAns.delete(+aid)}
  if(!QUESTIONS.some(q=>q.id===qid)&&filter!=='all'){filter='all';store('qa-filter','all');tabs()}
