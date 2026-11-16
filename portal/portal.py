@@ -3246,11 +3246,12 @@ class Handler(BaseHTTPRequestHandler):
         # the request for ttyd, without the keys
         rest = urllib.parse.urlencode([(k, v) for k, v in urllib.parse.parse_qsl(raw.query) if k not in ("key", "admin")])
         upgrade = (self.headers.get("Upgrade") or "").lower() == "websocket"
+        page = not upgrade and raw.path in ("/terminal/rw/", "/terminal/ro/")   # ttyd's page: add the copy support
         host = getattr(self.server, "term_host", None) or "127.0.0.1"
         lines = ["GET %s%s HTTP/1.1" % (raw.path, "?" + rest if rest else ""), "Host: %s:%d" % (host, port)]
         for k, v in self.headers.items():
             if k.lower() in ("host", "cookie", "connection", "keep-alive", "x-qa-key", "authorization") \
-                    or (not upgrade and k.lower() == "upgrade"):
+                    or (not upgrade and k.lower() == "upgrade") or (page and k.lower() == "accept-encoding"):
                 continue
             lines.append("%s: %s" % (k, v))
         cred = getattr(self.server, "term_credential", "") or ""
@@ -3265,6 +3266,24 @@ class Handler(BaseHTTPRequestHandler):
         try:
             up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
             head = b""
+            if page:   # the whole page (Connection: close), with OSC 52 support added; see TERM_COPY_JS
+                data = b""
+                while len(data) < 16 * 1024 * 1024:
+                    chunk = up.recv(262144)
+                    if not chunk:
+                        break
+                    data += chunk
+                hd, sep, body = data.partition(b"\r\n\r\n")
+                if sep and b"text/html" in hd.lower() and b"</body>" in body:
+                    body = body.replace(b"</body>", b"<script>" + TERM_COPY_JS.encode() + b"</script></body>", 1)
+                    hd = re.sub(rb"(?im)^content-length:.*$", b"Content-Length: %d" % len(body), hd)
+                data = hd + sep + body
+                if by_query and not by_cookie and b"\r\n" in data:
+                    first, rest_b = data.split(b"\r\n", 1)
+                    data = first + ("\r\nSet-Cookie: %s=%s; Path=/terminal/%s/; HttpOnly; SameSite=Strict"
+                                    % (cookie, token, mode)).encode() + b"\r\n" + rest_b
+                self.connection.sendall(data)
+                return
             while b"\r\n\r\n" not in head:
                 chunk = up.recv(65536)
                 if not chunk:
@@ -3771,6 +3790,39 @@ def lighten(hex_colour, amount=0.45):
     r, g, b = (int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
     r, g, b = (round(c + (255 - c) * amount) for c in (r, g, b))
     return "#%02x%02x%02x" % (r, g, b)
+
+
+# Copy from the terminal: programs (Claude Code, tmux with set-clipboard on) ask the terminal to copy text with
+# OSC 52, which ttyd's page ignores. The board adds a handler to the page it serves: the text goes to the clipboard
+# when the browser allows it (an https:// or localhost page), and otherwise a "Copy" button appears, since a click
+# lets any page copy.
+TERM_COPY_JS = r"""
+(function(){
+ var bound=null,box=null,pending='';
+ function show(n){if(!box){box=document.createElement('div');
+   box.style.cssText='position:fixed;right:12px;bottom:12px;z-index:99;background:#2d2f34;color:#eee;border:1px solid #555;'
+    +'border-radius:8px;padding:8px 10px;font:13px system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.4)';
+   document.body.appendChild(box)}
+  box.innerHTML='Copied '+n+' character'+(n===1?'':'s')+' from the terminal. <button style="margin-left:6px;padding:3px 10px;'
+   +'border-radius:6px;border:0;background:#4f8cff;color:#fff;cursor:pointer">Copy to clipboard</button> '
+   +'<a href="#" style="color:#aaa;margin-left:4px;text-decoration:none">&#10005;</a>';
+  box.style.display='block';
+  box.querySelector('button').onclick=function(){var ta=document.createElement('textarea');ta.value=pending;
+   ta.style.cssText='position:fixed;opacity:0';document.body.appendChild(ta);ta.select();var ok=false;
+   try{ok=document.execCommand('copy')}catch(e){}ta.remove();
+   box.innerHTML=ok?'Copied to the clipboard.':'Your browser blocked it: select the text with Shift held and copy.';
+   setTimeout(function(){box.style.display='none'},2000);if(window.term)window.term.focus()};
+  box.querySelector('a').onclick=function(e){e.preventDefault();box.style.display='none'}}
+ function copy(text){pending=text;
+  if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(text).then(function(){
+    if(box)box.style.display='none'},function(){show(text.length)})}
+  else show(text.length)}
+ function bind(){var t=window.term;if(!t||t===bound||!t.parser)return;bound=t;
+  t.parser.registerOscHandler(52,function(data){var i=data.indexOf(';'),b=data.slice(i+1);if(!b||b==='?')return true;
+   try{var bin=atob(b),u=new Uint8Array(bin.length);for(var k=0;k<bin.length;k++)u[k]=bin.charCodeAt(k);
+    copy(new TextDecoder().decode(u))}catch(e){}return true})}
+ setInterval(bind,500);bind()})();
+"""
 
 
 def zlib_crc(text):
