@@ -20,10 +20,33 @@ async function loadGala(){
  const slow=setTimeout(()=>{if(!GALA)$('#g-root').textContent='Reading the data folder… (after a restart or an update the portal reads every PDF once; this can take a minute or two)'},1500);
  let j;try{j=await api('/api/gala/overview')}catch(e){$('#g-root').textContent='Could not load the data folder: '+e.message;return}
  finally{galaBusy=false;clearTimeout(slow)}
+ if(j.root)renderReading(j.reading);
+ if(j.warming){   // the portal is still reading the data folder: show its log, ask again in a second
+  GALA=null;galaSig='';
+  $('#g-root').innerHTML='Data folder: <code>'+esc(j.root)+'</code><br>Inbox: <code>'+esc(j.inbox)+'</code>';
+  const wait='<div class="meta">Reading the data folder: the sessions show here when it is done (see the log above on the Gala tab).</div>';
+  $('#g-sess').innerHTML=$('#cl-sess').innerHTML='';$('#g-session').innerHTML=$('#cl-body').innerHTML=wait;$('#g-activity').hidden=true;$('#g-auto').checked=!!j.auto;
+  clearTimeout(galaWarmT);galaWarmT=setTimeout(loadGala,1000);return}
+ $('#g-activity').hidden=false;
  const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;GALA=j;
  if(!j.root){$('#g-root').textContent='This portal was started without a data folder (--gala-data).';return}
  const cs=curSession();if(cs)GSESS=cs.n;
  renderGalaHead();renderRestart();renderPills('#g-sess');renderPills('#cl-sess');renderSession();renderActivity();renderChecklist()}
+// the reading log: what the portal looked in and read (a box while it reads the data folder, then folded away)
+let galaWarmT=0,readOpen=false,readSig='';
+function renderReading(r){const box=$('#g-reading');if(!box)return;
+ if(!r||!r.lines||!r.lines.length){box.innerHTML='';readSig='';return}
+ const s=JSON.stringify([r.active,r.done,r.total,r.lines.length,r.lines.length&&r.lines[r.lines.length-1].ts]);if(s===readSig)return;readSig=s;
+ const old=box.querySelector('.rd-log');const atEnd=!old||old.scrollTop+old.clientHeight>=old.scrollHeight-8;const top=old?old.scrollTop:0;
+ const t=ts=>new Date(ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+ const log='<div class="rd-log">'+r.lines.map(l=>`<div${l.bad?' class="bad"':''}><span class="meta">${t(l.ts)}</span> ${esc(l.text)}</div>`).join('')+'</div>';
+ const secs=Math.round(((r.active?Date.now()/1000:r.finished)-r.started)||0);
+ if(r.active){const pct=r.total?Math.min(100,Math.round(100*r.done/r.total)):0;
+  box.innerHTML=`<div class="rd-box"><b>Reading the data folder…</b> <span class="meta">${r.total?r.done+' of '+r.total+' PDFs':'looking in the folders'} · ${secs}s</span>
+   <div class="rd-bar"><span style="width:${r.total?pct:3}%"></span></div>${log}</div>`}
+ else box.innerHTML=`<details class="rd-done"${readOpen?' open':''}><summary class="meta">${r.started?'Data folder read in '+secs+'s'+(r.done?', '+r.done+' PDF'+(r.done>1?'s':'')+' read':', nothing new to read')+' · ':''}reading log</summary>${log}</details>`;
+ const d=box.querySelector('details');if(d)d.addEventListener('toggle',()=>{readOpen=d.open});
+ const nl=box.querySelector('.rd-log');if(nl)nl.scrollTop=atEnd?nl.scrollHeight:top}
 function renderGalaHead(){
  $('#g-root').innerHTML='Data folder: <code>'+esc(GALA.root)+'</code><br>Inbox: <code>'+esc(GALA.inbox)+'</code>'
   +(GALA.waiting.length?` · <span class="gwarn">${GALA.waiting.length} file${GALA.waiting.length>1?'s':''} arriving</span>`:'');

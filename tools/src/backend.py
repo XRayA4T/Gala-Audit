@@ -114,6 +114,10 @@ class Gala:
         self.tlock = threading.Lock()
         self.tcache, self.tdirty = None, False
         self.tcache_file = os.path.join(self.root, ".portal-cache.json")
+        # what the portal is reading, for the page's log box: {active, started, finished, done, total, lines}
+        self._warm = False
+        self.reading = {"active": False, "started": None, "finished": None, "done": 0, "total": 0, "lines": [],
+                        "files": []}
         # inbox file -> ((size, mtime), when this computer first saw it like that), to wait until it is fully
         # written. Timed by this computer's clock, not the file's mtime, which on a Windows share comes from
         # another computer's clock and may be ahead or behind.
@@ -179,12 +183,103 @@ class Gala:
             hit = self.tcache.get(key)
         if hit and hit[0] == sig:
             return hit[1]
-        out = subprocess.run(list(args) + [path, "-"] if args[0] == "pdftotext" else list(args) + [path],
-                             capture_output=True, text=True, timeout=timeout).stdout
+        rel = self._rel(path)
+        what = {"pdfinfo": "page count", "pdftotext": "text"}.get(args[0], args[0])
+        t0 = time.time()
+        try:
+            out = subprocess.run(list(args) + [path, "-"] if args[0] == "pdftotext" else list(args) + [path],
+                                 capture_output=True, text=True, timeout=timeout).stdout
+        except (OSError, subprocess.SubprocessError) as e:
+            self.rlog("Couldn't read %s (%s): %s" % (rel, what, e), bad=True)
+            raise
+        took = time.time() - t0
+        self.rlog("Read %s (%s%s)" % (rel, what, ", %.1fs" % took if took >= 1 else ""), path=path)
         with self.tlock:
             self.tcache[key] = [sig, out]
             self.tdirty = True
         return out
+
+    def _rel(self, path):
+        try:
+            r = os.path.relpath(path, self.root)
+            return path if r.startswith("..") else r
+        except ValueError:
+            return path
+
+    def rlog(self, text, path=None, bad=False):
+        """A line for the page's reading log (the last 300 are kept)."""
+        r = self.reading
+        line = {"ts": time.time(), "text": text}
+        if bad:
+            line["bad"] = True
+        r["lines"] = (r["lines"] + [line])[-300:]
+        if path and r["active"] and path not in r["files"]:
+            r["files"].append(path)
+            r["done"] = len(r["files"])
+
+    def _fresh(self, path):
+        """Whether pdfinfo/pdftotext output for this file is in the saved cache and up to date."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return True
+        sig = [st.st_mtime, st.st_size]
+        with self.tlock:
+            if self.tcache is None:
+                try:
+                    with open(self.tcache_file, encoding="utf-8") as f:
+                        self.tcache = json.load(f)
+                except (OSError, ValueError):
+                    self.tcache = {}
+            fresh = getattr(self, "_freshset", None)
+            if fresh is None or fresh[0] is not self.tcache or fresh[1] != len(self.tcache):
+                fresh = (self.tcache, len(self.tcache), {k.split("\0", 1)[1]: v[0] for k, v in self.tcache.items()})
+                self._freshset = fresh
+        return fresh[2].get(path) == sig
+
+    def warm(self):
+        """Read the whole data folder once (after a start, an update or a restore), logging what it does."""
+        r = self.reading
+        r.update(active=True, started=time.time(), finished=None, done=0, total=0, files=[])
+        t0 = time.time()
+        self.rlog("Reading the data folder %s" % self.root)
+        try:
+            ns = self.sessions()
+            self.rlog("Looking in sessions/: %d session%s (%s)" % (len(ns), "" if len(ns) == 1 else "s",
+                                                                  ", ".join("S%d" % n for n in ns) or "none yet"))
+            todo = 0
+            for n in ns:
+                for sub in ("meet", "gen7", "scans"):
+                    d = os.path.join(self.root, "sessions", "S%d" % n, sub)
+                    pdfs = [os.path.join(d, f["name"]) for f in _ls(d) if not f["dir"] and f["name"].lower().endswith(".pdf")]
+                    others = len([f for f in _ls(d) if not f["dir"]]) - len(pdfs)
+                    need = [p for p in pdfs if not self._fresh(p)]
+                    todo += len(need)
+                    if not pdfs and not others:
+                        self.rlog("Looking in S%d/%s: empty" % (n, sub))
+                        continue
+                    self.rlog("Looking in S%d/%s: %d PDF%s%s; %s" % (
+                        n, sub, len(pdfs), "" if len(pdfs) == 1 else "s",
+                        " and %d other file%s" % (others, "" if others == 1 else "s") if others else "",
+                        "%d to read" % len(need) if need else "all already read"))
+            r["total"] = todo
+            self.rlog("%d PDF%s to read" % (todo, "" if todo == 1 else "s") if todo else
+                      "Nothing new to read: working out the sessions from the saved readings")
+            for n in ns:
+                self.rlog("Session %d: working out its events, heats and races" % n)
+                s = self.session(n)
+                self.rlog("Session %d: %d event%s, %d Gen7 race%s, %d scan%s" % (
+                    n, len(s.get("events") or []), "" if len(s.get("events") or []) == 1 else "s",
+                    s.get("races") or 0, "" if s.get("races") == 1 else "s",
+                    len(s.get("scans") or []), "" if len(s.get("scans") or []) == 1 else "s"))
+            self.save_tool_cache()
+            self.rlog("Done in %.0fs: read %d PDF%s" % (time.time() - t0, r["done"], "" if r["done"] == 1 else "s"))
+        except Exception as e:
+            self.rlog("Stopped: %r" % (e,), bad=True)
+            raise
+        finally:
+            r.update(active=False, finished=time.time())
+            self._warm = True
 
     def save_tool_cache(self):
         with self.tlock:
@@ -821,10 +916,21 @@ class Gala:
                             sorted(_ls(self.sdir(n, k)), key=lambda f: -f["mtime"])[:12] for k in SESSION_KEYS},
                 "ocrCount": len(ocr), "handFixCount": len(hand)}
 
+    def reading_view(self):
+        r = self.reading
+        return {"active": r["active"], "started": r["started"], "finished": r["finished"], "done": r["done"],
+                "total": r["total"], "lines": r["lines"][-200:]}
+
     def overview(self):
+        inbox_in_root = os.path.realpath(self.inbox).startswith(os.path.realpath(self.root) + os.sep)
+        if not self._warm:
+            # still reading the data folder: answer straight away with the reading log, not after every PDF
+            return {"root": self.root, "inbox": self.inbox, "warming": True, "reading": self.reading_view(),
+                    "auto": self.state.get("auto"), "log": self.state["log"][-40:][::-1], "waiting": [],
+                    "tools": {t: bool(shutil.which(t)) for t in ("pdfinfo", "pdftoppm", "pdftotext")}}
         with self.lock:
-            inbox_in_root = os.path.realpath(self.inbox).startswith(os.path.realpath(self.root) + os.sep)
-            return {"root": self.root, "inbox": self.inbox, "inboxRel": os.path.relpath(self.inbox, self.root)
+            return {"reading": self.reading_view(),
+                    "root": self.root, "inbox": self.inbox, "inboxRel": os.path.relpath(self.inbox, self.root)
                     if inbox_in_root else None, "auto": self.state["auto"],
                     "log": self.state["log"][-40:][::-1],
                     "waiting": [os.path.relpath(p, self.inbox) for p in self.seen],
@@ -1459,6 +1565,11 @@ class Gala:
     def run(self, every=4):
         while True:
             try:
+                if not self._warm:   # read every PDF once now, not while a page waits
+                    t0 = time.time()
+                    self.warm()
+                    sys.stderr.write("gala: data folder read in %.1fs (%d PDFs)\n" % (time.time() - t0,
+                                                                                    self.reading["done"]))
                 self.sort_inbox()
                 if not getattr(self, "_refiled", False):
                     self.refile()
@@ -1466,12 +1577,6 @@ class Gala:
                 self.ignore_strays()
                 self.auto_ask()
                 self.auto_compute()
-                if not getattr(self, "_warm", False):   # read every PDF once now, not while a page waits
-                    t0 = time.time()
-                    for n in self.sessions():
-                        self.session(n)
-                    self._warm = True
-                    sys.stderr.write("gala: data folder read in %.1fs\n" % (time.time() - t0))
                 if time.time() - getattr(self, "_tsaved", 0) > 30:
                     self._tsaved = time.time()
                     self.save_tool_cache()
@@ -1852,6 +1957,7 @@ class Gala:
             self.state = {"auto": self.state.get("auto", True), "log": [], "asked": {}, "ticks": {}, "qf": {},
                           "copied": copied}
             self.rechecks, self.cache, self.seen = {}, {}, {}
+            self._warm = False   # the loop reads the (new) data folder again, with the log on the page
             for d in (self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
                 os.makedirs(d, exist_ok=True)
             self.save()
@@ -1904,6 +2010,7 @@ class Gala:
             st["copied"] = dict(st["copied"], **copied)   # files already copied from linked folders stay copied
             self.state = st
             self.rechecks, self.cache, self.seen = {}, {}, {}
+            self._warm = False   # the loop reads the (new) data folder again, with the log on the page
             for d in (self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
                 os.makedirs(d, exist_ok=True)
             self.save()

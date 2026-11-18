@@ -136,3 +136,12 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .gdlg-box p{white-space:pre-line}
 /* the portal updates itself from its Restart tab (git), not the QA board's own updater */
 #set-update{display:none}
+/* the reading log: what the portal looked in and read */
+.rd-box{margin-top:12px;border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:var(--field)}
+.rd-bar{height:6px;border-radius:3px;background:var(--line);margin:8px 0;overflow:hidden}
+.rd-bar span{display:block;height:100%;background:var(--accent);transition:width .4s}
+.rd-log{max-height:240px;overflow:auto;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+ border:1px solid var(--line);border-radius:6px;padding:6px 8px;background:var(--card);overflow-wrap:anywhere}
+.rd-log .bad{color:var(--open)}
+.rd-done{margin-top:8px}.rd-done summary{cursor:pointer}.rd-done .rd-log{margin-top:6px}
+.rd-log .meta{font-size:inherit}

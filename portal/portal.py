@@ -47,7 +47,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.15.2"
+VERSION = "0.15.3"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 STATUSES = ("open", "answered", "resolved", "on_hold")
 
@@ -782,6 +782,10 @@ class Gala:
         self.tlock = threading.Lock()
         self.tcache, self.tdirty = None, False
         self.tcache_file = os.path.join(self.root, ".portal-cache.json")
+        # what the portal is reading, for the page's log box: {active, started, finished, done, total, lines}
+        self._warm = False
+        self.reading = {"active": False, "started": None, "finished": None, "done": 0, "total": 0, "lines": [],
+                        "files": []}
         # inbox file -> ((size, mtime), when this computer first saw it like that), to wait until it is fully
         # written. Timed by this computer's clock, not the file's mtime, which on a Windows share comes from
         # another computer's clock and may be ahead or behind.
@@ -847,12 +851,103 @@ class Gala:
             hit = self.tcache.get(key)
         if hit and hit[0] == sig:
             return hit[1]
-        out = subprocess.run(list(args) + [path, "-"] if args[0] == "pdftotext" else list(args) + [path],
-                             capture_output=True, text=True, timeout=timeout).stdout
+        rel = self._rel(path)
+        what = {"pdfinfo": "page count", "pdftotext": "text"}.get(args[0], args[0])
+        t0 = time.time()
+        try:
+            out = subprocess.run(list(args) + [path, "-"] if args[0] == "pdftotext" else list(args) + [path],
+                                 capture_output=True, text=True, timeout=timeout).stdout
+        except (OSError, subprocess.SubprocessError) as e:
+            self.rlog("Couldn't read %s (%s): %s" % (rel, what, e), bad=True)
+            raise
+        took = time.time() - t0
+        self.rlog("Read %s (%s%s)" % (rel, what, ", %.1fs" % took if took >= 1 else ""), path=path)
         with self.tlock:
             self.tcache[key] = [sig, out]
             self.tdirty = True
         return out
+
+    def _rel(self, path):
+        try:
+            r = os.path.relpath(path, self.root)
+            return path if r.startswith("..") else r
+        except ValueError:
+            return path
+
+    def rlog(self, text, path=None, bad=False):
+        """A line for the page's reading log (the last 300 are kept)."""
+        r = self.reading
+        line = {"ts": time.time(), "text": text}
+        if bad:
+            line["bad"] = True
+        r["lines"] = (r["lines"] + [line])[-300:]
+        if path and r["active"] and path not in r["files"]:
+            r["files"].append(path)
+            r["done"] = len(r["files"])
+
+    def _fresh(self, path):
+        """Whether pdfinfo/pdftotext output for this file is in the saved cache and up to date."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return True
+        sig = [st.st_mtime, st.st_size]
+        with self.tlock:
+            if self.tcache is None:
+                try:
+                    with open(self.tcache_file, encoding="utf-8") as f:
+                        self.tcache = json.load(f)
+                except (OSError, ValueError):
+                    self.tcache = {}
+            fresh = getattr(self, "_freshset", None)
+            if fresh is None or fresh[0] is not self.tcache or fresh[1] != len(self.tcache):
+                fresh = (self.tcache, len(self.tcache), {k.split("\0", 1)[1]: v[0] for k, v in self.tcache.items()})
+                self._freshset = fresh
+        return fresh[2].get(path) == sig
+
+    def warm(self):
+        """Read the whole data folder once (after a start, an update or a restore), logging what it does."""
+        r = self.reading
+        r.update(active=True, started=time.time(), finished=None, done=0, total=0, files=[])
+        t0 = time.time()
+        self.rlog("Reading the data folder %s" % self.root)
+        try:
+            ns = self.sessions()
+            self.rlog("Looking in sessions/: %d session%s (%s)" % (len(ns), "" if len(ns) == 1 else "s",
+                                                                  ", ".join("S%d" % n for n in ns) or "none yet"))
+            todo = 0
+            for n in ns:
+                for sub in ("meet", "gen7", "scans"):
+                    d = os.path.join(self.root, "sessions", "S%d" % n, sub)
+                    pdfs = [os.path.join(d, f["name"]) for f in _ls(d) if not f["dir"] and f["name"].lower().endswith(".pdf")]
+                    others = len([f for f in _ls(d) if not f["dir"]]) - len(pdfs)
+                    need = [p for p in pdfs if not self._fresh(p)]
+                    todo += len(need)
+                    if not pdfs and not others:
+                        self.rlog("Looking in S%d/%s: empty" % (n, sub))
+                        continue
+                    self.rlog("Looking in S%d/%s: %d PDF%s%s; %s" % (
+                        n, sub, len(pdfs), "" if len(pdfs) == 1 else "s",
+                        " and %d other file%s" % (others, "" if others == 1 else "s") if others else "",
+                        "%d to read" % len(need) if need else "all already read"))
+            r["total"] = todo
+            self.rlog("%d PDF%s to read" % (todo, "" if todo == 1 else "s") if todo else
+                      "Nothing new to read: working out the sessions from the saved readings")
+            for n in ns:
+                self.rlog("Session %d: working out its events, heats and races" % n)
+                s = self.session(n)
+                self.rlog("Session %d: %d event%s, %d Gen7 race%s, %d scan%s" % (
+                    n, len(s.get("events") or []), "" if len(s.get("events") or []) == 1 else "s",
+                    s.get("races") or 0, "" if s.get("races") == 1 else "s",
+                    len(s.get("scans") or []), "" if len(s.get("scans") or []) == 1 else "s"))
+            self.save_tool_cache()
+            self.rlog("Done in %.0fs: read %d PDF%s" % (time.time() - t0, r["done"], "" if r["done"] == 1 else "s"))
+        except Exception as e:
+            self.rlog("Stopped: %r" % (e,), bad=True)
+            raise
+        finally:
+            r.update(active=False, finished=time.time())
+            self._warm = True
 
     def save_tool_cache(self):
         with self.tlock:
@@ -1489,10 +1584,21 @@ class Gala:
                             sorted(_ls(self.sdir(n, k)), key=lambda f: -f["mtime"])[:12] for k in SESSION_KEYS},
                 "ocrCount": len(ocr), "handFixCount": len(hand)}
 
+    def reading_view(self):
+        r = self.reading
+        return {"active": r["active"], "started": r["started"], "finished": r["finished"], "done": r["done"],
+                "total": r["total"], "lines": r["lines"][-200:]}
+
     def overview(self):
+        inbox_in_root = os.path.realpath(self.inbox).startswith(os.path.realpath(self.root) + os.sep)
+        if not self._warm:
+            # still reading the data folder: answer straight away with the reading log, not after every PDF
+            return {"root": self.root, "inbox": self.inbox, "warming": True, "reading": self.reading_view(),
+                    "auto": self.state.get("auto"), "log": self.state["log"][-40:][::-1], "waiting": [],
+                    "tools": {t: bool(shutil.which(t)) for t in ("pdfinfo", "pdftoppm", "pdftotext")}}
         with self.lock:
-            inbox_in_root = os.path.realpath(self.inbox).startswith(os.path.realpath(self.root) + os.sep)
-            return {"root": self.root, "inbox": self.inbox, "inboxRel": os.path.relpath(self.inbox, self.root)
+            return {"reading": self.reading_view(),
+                    "root": self.root, "inbox": self.inbox, "inboxRel": os.path.relpath(self.inbox, self.root)
                     if inbox_in_root else None, "auto": self.state["auto"],
                     "log": self.state["log"][-40:][::-1],
                     "waiting": [os.path.relpath(p, self.inbox) for p in self.seen],
@@ -2127,6 +2233,11 @@ class Gala:
     def run(self, every=4):
         while True:
             try:
+                if not self._warm:   # read every PDF once now, not while a page waits
+                    t0 = time.time()
+                    self.warm()
+                    sys.stderr.write("gala: data folder read in %.1fs (%d PDFs)\n" % (time.time() - t0,
+                                                                                    self.reading["done"]))
                 self.sort_inbox()
                 if not getattr(self, "_refiled", False):
                     self.refile()
@@ -2134,12 +2245,6 @@ class Gala:
                 self.ignore_strays()
                 self.auto_ask()
                 self.auto_compute()
-                if not getattr(self, "_warm", False):   # read every PDF once now, not while a page waits
-                    t0 = time.time()
-                    for n in self.sessions():
-                        self.session(n)
-                    self._warm = True
-                    sys.stderr.write("gala: data folder read in %.1fs\n" % (time.time() - t0))
                 if time.time() - getattr(self, "_tsaved", 0) > 30:
                     self._tsaved = time.time()
                     self.save_tool_cache()
@@ -2520,6 +2625,7 @@ class Gala:
             self.state = {"auto": self.state.get("auto", True), "log": [], "asked": {}, "ticks": {}, "qf": {},
                           "copied": copied}
             self.rechecks, self.cache, self.seen = {}, {}, {}
+            self._warm = False   # the loop reads the (new) data folder again, with the log on the page
             for d in (self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
                 os.makedirs(d, exist_ok=True)
             self.save()
@@ -2572,6 +2678,7 @@ class Gala:
             st["copied"] = dict(st["copied"], **copied)   # files already copied from linked folders stay copied
             self.state = st
             self.rechecks, self.cache, self.seen = {}, {}, {}
+            self._warm = False   # the loop reads the (new) data folder again, with the log on the page
             for d in (self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
                 os.makedirs(d, exist_ok=True)
             self.save()
@@ -4460,6 +4567,15 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .gdlg-box p{white-space:pre-line}
 /* the portal updates itself from its Restart tab (git), not the QA board's own updater */
 #set-update{display:none}
+/* the reading log: what the portal looked in and read */
+.rd-box{margin-top:12px;border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:var(--field)}
+.rd-bar{height:6px;border-radius:3px;background:var(--line);margin:8px 0;overflow:hidden}
+.rd-bar span{display:block;height:100%;background:var(--accent);transition:width .4s}
+.rd-log{max-height:240px;overflow:auto;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+ border:1px solid var(--line);border-radius:6px;padding:6px 8px;background:var(--card);overflow-wrap:anywhere}
+.rd-log .bad{color:var(--open)}
+.rd-done{margin-top:8px}.rd-done summary{cursor:pointer}.rd-done .rd-log{margin-top:6px}
+.rd-log .meta{font-size:inherit}
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -4489,6 +4605,7 @@ ul.qf>li.cleared>div>ul{opacity:.75}
   or <label class="lnk">choose files<input type="file" multiple hidden id="g-inboxfile"></label>.
   <div class="meta">They go into the inbox and are sorted into their session within a few seconds. The scanner and the Gen7 computer can save straight into the inbox folder too.</div>
   <div class="meta" data-gmsg></div></div>
+ <div id="g-reading"></div>
 </div>
 <div class="spills" id="g-sess"></div>
 <div id="g-session"></div>
@@ -4648,10 +4765,33 @@ async function loadGala(){
  const slow=setTimeout(()=>{if(!GALA)$('#g-root').textContent='Reading the data folder… (after a restart or an update the portal reads every PDF once; this can take a minute or two)'},1500);
  let j;try{j=await api('/api/gala/overview')}catch(e){$('#g-root').textContent='Could not load the data folder: '+e.message;return}
  finally{galaBusy=false;clearTimeout(slow)}
+ if(j.root)renderReading(j.reading);
+ if(j.warming){   // the portal is still reading the data folder: show its log, ask again in a second
+  GALA=null;galaSig='';
+  $('#g-root').innerHTML='Data folder: <code>'+esc(j.root)+'</code><br>Inbox: <code>'+esc(j.inbox)+'</code>';
+  const wait='<div class="meta">Reading the data folder: the sessions show here when it is done (see the log above on the Gala tab).</div>';
+  $('#g-sess').innerHTML=$('#cl-sess').innerHTML='';$('#g-session').innerHTML=$('#cl-body').innerHTML=wait;$('#g-activity').hidden=true;$('#g-auto').checked=!!j.auto;
+  clearTimeout(galaWarmT);galaWarmT=setTimeout(loadGala,1000);return}
+ $('#g-activity').hidden=false;
  const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;GALA=j;
  if(!j.root){$('#g-root').textContent='This portal was started without a data folder (--gala-data).';return}
  const cs=curSession();if(cs)GSESS=cs.n;
  renderGalaHead();renderRestart();renderPills('#g-sess');renderPills('#cl-sess');renderSession();renderActivity();renderChecklist()}
+// the reading log: what the portal looked in and read (a box while it reads the data folder, then folded away)
+let galaWarmT=0,readOpen=false,readSig='';
+function renderReading(r){const box=$('#g-reading');if(!box)return;
+ if(!r||!r.lines||!r.lines.length){box.innerHTML='';readSig='';return}
+ const s=JSON.stringify([r.active,r.done,r.total,r.lines.length,r.lines.length&&r.lines[r.lines.length-1].ts]);if(s===readSig)return;readSig=s;
+ const old=box.querySelector('.rd-log');const atEnd=!old||old.scrollTop+old.clientHeight>=old.scrollHeight-8;const top=old?old.scrollTop:0;
+ const t=ts=>new Date(ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+ const log='<div class="rd-log">'+r.lines.map(l=>`<div${l.bad?' class="bad"':''}><span class="meta">${t(l.ts)}</span> ${esc(l.text)}</div>`).join('')+'</div>';
+ const secs=Math.round(((r.active?Date.now()/1000:r.finished)-r.started)||0);
+ if(r.active){const pct=r.total?Math.min(100,Math.round(100*r.done/r.total)):0;
+  box.innerHTML=`<div class="rd-box"><b>Reading the data folder…</b> <span class="meta">${r.total?r.done+' of '+r.total+' PDFs':'looking in the folders'} · ${secs}s</span>
+   <div class="rd-bar"><span style="width:${r.total?pct:3}%"></span></div>${log}</div>`}
+ else box.innerHTML=`<details class="rd-done"${readOpen?' open':''}><summary class="meta">${r.started?'Data folder read in '+secs+'s'+(r.done?', '+r.done+' PDF'+(r.done>1?'s':'')+' read':', nothing new to read')+' · ':''}reading log</summary>${log}</details>`;
+ const d=box.querySelector('details');if(d)d.addEventListener('toggle',()=>{readOpen=d.open});
+ const nl=box.querySelector('.rd-log');if(nl)nl.scrollTop=atEnd?nl.scrollHeight:top}
 function renderGalaHead(){
  $('#g-root').innerHTML='Data folder: <code>'+esc(GALA.root)+'</code><br>Inbox: <code>'+esc(GALA.inbox)+'</code>'
   +(GALA.waiting.length?` · <span class="gwarn">${GALA.waiting.length} file${GALA.waiting.length>1?'s':''} arriving</span>`:'');
