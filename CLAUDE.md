@@ -31,6 +31,8 @@ together: its `ocr`, its `gen7` folder (give the **folder** to the scripts: the 
 version 1.6.0 or later) and `--scans data/sessions/S<n>/scans` so the reports embed the scanned pages.
 Never write into `meet/`, `gen7/` or `scans/`, and never move or delete files there; the portal does the sorting.
 Folders called `.replaced` hold old copies; ignore them.
+`scans/pages/` holds each pack split into single pages for people to look at (named by lane from your
+transcriptions); always read the packs themselves, never the pages.
 
 When the session's **printed lane sheets** are in `meet/`, always take the printed fields (names, ages, teams,
 seed times, heats) from them with gala-ocr's `original_sheets.py`, and read only the handwriting off the scans.

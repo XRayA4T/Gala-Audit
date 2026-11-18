@@ -31,7 +31,9 @@ async function loadGala(){
  const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;GALA=j;
  if(!j.root){$('#g-root').textContent='This portal was started without a data folder (--gala-data).';return}
  const cs=curSession();if(cs)GSESS=cs.n;
- renderGalaHead();renderRestart();renderPills('#g-sess');renderPills('#cl-sess');renderSession();renderActivity();renderChecklist()}
+ const keep={};document.querySelectorAll('[data-qfv]').forEach(v=>{if(v.scrollTop)keep[v.dataset.qfv]=v.scrollTop});   // where each page was scrolled to
+ renderGalaHead();renderRestart();renderPills('#g-sess');renderPills('#cl-sess');renderSession();renderActivity();renderChecklist();
+ document.querySelectorAll('[data-qfv]').forEach(v=>{const t=keep[v.dataset.qfv];if(t){const img=v.querySelector('img');const go=()=>{v.scrollTop=t};img&&!img.complete?img.addEventListener('load',go,{once:true}):go()}})}
 // the reading log: what the portal looked in and read (a box while it reads the data folder, then folded away)
 let galaWarmT=0,readOpen=false,readSig='';
 function renderReading(r){const box=$('#g-reading');if(!box)return;
@@ -74,7 +76,10 @@ function renderPills(sel){
 function fileList(s,key,files,limit){
  if(!files.length)return '<div class="meta" style="margin-top:8px">Empty.</div>';
  return '<ul class="gfiles">'+files.filter(f=>!f.dir).slice(0,limit||500).map(f=>{const rel='sessions/S'+s.n+'/'+key+'/'+f.name;
-  return `<li><a href="${esc(galaHref(rel))}" target="_blank" rel="noopener" title="${esc(f.name)}">${esc(f.name)}</a><span class="meta">${size(f.size)} · ${agoShort(f.mtime)}</span><a class="meta" href="${esc(galaHref(rel,1))}" title="Download">⤓</a></li>`}).join('')+'</ul>'}
+  const sc=key==='scans'&&(s.scans||[]).find(x=>x.name===f.name),pg=sc&&sc.split&&sc.split.length?sc.split:null;
+  return `<li><a href="${esc(galaHref(rel))}" target="_blank" rel="noopener" title="${esc(f.name)}">${esc(f.name)}</a><span class="meta">${size(f.size)} · ${agoShort(f.mtime)}</span><a class="meta" href="${esc(galaHref(rel,1))}" title="Download">⤓</a>`
+   +(pg?`<details class="gpages"><summary class="meta">${pg.length} page${pg.length>1?'s':''}</summary><ul>${pg.map(([n,nm])=>{const pr='sessions/S'+s.n+'/scans/pages/'+f.name.slice(0,-4)+'/'+nm;
+     return `<li><a href="${esc(galaHref(pr))}" target="_blank" rel="noopener">${esc(nm.slice(f.name.length-1).replace(/\.pdf$/i,''))}</a><a class="meta" href="${esc(galaHref(pr,1))}" title="Download">⤓</a></li>`}).join('')}</ul></details>`:'')+'</li>'}).join('')+'</ul>'}
 function renderSession(){
  const s=curSession(),box=$('#g-session');if(!s){box.innerHTML='';return}
  const c=k=>s.events.filter(e=>e.status===k).length;
@@ -100,7 +105,7 @@ function renderSession(){
      return j.state==='running'?`${t}: working…`:j.state==='failed'?`<span class="gwarn">${t} failed: ${esc(j.msg||'')}</span>`:`${t}: done ${esc(agoShort(j.at))}`}).filter(Boolean).join(' · ')}</span></div></div>
   <div class="gfolders">${Object.keys(FOLDER_TXT).map(k=>{const f=s.folders[k]||[];const mine=k==='ocr'||k==='reports';
    return `<div class="card gfolder" data-gfolder="S${s.n}/${k}"><h3><span>${esc(FOLDER_TXT[k][0])} <span class="meta">(${k==='ocr'?s.ocrCount:f.filter(x=>!x.dir).length})</span></span><code>sessions/S${s.n}/${k}</code></h3>
-    <div class="meta">${esc(FOLDER_TXT[k][1])}</div>${fileList(s,k,f)}${k==='ocr'&&s.ocrCount>f.length?`<div class="meta">Newest ${f.length} of ${s.ocrCount}.</div>`:''}
+    <div class="meta">${esc(FOLDER_TXT[k][1])}${k==='scans'&&f.some(x=>!x.dir&&/\.pdf$/i.test(x.name))?` <button type="button" class="gsplit" data-gsplit="${s.n}" title="Split every scan in this session into single pages, named by lane once Claude has read them (new scans are split as they arrive)">Split into pages</button>`:''}</div>${fileList(s,k,f)}${k==='ocr'&&s.ocrCount>f.length?`<div class="meta">Newest ${f.length} of ${s.ocrCount}.</div>`:''}
     ${mine?'':`<div class="drop gdrop">Drop files here, or <label class="lnk">choose files<input type="file" multiple hidden data-gup="S${s.n}/${k}"></label><div class="meta" data-gmsg></div></div>`}</div>`}).join('')}</div>`}
 function renderActivity(){
  const un=GALA.unsorted.filter(f=>!f.dir);
@@ -146,7 +151,8 @@ function renderChecklist(){setTimeout(swAll,0);
      <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
       return `<li class="${t?'done':''}${f.cleared?' cleared':''}">${tickBox(k,'Lane '+f.lane+' heat '+f.heat)}<div><b>Lane ${esc(f.lane)} · Heat ${esc(f.heat)}</b>${f.cleared?` <span class="st audited" title="${esc('No longer flagged since '+agoShort(f.clearedAt))}">settled by the re-check</span>`:''} <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
-       ${f.scans.length?`<div class="sm">${f.scans.map(sc=>`<a href="${esc(galaHref('sessions/S'+s.n+'/scans/'+sc.scan))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`).join(' · ')}</div>`:''}
+       ${f.scans.length?f.scans.map(sc=>{const rel='sessions/S'+s.n+'/scans/'+sc.scan,u=url('/api/gala/page');u.searchParams.set('path',rel);u.searchParams.set('page',sc.page||1);
+        return `<div class="qf-page"><div class="sm"><a href="${esc(galaHref(rel))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a> <span class="meta">(scroll the page here, or open it)</span></div><div class="qf-view" data-qfv="${esc(s.n+'|'+sc.scan+'|'+sc.page)}"><img loading="lazy" alt="${esc(sc.label)}, page ${esc(sc.page)}" src="${esc(u.toString())}"></div></div>`}).join(''):''}
        <form class="qffix" data-fix="${s.n}|${e.event}|${esc(f.heat)}|${esc(f.lane)}" autocomplete="off">
         ${(()=>{const w=qfTimes(f,hf),sw=qfSwimmer(s,e,f,hf);f._block=!!(w||sw);f._watch=!!w;return w+sw})()}
         <label>Result <select name="status"><option value="">as audited</option><option value="OK"${hf.status==='OK'?' selected':''}>Swam</option><option value="NS"${hf.status==='NS'?' selected':''}>No-show</option><option value="DQ"${hf.status==='DQ'?' selected':''}>DQ</option></select></label>
@@ -203,6 +209,9 @@ async function galaUpload(folder,files,card){
  say(folder==='inbox'?`Uploaded ${files.length} file${files.length>1?'s':''}: sorting…`:`Uploaded ${files.length} file${files.length>1?'s':''}.`);
  galaSig='';loadGala();if(folder==='inbox')setTimeout(()=>{galaSig='';loadGala()},9000)}
 function galaClicks(e){
+ const sp=e.target.closest('[data-gsplit]');if(sp){sp.disabled=true;
+  galaPost('/api/gala/split',{session:+sp.dataset.gsplit}).then(j=>{galaNotice('Splitting '+j.scans+' scan'+(j.scans>1?'s':'')+' into pages: each one\'s pages show under it in a few seconds.');setTimeout(()=>{galaSig='';loadGala()},4000)})
+   .catch(err=>{sp.disabled=false;galaNotice(err.message,'error')});return}
  const sb=e.target.closest('[data-sess]');if(sb){GSESS=+sb.dataset.sess;store('qa-gsess',GSESS);galaSig='';loadGala();return}
  if(e.target.closest('[data-newsess]')){galaPost('/api/gala/session').then(()=>{GSESS=(GALA&&GALA.sessions.length?Math.max(...GALA.sessions.map(s=>s.n)):0)+1;store('qa-gsess',GSESS);galaSig='';loadGala()});return}
  const go=e.target.closest('[data-goto]');if(go){e.preventDefault();showView(go.dataset.goto);return}

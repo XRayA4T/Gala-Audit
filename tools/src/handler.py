@@ -49,6 +49,23 @@
         with open(p, "rb") as f:
             shutil.copyfileobj(f, self.wfile, 65536)
 
+    def _gala_page(self, q):
+        """GET /api/gala/page?path=sessions/S2/scans/X.pdf&page=7: that page as a JPEG."""
+        g = self._gala()
+        try:
+            p = g.page_image(q.get("path"), max(1, int(q.get("page") or 1))) if g else None
+        except (ValueError, OSError, subprocess.SubprocessError) as e:
+            return self._json(404, {"error": str(e)})
+        if not p:
+            return self._json(404, {"error": "no data folder"})
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(os.path.getsize(p)))
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        with open(p, "rb") as f:
+            shutil.copyfileobj(f, self.wfile, 65536)
+
     def _gala_upload(self, q):
         """POST /api/gala/upload?folder=inbox|S<n>/<folder>&filename=NAME, the file as the body."""
         g = self._gala()
@@ -121,6 +138,11 @@
                 g.recheck(int(d.get("session") or 0), int(d.get("event") or 0), who)
             elif path == "/api/gala/fix":
                 g.set_fix(int(d.get("session") or 0), d.get("event"), d.get("heat"), d.get("lane"), d, who)
+            elif path == "/api/gala/split":
+                n = int(d.get("session") or 0)
+                if d.get("name"):
+                    return self._json(200, {"ok": True, "pages": g.split_scan(n, str(d["name"]), who)})
+                return self._json(200, {"ok": True, "scans": g.split_session(n, who)})
             elif path == "/api/gala/session":
                 n = max(g.sessions() or [0]) + 1
                 g.sdir(n)

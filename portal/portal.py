@@ -47,7 +47,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.15.5"
+VERSION = "0.16.0"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 STATUSES = ("open", "answered", "resolved", "on_hold")
 
@@ -1458,6 +1458,155 @@ class Gala:
                     out.append(dict(r, file=f["name"], mtime=f["mtime"]))
         return out
 
+    # ---- scans split into single pages: scans/pages/<pack>/<pack> - Lane 7.pdf (or - p07.pdf until Claude has read
+    # the page). The packs stay the working copy (Claude, the OCR names, the audit report); the pages are for people.
+    def pages_dir(self, n, stem):
+        return os.path.join(self.sdir(n, "scans"), "pages", stem)
+
+    def _page_names(self, n, stem, count):
+        """The file name for each page of a pack: the lane from Claude's transcription when it has one."""
+        lanes = {}
+        if self.scan_kind(stem + ".pdf") == "lanes":
+            for o in _ls(self.sdir(n, "ocr")):
+                nm = o["name"]
+                if not nm.startswith(stem + "-"):
+                    continue
+                mp, ml = OCR_PAGE.search(nm), OCR_LANE.search(nm)
+                if mp and ml and not OCR_SLIP.search(nm):
+                    lanes.setdefault(int(ml.group(2)), set()).add(int(mp.group(1)))
+        by_page = {}
+        for lane, ps in lanes.items():
+            for p in ps:
+                by_page[p] = "Lane %d" % lane if len(ps) == 1 else "Lane %d p%02d" % (lane, p)
+        return {p: "%s - %s.pdf" % (stem, by_page.get(p) or "p%02d" % p) for p in range(1, count + 1)}
+
+    def _manifest(self, n, stem):
+        try:
+            with open(os.path.join(self.pages_dir(n, stem), ".manifest.json"), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def split_scan(self, n, name, who=None):
+        """Split one pack into single pages (again: the old pages are replaced)."""
+        src = os.path.join(self.sdir(n, "scans"), name)
+        stem = name[:-4]
+        if not (name.lower().endswith(".pdf") and os.path.isfile(src)):
+            raise ValueError("no such scan: %s" % name)
+        tool = shutil.which("pdfseparate")
+        if not tool:
+            raise ValueError("pdfseparate isn't installed (install poppler-utils)")
+        st = os.stat(src)
+        count = self.pdf_pages(src) or 0
+        d = self.pages_dir(n, stem)
+        tmp = d + ".new"
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp)
+        r = subprocess.run([tool, src, os.path.join(tmp, ".page-%d.pdf")], capture_output=True, text=True, timeout=300)
+        made = sorted(int(m.group(1)) for m in (re.fullmatch(r"\.page-(\d+)\.pdf", f) for f in os.listdir(tmp)) if m)
+        if r.returncode != 0 or not made:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ValueError("couldn't split %s: %s" % (name, (r.stderr or "no pages").strip()[:200]))
+        count = max(count, made[-1])
+        names = self._page_names(n, stem, count)
+        for p in made:
+            os.replace(os.path.join(tmp, ".page-%d.pdf" % p), os.path.join(tmp, names[p]))
+        with open(os.path.join(tmp, ".manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"sig": [st.st_mtime, st.st_size], "pages": {str(p): names[p] for p in made}}, f)
+        shutil.rmtree(d, ignore_errors=True)
+        os.replace(tmp, d)
+        with self.lock:
+            self.state.setdefault("splitSeen", {})[src] = [st.st_mtime, st.st_size]
+            self.save()
+        self.rlog("Split S%d/scans/%s into %d page%s" % (n, name, len(made), "" if len(made) == 1 else "s"))
+        if who:
+            self.log("%s split into %d pages by %s" % (name, len(made), who), name=name)
+        return len(made)
+
+    def split_session(self, n, who):
+        """The Scans folder's "Split into pages" button: every pack in the session, in a thread."""
+        names = [f["name"] for f in _ls(self.sdir(n, "scans")) if not f["dir"] and f["name"].lower().endswith(".pdf")]
+        if not names:
+            raise ValueError("no scans in session %d" % n)
+
+        def go():
+            done = 0
+            for nm in names:
+                try:
+                    self.split_scan(n, nm)
+                    done += 1
+                except Exception as e:
+                    self.rlog("Couldn't split S%d/scans/%s: %s" % (n, nm, e), bad=True)
+            self.log("Session %d: %d of %d scans split into pages by %s" % (n, done, len(names), who))
+
+        threading.Thread(target=go, daemon=True, name="split S%d" % n).start()
+        return len(names)
+
+    def split_new(self):
+        """In the loop: split scans that arrive (or are rescanned) into pages; keep the page names up to date as Claude
+        reads the pages; remove pages of packs that are gone. Packs there before this existed wait for the button."""
+        with self.lock:
+            seen = self.state.setdefault("splitSeen", {})
+            first = not self.state.get("splitInit")
+        for n in self.sessions():
+            d = self.sdir(n, "scans")
+            packs = {f["name"]: f for f in _ls(d) if not f["dir"] and f["name"].lower().endswith(".pdf")}
+            for name, f in packs.items():
+                src = os.path.join(d, name)
+                sig = [f["mtime"], f["size"]]
+                if first:
+                    seen.setdefault(src, sig)
+                    continue
+                if seen.get(src) != sig and time.time() - f["mtime"] > 5:
+                    try:
+                        self.split_scan(n, name)
+                    except Exception as e:
+                        seen[src] = sig   # don't try again and again
+                        self.rlog("Couldn't split S%d/scans/%s: %s" % (n, name, e), bad=True)
+                    continue
+                man = self._manifest(n, name[:-4])
+                if man:   # rename pages Claude has read since
+                    want = self._page_names(n, name[:-4], max(int(p) for p in man["pages"]) if man["pages"] else 0)
+                    pd = self.pages_dir(n, name[:-4])
+                    changed = False
+                    for p, old in list(man["pages"].items()):
+                        new = want.get(int(p))
+                        if new and new != old and os.path.exists(os.path.join(pd, old)) \
+                                and not os.path.exists(os.path.join(pd, new)):
+                            os.replace(os.path.join(pd, old), os.path.join(pd, new))
+                            man["pages"][p] = new
+                            changed = True
+                    if changed:
+                        with open(os.path.join(pd, ".manifest.json"), "w", encoding="utf-8") as fh:
+                            json.dump(man, fh)
+            pdir = os.path.join(d, "pages")
+            for f in _ls(pdir):
+                if f["dir"] and f["name"] + ".pdf" not in packs and not f["name"].endswith(".new"):
+                    shutil.rmtree(os.path.join(pdir, f["name"]), ignore_errors=True)
+        if first:
+            with self.lock:
+                self.state["splitInit"] = time.time()
+                self.save()
+
+    def page_image(self, rel, page):
+        """A page of a scan as a JPEG (for the quick fixes), drawn once with pdftoppm and kept in data/.portal-pages/."""
+        src = gala_path(self.root, rel)
+        if not src or not src.lower().endswith(".pdf"):
+            raise ValueError("no such scan")
+        st = os.stat(src)
+        key = hashlib.sha1(("%s|%s|%s|%d" % (src, st.st_mtime, st.st_size, page)).encode()).hexdigest()[:20]
+        cdir = os.path.join(self.root, ".portal-pages")
+        out = os.path.join(cdir, key + ".jpg")
+        if not os.path.exists(out):
+            os.makedirs(cdir, exist_ok=True)
+            r = subprocess.run(["pdftoppm", "-jpeg", "-jpegopt", "quality=75", "-r", "110", "-f", str(page),
+                                "-l", str(page), "-singlefile", src, os.path.join(cdir, key + ".tmp")],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0 or not os.path.exists(os.path.join(cdir, key + ".tmp.jpg")):
+                raise ValueError("couldn't draw page %d: %s" % (page, (r.stderr or "").strip()[:200]))
+            os.replace(os.path.join(cdir, key + ".tmp.jpg"), out)
+        return out
+
     def scans(self, n):
         d, ocr = self.sdir(n, "scans"), self.sdir(n, "ocr")
         ocr_files = [f["name"] for f in _ls(ocr) if f["name"].lower().endswith(".json")]
@@ -1489,7 +1638,9 @@ class Gala:
             out.append({"name": f["name"], "kind": self.scan_kind(f["name"]), "event": ev,
                         "events": sorted(events), "pages": pages, "mtime": f["mtime"], "size": f["size"],
                         "done": len([p for p in done if not pages or p <= pages]), "files": files, "review": review,
-                        "bad": bad, "missing": missing[:40], "missingCount": len(missing)})
+                        "bad": bad, "missing": missing[:40], "missingCount": len(missing),
+                        "split": [[int(p), nm] for p, nm in sorted(((int(p), nm) for p, nm in
+                                  ((self._manifest(n, stem) or {}).get("pages") or {}).items()))]})
         return out
 
     def session(self, n):
@@ -2309,6 +2460,8 @@ class Gala:
                 self._step("setting aside Gen7 races not in the entries", self.ignore_strays)
                 self._step("deciding what to ask Claude", self.auto_ask)
                 self._step("starting the merge results and audits", self.auto_compute)
+                if shutil.which("pdfseparate"):
+                    self._step("splitting new scans into pages", self.split_new)
                 if time.time() - self._totals_at > 30:
                     self._step("adding up the folder sizes", self.update_totals)
                 if time.time() - getattr(self, "_tsaved", 0) > 30:
@@ -3815,6 +3968,23 @@ class Handler(BaseHTTPRequestHandler):
         with open(p, "rb") as f:
             shutil.copyfileobj(f, self.wfile, 65536)
 
+    def _gala_page(self, q):
+        """GET /api/gala/page?path=sessions/S2/scans/X.pdf&page=7: that page as a JPEG."""
+        g = self._gala()
+        try:
+            p = g.page_image(q.get("path"), max(1, int(q.get("page") or 1))) if g else None
+        except (ValueError, OSError, subprocess.SubprocessError) as e:
+            return self._json(404, {"error": str(e)})
+        if not p:
+            return self._json(404, {"error": "no data folder"})
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(os.path.getsize(p)))
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        with open(p, "rb") as f:
+            shutil.copyfileobj(f, self.wfile, 65536)
+
     def _gala_upload(self, q):
         """POST /api/gala/upload?folder=inbox|S<n>/<folder>&filename=NAME, the file as the body."""
         g = self._gala()
@@ -3887,6 +4057,11 @@ class Handler(BaseHTTPRequestHandler):
                 g.recheck(int(d.get("session") or 0), int(d.get("event") or 0), who)
             elif path == "/api/gala/fix":
                 g.set_fix(int(d.get("session") or 0), d.get("event"), d.get("heat"), d.get("lane"), d, who)
+            elif path == "/api/gala/split":
+                n = int(d.get("session") or 0)
+                if d.get("name"):
+                    return self._json(200, {"ok": True, "pages": g.split_scan(n, str(d["name"]), who)})
+                return self._json(200, {"ok": True, "scans": g.split_session(n, who)})
             elif path == "/api/gala/session":
                 n = max(g.sessions() or [0]) + 1
                 g.sdir(n)
@@ -3942,6 +4117,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, g.update_status(q.get("fetch") == "1") if g else {"git": False})
             if path == "/api/gala/file":
                 return self._gala_file(q)
+            if path == "/api/gala/page":
+                return self._gala_page(q)
             if path == "/api/board/update":
                 return self._json(200, self.server.updater.status(q.get("check") == "1"))
             if path == "/api/settings":
@@ -4006,7 +4183,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
             if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck",
-                        "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update"):
+                        "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update", "/api/gala/split"):
                 return self._gala_post(path, q)
             if path == "/api/settings/logo":   # the image itself as the body; empty body removes it
                 n = int(self.headers.get("Content-Length") or 0)
@@ -4773,6 +4950,15 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .rd-done{margin-top:8px}.rd-done summary{cursor:pointer}.rd-done .rd-log{margin-top:6px}
 .rd-log .meta{font-size:inherit}
 .rd-busy{margin-top:10px;padding:8px 12px;border-radius:8px;border:1px solid var(--open);color:var(--fg);background:var(--field)}
+/* a scan's page in a quick fix: full width, about half a page high, scroll for the rest */
+.qf-page{margin:6px 0 10px}
+.qf-view{width:100%;aspect-ratio:1235/673;max-height:70vh;overflow:auto;border:1px solid var(--line);border-radius:6px;background:#fff;margin-top:4px}
+.qf-view img{display:block;width:100%;height:auto}
+/* a pack's single pages, under it in the Scans folder */
+.gpages{margin:2px 0 4px 14px}.gpages summary{cursor:pointer}
+.gpages ul{list-style:none;margin:2px 0 0;padding:0}.gpages li{display:flex;gap:8px;align-items:baseline}
+.gsplit{margin-left:6px;font-size:.85em;padding:2px 8px}
+.gfiles li{flex-wrap:wrap}.gfiles li .gpages{flex-basis:100%}.gpages li{border-top:0;padding:1px 0}
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -4974,7 +5160,9 @@ async function loadGala(){
  const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;GALA=j;
  if(!j.root){$('#g-root').textContent='This portal was started without a data folder (--gala-data).';return}
  const cs=curSession();if(cs)GSESS=cs.n;
- renderGalaHead();renderRestart();renderPills('#g-sess');renderPills('#cl-sess');renderSession();renderActivity();renderChecklist()}
+ const keep={};document.querySelectorAll('[data-qfv]').forEach(v=>{if(v.scrollTop)keep[v.dataset.qfv]=v.scrollTop});   // where each page was scrolled to
+ renderGalaHead();renderRestart();renderPills('#g-sess');renderPills('#cl-sess');renderSession();renderActivity();renderChecklist();
+ document.querySelectorAll('[data-qfv]').forEach(v=>{const t=keep[v.dataset.qfv];if(t){const img=v.querySelector('img');const go=()=>{v.scrollTop=t};img&&!img.complete?img.addEventListener('load',go,{once:true}):go()}})}
 // the reading log: what the portal looked in and read (a box while it reads the data folder, then folded away)
 let galaWarmT=0,readOpen=false,readSig='';
 function renderReading(r){const box=$('#g-reading');if(!box)return;
@@ -5017,7 +5205,10 @@ function renderPills(sel){
 function fileList(s,key,files,limit){
  if(!files.length)return '<div class="meta" style="margin-top:8px">Empty.</div>';
  return '<ul class="gfiles">'+files.filter(f=>!f.dir).slice(0,limit||500).map(f=>{const rel='sessions/S'+s.n+'/'+key+'/'+f.name;
-  return `<li><a href="${esc(galaHref(rel))}" target="_blank" rel="noopener" title="${esc(f.name)}">${esc(f.name)}</a><span class="meta">${size(f.size)} · ${agoShort(f.mtime)}</span><a class="meta" href="${esc(galaHref(rel,1))}" title="Download">⤓</a></li>`}).join('')+'</ul>'}
+  const sc=key==='scans'&&(s.scans||[]).find(x=>x.name===f.name),pg=sc&&sc.split&&sc.split.length?sc.split:null;
+  return `<li><a href="${esc(galaHref(rel))}" target="_blank" rel="noopener" title="${esc(f.name)}">${esc(f.name)}</a><span class="meta">${size(f.size)} · ${agoShort(f.mtime)}</span><a class="meta" href="${esc(galaHref(rel,1))}" title="Download">⤓</a>`
+   +(pg?`<details class="gpages"><summary class="meta">${pg.length} page${pg.length>1?'s':''}</summary><ul>${pg.map(([n,nm])=>{const pr='sessions/S'+s.n+'/scans/pages/'+f.name.slice(0,-4)+'/'+nm;
+     return `<li><a href="${esc(galaHref(pr))}" target="_blank" rel="noopener">${esc(nm.slice(f.name.length-1).replace(/\.pdf$/i,''))}</a><a class="meta" href="${esc(galaHref(pr,1))}" title="Download">⤓</a></li>`}).join('')}</ul></details>`:'')+'</li>'}).join('')+'</ul>'}
 function renderSession(){
  const s=curSession(),box=$('#g-session');if(!s){box.innerHTML='';return}
  const c=k=>s.events.filter(e=>e.status===k).length;
@@ -5043,7 +5234,7 @@ function renderSession(){
      return j.state==='running'?`${t}: working…`:j.state==='failed'?`<span class="gwarn">${t} failed: ${esc(j.msg||'')}</span>`:`${t}: done ${esc(agoShort(j.at))}`}).filter(Boolean).join(' · ')}</span></div></div>
   <div class="gfolders">${Object.keys(FOLDER_TXT).map(k=>{const f=s.folders[k]||[];const mine=k==='ocr'||k==='reports';
    return `<div class="card gfolder" data-gfolder="S${s.n}/${k}"><h3><span>${esc(FOLDER_TXT[k][0])} <span class="meta">(${k==='ocr'?s.ocrCount:f.filter(x=>!x.dir).length})</span></span><code>sessions/S${s.n}/${k}</code></h3>
-    <div class="meta">${esc(FOLDER_TXT[k][1])}</div>${fileList(s,k,f)}${k==='ocr'&&s.ocrCount>f.length?`<div class="meta">Newest ${f.length} of ${s.ocrCount}.</div>`:''}
+    <div class="meta">${esc(FOLDER_TXT[k][1])}${k==='scans'&&f.some(x=>!x.dir&&/\.pdf$/i.test(x.name))?` <button type="button" class="gsplit" data-gsplit="${s.n}" title="Split every scan in this session into single pages, named by lane once Claude has read them (new scans are split as they arrive)">Split into pages</button>`:''}</div>${fileList(s,k,f)}${k==='ocr'&&s.ocrCount>f.length?`<div class="meta">Newest ${f.length} of ${s.ocrCount}.</div>`:''}
     ${mine?'':`<div class="drop gdrop">Drop files here, or <label class="lnk">choose files<input type="file" multiple hidden data-gup="S${s.n}/${k}"></label><div class="meta" data-gmsg></div></div>`}</div>`}).join('')}</div>`}
 function renderActivity(){
  const un=GALA.unsorted.filter(f=>!f.dir);
@@ -5089,7 +5280,8 @@ function renderChecklist(){setTimeout(swAll,0);
      <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
       return `<li class="${t?'done':''}${f.cleared?' cleared':''}">${tickBox(k,'Lane '+f.lane+' heat '+f.heat)}<div><b>Lane ${esc(f.lane)} · Heat ${esc(f.heat)}</b>${f.cleared?` <span class="st audited" title="${esc('No longer flagged since '+agoShort(f.clearedAt))}">settled by the re-check</span>`:''} <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
-       ${f.scans.length?`<div class="sm">${f.scans.map(sc=>`<a href="${esc(galaHref('sessions/S'+s.n+'/scans/'+sc.scan))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`).join(' · ')}</div>`:''}
+       ${f.scans.length?f.scans.map(sc=>{const rel='sessions/S'+s.n+'/scans/'+sc.scan,u=url('/api/gala/page');u.searchParams.set('path',rel);u.searchParams.set('page',sc.page||1);
+        return `<div class="qf-page"><div class="sm"><a href="${esc(galaHref(rel))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a> <span class="meta">(scroll the page here, or open it)</span></div><div class="qf-view" data-qfv="${esc(s.n+'|'+sc.scan+'|'+sc.page)}"><img loading="lazy" alt="${esc(sc.label)}, page ${esc(sc.page)}" src="${esc(u.toString())}"></div></div>`}).join(''):''}
        <form class="qffix" data-fix="${s.n}|${e.event}|${esc(f.heat)}|${esc(f.lane)}" autocomplete="off">
         ${(()=>{const w=qfTimes(f,hf),sw=qfSwimmer(s,e,f,hf);f._block=!!(w||sw);f._watch=!!w;return w+sw})()}
         <label>Result <select name="status"><option value="">as audited</option><option value="OK"${hf.status==='OK'?' selected':''}>Swam</option><option value="NS"${hf.status==='NS'?' selected':''}>No-show</option><option value="DQ"${hf.status==='DQ'?' selected':''}>DQ</option></select></label>
@@ -5146,6 +5338,9 @@ async function galaUpload(folder,files,card){
  say(folder==='inbox'?`Uploaded ${files.length} file${files.length>1?'s':''}: sorting…`:`Uploaded ${files.length} file${files.length>1?'s':''}.`);
  galaSig='';loadGala();if(folder==='inbox')setTimeout(()=>{galaSig='';loadGala()},9000)}
 function galaClicks(e){
+ const sp=e.target.closest('[data-gsplit]');if(sp){sp.disabled=true;
+  galaPost('/api/gala/split',{session:+sp.dataset.gsplit}).then(j=>{galaNotice('Splitting '+j.scans+' scan'+(j.scans>1?'s':'')+' into pages: each one\'s pages show under it in a few seconds.');setTimeout(()=>{galaSig='';loadGala()},4000)})
+   .catch(err=>{sp.disabled=false;galaNotice(err.message,'error')});return}
  const sb=e.target.closest('[data-sess]');if(sb){GSESS=+sb.dataset.sess;store('qa-gsess',GSESS);galaSig='';loadGala();return}
  if(e.target.closest('[data-newsess]')){galaPost('/api/gala/session').then(()=>{GSESS=(GALA&&GALA.sessions.length?Math.max(...GALA.sessions.map(s=>s.n)):0)+1;store('qa-gsess',GSESS);galaSig='';loadGala()});return}
  const go=e.target.closest('[data-goto]');if(go){e.preventDefault();showView(go.dataset.goto);return}

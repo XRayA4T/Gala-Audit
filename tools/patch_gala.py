@@ -8,7 +8,7 @@ import re
 import sys
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
-VERSION = "0.15.5"
+VERSION = "0.16.0"
 s = open(sys.argv[1], encoding="utf-8").read()
 piece = lambda name: open(os.path.join(SRC, name), encoding="utf-8").read()  # noqa: E731
 
@@ -62,14 +62,16 @@ sub('''            if path == "/health":
                 g = self._gala()
                 return self._json(200, g.update_status(q.get("fetch") == "1") if g else {"git": False})
             if path == "/api/gala/file":
-                return self._gala_file(q)''')
+                return self._gala_file(q)
+            if path == "/api/gala/page":
+                return self._gala_page(q)''')
 sub('''            if path == "/api/board/update":
                 return self._json(200, {"ok": True, "update": self.server.updater.start(self._who(q))})''', '''            if path == "/api/board/update":   # the board's own updater is off in the portal (it updates with git)
                 return self._json(200, {"ok": True, "update": self.server.updater.start(self._who(q))})
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
             if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck",
-                        "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update"):
+                        "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update", "/api/gala/split"):
                 return self._gala_post(path, q)''')
 # the web terminal through the portal (/terminal/ro/, /terminal/rw/, the admin key) is part of the QA board itself
 # quieter log: the page and the watcher poll every few seconds

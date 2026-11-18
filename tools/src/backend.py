@@ -790,6 +790,155 @@ class Gala:
                     out.append(dict(r, file=f["name"], mtime=f["mtime"]))
         return out
 
+    # ---- scans split into single pages: scans/pages/<pack>/<pack> - Lane 7.pdf (or - p07.pdf until Claude has read
+    # the page). The packs stay the working copy (Claude, the OCR names, the audit report); the pages are for people.
+    def pages_dir(self, n, stem):
+        return os.path.join(self.sdir(n, "scans"), "pages", stem)
+
+    def _page_names(self, n, stem, count):
+        """The file name for each page of a pack: the lane from Claude's transcription when it has one."""
+        lanes = {}
+        if self.scan_kind(stem + ".pdf") == "lanes":
+            for o in _ls(self.sdir(n, "ocr")):
+                nm = o["name"]
+                if not nm.startswith(stem + "-"):
+                    continue
+                mp, ml = OCR_PAGE.search(nm), OCR_LANE.search(nm)
+                if mp and ml and not OCR_SLIP.search(nm):
+                    lanes.setdefault(int(ml.group(2)), set()).add(int(mp.group(1)))
+        by_page = {}
+        for lane, ps in lanes.items():
+            for p in ps:
+                by_page[p] = "Lane %d" % lane if len(ps) == 1 else "Lane %d p%02d" % (lane, p)
+        return {p: "%s - %s.pdf" % (stem, by_page.get(p) or "p%02d" % p) for p in range(1, count + 1)}
+
+    def _manifest(self, n, stem):
+        try:
+            with open(os.path.join(self.pages_dir(n, stem), ".manifest.json"), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def split_scan(self, n, name, who=None):
+        """Split one pack into single pages (again: the old pages are replaced)."""
+        src = os.path.join(self.sdir(n, "scans"), name)
+        stem = name[:-4]
+        if not (name.lower().endswith(".pdf") and os.path.isfile(src)):
+            raise ValueError("no such scan: %s" % name)
+        tool = shutil.which("pdfseparate")
+        if not tool:
+            raise ValueError("pdfseparate isn't installed (install poppler-utils)")
+        st = os.stat(src)
+        count = self.pdf_pages(src) or 0
+        d = self.pages_dir(n, stem)
+        tmp = d + ".new"
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp)
+        r = subprocess.run([tool, src, os.path.join(tmp, ".page-%d.pdf")], capture_output=True, text=True, timeout=300)
+        made = sorted(int(m.group(1)) for m in (re.fullmatch(r"\.page-(\d+)\.pdf", f) for f in os.listdir(tmp)) if m)
+        if r.returncode != 0 or not made:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ValueError("couldn't split %s: %s" % (name, (r.stderr or "no pages").strip()[:200]))
+        count = max(count, made[-1])
+        names = self._page_names(n, stem, count)
+        for p in made:
+            os.replace(os.path.join(tmp, ".page-%d.pdf" % p), os.path.join(tmp, names[p]))
+        with open(os.path.join(tmp, ".manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"sig": [st.st_mtime, st.st_size], "pages": {str(p): names[p] for p in made}}, f)
+        shutil.rmtree(d, ignore_errors=True)
+        os.replace(tmp, d)
+        with self.lock:
+            self.state.setdefault("splitSeen", {})[src] = [st.st_mtime, st.st_size]
+            self.save()
+        self.rlog("Split S%d/scans/%s into %d page%s" % (n, name, len(made), "" if len(made) == 1 else "s"))
+        if who:
+            self.log("%s split into %d pages by %s" % (name, len(made), who), name=name)
+        return len(made)
+
+    def split_session(self, n, who):
+        """The Scans folder's "Split into pages" button: every pack in the session, in a thread."""
+        names = [f["name"] for f in _ls(self.sdir(n, "scans")) if not f["dir"] and f["name"].lower().endswith(".pdf")]
+        if not names:
+            raise ValueError("no scans in session %d" % n)
+
+        def go():
+            done = 0
+            for nm in names:
+                try:
+                    self.split_scan(n, nm)
+                    done += 1
+                except Exception as e:
+                    self.rlog("Couldn't split S%d/scans/%s: %s" % (n, nm, e), bad=True)
+            self.log("Session %d: %d of %d scans split into pages by %s" % (n, done, len(names), who))
+
+        threading.Thread(target=go, daemon=True, name="split S%d" % n).start()
+        return len(names)
+
+    def split_new(self):
+        """In the loop: split scans that arrive (or are rescanned) into pages; keep the page names up to date as Claude
+        reads the pages; remove pages of packs that are gone. Packs there before this existed wait for the button."""
+        with self.lock:
+            seen = self.state.setdefault("splitSeen", {})
+            first = not self.state.get("splitInit")
+        for n in self.sessions():
+            d = self.sdir(n, "scans")
+            packs = {f["name"]: f for f in _ls(d) if not f["dir"] and f["name"].lower().endswith(".pdf")}
+            for name, f in packs.items():
+                src = os.path.join(d, name)
+                sig = [f["mtime"], f["size"]]
+                if first:
+                    seen.setdefault(src, sig)
+                    continue
+                if seen.get(src) != sig and time.time() - f["mtime"] > 5:
+                    try:
+                        self.split_scan(n, name)
+                    except Exception as e:
+                        seen[src] = sig   # don't try again and again
+                        self.rlog("Couldn't split S%d/scans/%s: %s" % (n, name, e), bad=True)
+                    continue
+                man = self._manifest(n, name[:-4])
+                if man:   # rename pages Claude has read since
+                    want = self._page_names(n, name[:-4], max(int(p) for p in man["pages"]) if man["pages"] else 0)
+                    pd = self.pages_dir(n, name[:-4])
+                    changed = False
+                    for p, old in list(man["pages"].items()):
+                        new = want.get(int(p))
+                        if new and new != old and os.path.exists(os.path.join(pd, old)) \
+                                and not os.path.exists(os.path.join(pd, new)):
+                            os.replace(os.path.join(pd, old), os.path.join(pd, new))
+                            man["pages"][p] = new
+                            changed = True
+                    if changed:
+                        with open(os.path.join(pd, ".manifest.json"), "w", encoding="utf-8") as fh:
+                            json.dump(man, fh)
+            pdir = os.path.join(d, "pages")
+            for f in _ls(pdir):
+                if f["dir"] and f["name"] + ".pdf" not in packs and not f["name"].endswith(".new"):
+                    shutil.rmtree(os.path.join(pdir, f["name"]), ignore_errors=True)
+        if first:
+            with self.lock:
+                self.state["splitInit"] = time.time()
+                self.save()
+
+    def page_image(self, rel, page):
+        """A page of a scan as a JPEG (for the quick fixes), drawn once with pdftoppm and kept in data/.portal-pages/."""
+        src = gala_path(self.root, rel)
+        if not src or not src.lower().endswith(".pdf"):
+            raise ValueError("no such scan")
+        st = os.stat(src)
+        key = hashlib.sha1(("%s|%s|%s|%d" % (src, st.st_mtime, st.st_size, page)).encode()).hexdigest()[:20]
+        cdir = os.path.join(self.root, ".portal-pages")
+        out = os.path.join(cdir, key + ".jpg")
+        if not os.path.exists(out):
+            os.makedirs(cdir, exist_ok=True)
+            r = subprocess.run(["pdftoppm", "-jpeg", "-jpegopt", "quality=75", "-r", "110", "-f", str(page),
+                                "-l", str(page), "-singlefile", src, os.path.join(cdir, key + ".tmp")],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0 or not os.path.exists(os.path.join(cdir, key + ".tmp.jpg")):
+                raise ValueError("couldn't draw page %d: %s" % (page, (r.stderr or "").strip()[:200]))
+            os.replace(os.path.join(cdir, key + ".tmp.jpg"), out)
+        return out
+
     def scans(self, n):
         d, ocr = self.sdir(n, "scans"), self.sdir(n, "ocr")
         ocr_files = [f["name"] for f in _ls(ocr) if f["name"].lower().endswith(".json")]
@@ -821,7 +970,9 @@ class Gala:
             out.append({"name": f["name"], "kind": self.scan_kind(f["name"]), "event": ev,
                         "events": sorted(events), "pages": pages, "mtime": f["mtime"], "size": f["size"],
                         "done": len([p for p in done if not pages or p <= pages]), "files": files, "review": review,
-                        "bad": bad, "missing": missing[:40], "missingCount": len(missing)})
+                        "bad": bad, "missing": missing[:40], "missingCount": len(missing),
+                        "split": [[int(p), nm] for p, nm in sorted(((int(p), nm) for p, nm in
+                                  ((self._manifest(n, stem) or {}).get("pages") or {}).items()))]})
         return out
 
     def session(self, n):
@@ -1641,6 +1792,8 @@ class Gala:
                 self._step("setting aside Gen7 races not in the entries", self.ignore_strays)
                 self._step("deciding what to ask Claude", self.auto_ask)
                 self._step("starting the merge results and audits", self.auto_compute)
+                if shutil.which("pdfseparate"):
+                    self._step("splitting new scans into pages", self.split_new)
                 if time.time() - self._totals_at > 30:
                     self._step("adding up the folder sizes", self.update_totals)
                 if time.time() - getattr(self, "_tsaved", 0) > 30:

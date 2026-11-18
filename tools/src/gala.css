@@ -146,3 +146,12 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .rd-done{margin-top:8px}.rd-done summary{cursor:pointer}.rd-done .rd-log{margin-top:6px}
 .rd-log .meta{font-size:inherit}
 .rd-busy{margin-top:10px;padding:8px 12px;border-radius:8px;border:1px solid var(--open);color:var(--fg);background:var(--field)}
+/* a scan's page in a quick fix: full width, about half a page high, scroll for the rest */
+.qf-page{margin:6px 0 10px}
+.qf-view{width:100%;aspect-ratio:1235/673;max-height:70vh;overflow:auto;border:1px solid var(--line);border-radius:6px;background:#fff;margin-top:4px}
+.qf-view img{display:block;width:100%;height:auto}
+/* a pack's single pages, under it in the Scans folder */
+.gpages{margin:2px 0 4px 14px}.gpages summary{cursor:pointer}
+.gpages ul{list-style:none;margin:2px 0 0;padding:0}.gpages li{display:flex;gap:8px;align-items:baseline}
+.gsplit{margin-left:6px;font-size:.85em;padding:2px 8px}
+.gfiles li{flex-wrap:wrap}.gfiles li .gpages{flex-basis:100%}.gpages li{border-top:0;padding:1px 0}
