@@ -1,6 +1,6 @@
 
 // ---- Gala and Checklist tabs: the gala's files by session, sorted from the inbox; per-event progress; ticks
-let GALA=null,galaSig='',GSESS=+(store('qa-gsess')||0);
+let galaBusy=false,GALA=null,galaSig='',GSESS=+(store('qa-gsess')||0);
 function galaHref(rel,dl){const u=url('/api/gala/file');u.searchParams.set('path',rel);if(dl)u.searchParams.set('dl','1');return u.toString()}
 async function galaPost(path,body){return api(path,Object.assign({by:me()||'someone'},body||{}))}
 const ST_TXT={waiting:'waiting',ready:'ready',asked:'with Claude',transcribed:'transcribed',computing:'working…',audited:'audited',changed:'new files'};
@@ -16,7 +16,10 @@ async function loadCodes(n){if(CODES_FOR===n)return;CODES_FOR=n;
   dl.innerHTML=(j.codes||[]).map(c=>`<option value="${esc(c[0])}">${esc(c[0]+' – '+c[1]+(c[2]?' ('+c[2]+')':''))}</option>`).join('')}catch(e){CODES_FOR=null}}
 async function loadGala(){
  if(galaEditing()||selectingIn($('#v-gala'))||selectingIn($('#v-checklist'))||selectingIn($('#v-restart')))return;   // typing, or selecting text to copy
+ if(galaBusy)return;galaBusy=true;   // one at a time: a slow answer mustn't pile up more requests behind it
+ const slow=setTimeout(()=>{if(!GALA)$('#g-root').textContent='Reading the data folder… (after a restart or an update the portal reads every PDF once; this can take a minute or two)'},1500);
  let j;try{j=await api('/api/gala/overview')}catch(e){$('#g-root').textContent='Could not load the data folder: '+e.message;return}
+ finally{galaBusy=false;clearTimeout(slow)}
  const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;GALA=j;
  if(!j.root){$('#g-root').textContent='This portal was started without a data folder (--gala-data).';return}
  const cs=curSession();if(cs)GSESS=cs.n;

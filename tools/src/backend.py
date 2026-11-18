@@ -111,6 +111,9 @@ class Gala:
         self.store = store
         self.lock = threading.RLock()
         self.cache = {}
+        self.tlock = threading.Lock()
+        self.tcache, self.tdirty = None, False
+        self.tcache_file = os.path.join(self.root, ".portal-cache.json")
         # inbox file -> ((size, mtime), when this computer first saw it like that), to wait until it is fully
         # written. Timed by this computer's clock, not the file's mtime, which on a Windows share comes from
         # another computer's clock and may be ahead or behind.
@@ -157,10 +160,50 @@ class Gala:
         self.cache[key] = ((st.st_mtime, st.st_size), val)
         return val
 
+    # pdfinfo / pdftotext output, kept in data/.portal-cache.json too, so a restart doesn't read every PDF again
+    # (hundreds of Gen7 races and scans: minutes on a slow computer, while the page waits)
+    def _tool(self, args, path, timeout):
+        try:
+            st = os.stat(path)
+        except OSError:
+            raise OSError("gone")
+        key = " ".join(args) + "\0" + path
+        sig = [st.st_mtime, st.st_size]
+        with self.tlock:
+            if self.tcache is None:
+                try:
+                    with open(self.tcache_file, encoding="utf-8") as f:
+                        self.tcache = json.load(f)
+                except (OSError, ValueError):
+                    self.tcache = {}
+            hit = self.tcache.get(key)
+        if hit and hit[0] == sig:
+            return hit[1]
+        out = subprocess.run(list(args) + [path, "-"] if args[0] == "pdftotext" else list(args) + [path],
+                             capture_output=True, text=True, timeout=timeout).stdout
+        with self.tlock:
+            self.tcache[key] = [sig, out]
+            self.tdirty = True
+        return out
+
+    def save_tool_cache(self):
+        with self.tlock:
+            if not self.tdirty or self.tcache is None:
+                return
+            live = {k: v for k, v in self.tcache.items() if os.path.exists(k.split("\0", 1)[1])}
+            self.tcache, self.tdirty = live, False
+            try:
+                tmp = self.tcache_file + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(live, f)
+                os.replace(tmp, self.tcache_file)
+            except OSError:
+                pass
+
     def pdf_pages(self, path):
         def run(p):
             try:
-                out = subprocess.run(["pdfinfo", p], capture_output=True, text=True, timeout=30).stdout
+                out = self._tool(["pdfinfo"], p, 30)
                 m = re.search(r"^Pages:\s+(\d+)", out, re.M)
                 return int(m.group(1)) if m else None
             except (OSError, subprocess.SubprocessError):
@@ -170,8 +213,7 @@ class Gala:
     def pdf_text(self, path):
         def run(p):
             try:
-                return subprocess.run(["pdftotext", "-l", "6", p, "-"], capture_output=True, text=True,
-                                      timeout=60).stdout
+                return self._tool(["pdftotext", "-l", "6"], p, 60)
             except (OSError, subprocess.SubprocessError):
                 return ""
         return self._cached("text", path, run) or ""
@@ -180,8 +222,7 @@ class Gala:
         """Meet Manager's printed (not scanned) lane sheets: {events: [...], sheets: N}; no events if it isn't one."""
         def run(p):
             try:
-                txt = subprocess.run(["pdftotext", "-layout", p, "-"], capture_output=True, text=True,
-                                     timeout=120).stdout
+                txt = self._tool(["pdftotext", "-layout"], p, 120)
             except (OSError, subprocess.SubprocessError):
                 return {"events": [], "sheets": 0, "heats": {}, "lanes": {}}
             sheets, heats, lanes = 0, {}, {}
@@ -214,7 +255,7 @@ class Gala:
         """The Gen7 races in a PDF: {session, races: [{race, event, heat, desc}]} (empty races: not a Gen7 PDF)."""
         def run(p):
             try:
-                txt = subprocess.run(["pdftotext", p, "-"], capture_output=True, text=True, timeout=60).stdout
+                txt = self._tool(["pdftotext"], p, 60)
             except (OSError, subprocess.SubprocessError):
                 txt = ""
             races = []
@@ -1425,6 +1466,15 @@ class Gala:
                 self.ignore_strays()
                 self.auto_ask()
                 self.auto_compute()
+                if not getattr(self, "_warm", False):   # read every PDF once now, not while a page waits
+                    t0 = time.time()
+                    for n in self.sessions():
+                        self.session(n)
+                    self._warm = True
+                    sys.stderr.write("gala: data folder read in %.1fs\n" % (time.time() - t0))
+                if time.time() - getattr(self, "_tsaved", 0) > 30:
+                    self._tsaved = time.time()
+                    self.save_tool_cache()
             except Exception as e:
                 sys.stderr.write("gala loop: %r\n" % (e,))
             time.sleep(every)
