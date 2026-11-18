@@ -155,3 +155,4 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .gpages ul{list-style:none;margin:2px 0 0;padding:0}.gpages li{display:flex;gap:8px;align-items:baseline}
 .gsplit{margin-left:6px;font-size:.85em;padding:2px 8px}
 .gfiles li{flex-wrap:wrap}.gfiles li .gpages{flex-basis:100%}.gpages li{border-top:0;padding:1px 0}
+.qf-page summary{cursor:pointer}.qf-page{margin-top:8px}

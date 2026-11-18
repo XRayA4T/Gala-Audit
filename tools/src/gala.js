@@ -1,6 +1,6 @@
 
 // ---- Gala and Checklist tabs: the gala's files by session, sorted from the inbox; per-event progress; ticks
-let galaBusy=false,GALA=null,galaSig='',GSESS=+(store('qa-gsess')||0);
+let QP_OPEN={},galaBusy=false,GALA=null,galaSig='',GSESS=+(store('qa-gsess')||0);
 function galaHref(rel,dl){const u=url('/api/gala/file');u.searchParams.set('path',rel);if(dl)u.searchParams.set('dl','1');return u.toString()}
 async function galaPost(path,body){return api(path,Object.assign({by:me()||'someone'},body||{}))}
 const ST_TXT={waiting:'waiting',ready:'ready',asked:'with Claude',transcribed:'transcribed',computing:'working…',audited:'audited',changed:'new files'};
@@ -151,8 +151,6 @@ function renderChecklist(){setTimeout(swAll,0);
      <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
       return `<li class="${t?'done':''}${f.cleared?' cleared':''}">${tickBox(k,'Lane '+f.lane+' heat '+f.heat)}<div><b>Lane ${esc(f.lane)} · Heat ${esc(f.heat)}</b>${f.cleared?` <span class="st audited" title="${esc('No longer flagged since '+agoShort(f.clearedAt))}">settled by the re-check</span>`:''} <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
-       ${f.scans.length?f.scans.map(sc=>{const rel='sessions/S'+s.n+'/scans/'+sc.scan,u=url('/api/gala/page');u.searchParams.set('path',rel);u.searchParams.set('page',sc.page||1);
-        return `<div class="qf-page"><div class="sm"><a href="${esc(galaHref(rel))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a> <span class="meta">(scroll the page here, or open it)</span></div><div class="qf-view" data-qfv="${esc(s.n+'|'+sc.scan+'|'+sc.page)}"><img loading="lazy" alt="${esc(sc.label)}, page ${esc(sc.page)}" src="${esc(u.toString())}"></div></div>`}).join(''):''}
        <form class="qffix" data-fix="${s.n}|${e.event}|${esc(f.heat)}|${esc(f.lane)}" autocomplete="off">
         ${(()=>{const w=qfTimes(f,hf),sw=qfSwimmer(s,e,f,hf);f._block=!!(w||sw);f._watch=!!w;return w+sw})()}
         <label>Result <select name="status"><option value="">as audited</option><option value="OK"${hf.status==='OK'?' selected':''}>Swam</option><option value="NS"${hf.status==='NS'?' selected':''}>No-show</option><option value="DQ"${hf.status==='DQ'?' selected':''}>DQ</option></select></label>
@@ -162,7 +160,10 @@ function renderChecklist(){setTimeout(swAll,0);
         ${(()=>{const mi=/not in the merge file/i.test(f.checks.join(' ')),wr=!!(f.row&&f.row.writtenIn)||/written in/i.test(f.checks.join(' '));
           return `<button type="submit"${mi||wr||f._watch?' class="primary"':''}>${mi||wr?(hf.add?'Confirmed · update':mi?'Confirm swim':'Confirm swimmer'):f._watch?'Save &amp; recalculate':hf.by?'Update':'Save fix'}</button>`})()}${hf.by?'<button type="button" data-clearfix>Clear</button>':''}
         <span class="sm" data-fixmsg>${hf.by?esc('Fixed by '+hf.by+' · '+agoShort(hf.at)):'Or just tick it if nothing needs changing.'}</span></form>
-       ${t?`<div class="sm">done · ticked by ${esc(t.by)} · ${esc(agoShort(t.at))}</div>`:''}</div></li>`}).join('')}</ul></details></td></tr>`:'';
+       ${t?`<div class="sm">done · ticked by ${esc(t.by)} · ${esc(agoShort(t.at))}</div>`:''}
+       ${f.scans.length?f.scans.map(sc=>{const rel='sessions/S'+s.n+'/scans/'+sc.scan,u=url('/api/gala/page');u.searchParams.set('path',rel);u.searchParams.set('page',sc.page||1);
+        const dk=k+'|'+sc.scan+'|'+sc.page,was=QP_OPEN[dk],open=was&&was.ticked===!!t?was.open:!t;   // open until ticked, unless opened or closed by hand
+        return `<details class="qf-page" data-qpd="${esc(dk)}" data-ticked="${t?1:0}"${open?' open':''}><summary class="sm"><a href="${esc(galaHref(rel))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a> <span class="meta">(scroll the page here, or open it)</span></summary><div class="qf-view" data-qfv="${esc(s.n+'|'+sc.scan+'|'+sc.page)}"><img loading="lazy" alt="${esc(sc.label)}, page ${esc(sc.page)}" src="${esc(u.toString())}"></div></details>`}).join(''):''}</div></li>`}).join('')}</ul></details></td></tr>`:'';
    return `<tr class="${t?'done':''}" data-cldrop="S${s.n}/scans">
     <td>${tickBox(key,'Event '+e.event)}</td>
     <td><span class="evname">Event ${e.event}</span>${e.desc?`<div class="sm">${esc(e.desc)}</div>`:''}${!e.expected&&s.meet.entries.length?'<div class="sm gwarn">not in the entries</div>':''}${t?`<div class="sm">ticked by ${esc(t.by)}</div>`:''}</td>
@@ -467,3 +468,6 @@ async function rsRestore(name,hasQ){const s=(GALA&&GALA.summary)||{};
   galaNotice('Restored '+name+'.'+(j.archive?' What was here is in data/archive/'+j.archive+'.':''));GSESS=0;galaSig='';loadGala()}
  catch(err){galaNotice(err.message,'error')}}
 
+
+// remember a quick fix page opened or closed by hand (until the item is ticked or unticked)
+document.addEventListener('toggle',e=>{const d=e.target;if(d&&d.matches&&d.matches('details[data-qpd]'))QP_OPEN[d.dataset.qpd]={open:d.open,ticked:d.dataset.ticked==='1'}},true);
