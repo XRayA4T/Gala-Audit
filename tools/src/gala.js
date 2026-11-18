@@ -15,7 +15,7 @@ async function loadCodes(n){if(CODES_FOR===n)return;CODES_FOR=n;
  try{const j=await api('/api/gala/codes?session='+n);CODES=j;let dl=$('#dqcodes');if(!dl){dl=document.createElement('datalist');dl.id='dqcodes';document.body.appendChild(dl)}
   dl.innerHTML=(j.codes||[]).map(c=>`<option value="${esc(c[0])}">${esc(c[0]+' – '+c[1]+(c[2]?' ('+c[2]+')':''))}</option>`).join('')}catch(e){CODES_FOR=null}}
 async function loadGala(){
- if(galaEditing())return;
+ if(galaEditing()||selectingIn($('#v-gala'))||selectingIn($('#v-checklist'))||selectingIn($('#v-restart')))return;   // typing, or selecting text to copy
  let j;try{j=await api('/api/gala/overview')}catch(e){$('#g-root').textContent='Could not load the data folder: '+e.message;return}
  const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;GALA=j;
  if(!j.root){$('#g-root').textContent='This portal was started without a data folder (--gala-data).';return}
@@ -377,11 +377,11 @@ $('#rs-arch').addEventListener('click',async ev=>{const r=ev.target.closest('[da
  galaPost('/api/gala/archive-delete',{name:b.dataset.rsdel}).then(()=>{galaNotice('Archive deleted.');galaSig='';loadGala()}).catch(err=>galaNotice(err.message,'error'))});
 
 // ---- Restart tab: updates from GitHub (update.sh)
-let UPD=null,updAt=0;
+let GUPD=null,updAt=0;
 async function loadUpdate(fetch){
- try{UPD=await api('/api/gala/update-status'+(fetch?'?fetch=1':''));updAt=Date.now()}catch(e){$('#up-info').textContent='Could not check: '+e.message;return}
+ try{GUPD=await api('/api/gala/update-status'+(fetch?'?fetch=1':''));updAt=Date.now()}catch(e){$('#up-info').textContent='Could not check: '+e.message;return}
  renderUpdate()}
-function renderUpdate(){const u=UPD;if(!u)return;const go=$('#up-go'),cl=$('#up-claude-l');go.hidden=cl.hidden=true;
+function renderUpdate(){const u=GUPD;if(!u)return;const go=$('#up-go'),cl=$('#up-claude-l');go.hidden=cl.hidden=true;
  if(!u.git){$('#up-info').innerHTML='This copy of the portal (v'+esc(u.version)+') isn\'t a git clone, so it can\'t update itself. Install it with <code>install.sh</code> to get updates.';return}
  const cur=(u.current||'').split('|');let h='Installed: <b>v'+esc(u.version)+'</b> · <code>'+esc(cur[0]||'?')+'</code> '+esc(cur[1]||'')+(cur[2]?' – '+esc(cur[2]):'');
  if(u.fetched===false)h+='<br><span class="bad">Couldn\'t reach GitHub just now (no internet?).</span>';
@@ -400,7 +400,7 @@ $('#up-go').addEventListener('click',async()=>{const claude=$('#up-claude').chec
  $('#up-go').disabled=true;
  try{await galaPost('/api/gala/update',{claude})}catch(err){$('#up-go').disabled=false;galaNotice(err.message,'error');return}
  galaNotice('Updating… the page reloads when the portal is back.');$('#up-info').textContent='Updating…';
- const was=UPD&&UPD.current;let down=false;const t0=Date.now();
+ const was=GUPD&&GUPD.current;let down=false;const t0=Date.now();
  const poll=async()=>{if(Date.now()-t0>180000){galaNotice('The portal hasn\'t come back after 3 minutes. Look at .portal/update.log, or run bash start-portal.sh.','error');return}
   try{const r=await fetch(url('/api/gala/update-status'),{cache:'no-store'});if(r.ok){const j=await r.json();
    if(down||(j.current&&j.current!==was)){location.reload();return}}else down=true}catch(e){down=true}

@@ -47,7 +47,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.15.0"
+VERSION = "0.15.1"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 STATUSES = ("open", "answered", "resolved", "on_hold")
 
@@ -4593,7 +4593,7 @@ async function loadCodes(n){if(CODES_FOR===n)return;CODES_FOR=n;
  try{const j=await api('/api/gala/codes?session='+n);CODES=j;let dl=$('#dqcodes');if(!dl){dl=document.createElement('datalist');dl.id='dqcodes';document.body.appendChild(dl)}
   dl.innerHTML=(j.codes||[]).map(c=>`<option value="${esc(c[0])}">${esc(c[0]+' – '+c[1]+(c[2]?' ('+c[2]+')':''))}</option>`).join('')}catch(e){CODES_FOR=null}}
 async function loadGala(){
- if(galaEditing())return;
+ if(galaEditing()||selectingIn($('#v-gala'))||selectingIn($('#v-checklist'))||selectingIn($('#v-restart')))return;   // typing, or selecting text to copy
  let j;try{j=await api('/api/gala/overview')}catch(e){$('#g-root').textContent='Could not load the data folder: '+e.message;return}
  const sig=JSON.stringify(j);if(sig===galaSig)return;galaSig=sig;GALA=j;
  if(!j.root){$('#g-root').textContent='This portal was started without a data folder (--gala-data).';return}
@@ -4955,11 +4955,11 @@ $('#rs-arch').addEventListener('click',async ev=>{const r=ev.target.closest('[da
  galaPost('/api/gala/archive-delete',{name:b.dataset.rsdel}).then(()=>{galaNotice('Archive deleted.');galaSig='';loadGala()}).catch(err=>galaNotice(err.message,'error'))});
 
 // ---- Restart tab: updates from GitHub (update.sh)
-let UPD=null,updAt=0;
+let GUPD=null,updAt=0;
 async function loadUpdate(fetch){
- try{UPD=await api('/api/gala/update-status'+(fetch?'?fetch=1':''));updAt=Date.now()}catch(e){$('#up-info').textContent='Could not check: '+e.message;return}
+ try{GUPD=await api('/api/gala/update-status'+(fetch?'?fetch=1':''));updAt=Date.now()}catch(e){$('#up-info').textContent='Could not check: '+e.message;return}
  renderUpdate()}
-function renderUpdate(){const u=UPD;if(!u)return;const go=$('#up-go'),cl=$('#up-claude-l');go.hidden=cl.hidden=true;
+function renderUpdate(){const u=GUPD;if(!u)return;const go=$('#up-go'),cl=$('#up-claude-l');go.hidden=cl.hidden=true;
  if(!u.git){$('#up-info').innerHTML='This copy of the portal (v'+esc(u.version)+') isn\'t a git clone, so it can\'t update itself. Install it with <code>install.sh</code> to get updates.';return}
  const cur=(u.current||'').split('|');let h='Installed: <b>v'+esc(u.version)+'</b> · <code>'+esc(cur[0]||'?')+'</code> '+esc(cur[1]||'')+(cur[2]?' – '+esc(cur[2]):'');
  if(u.fetched===false)h+='<br><span class="bad">Couldn\'t reach GitHub just now (no internet?).</span>';
@@ -4978,7 +4978,7 @@ $('#up-go').addEventListener('click',async()=>{const claude=$('#up-claude').chec
  $('#up-go').disabled=true;
  try{await galaPost('/api/gala/update',{claude})}catch(err){$('#up-go').disabled=false;galaNotice(err.message,'error');return}
  galaNotice('Updating… the page reloads when the portal is back.');$('#up-info').textContent='Updating…';
- const was=UPD&&UPD.current;let down=false;const t0=Date.now();
+ const was=GUPD&&GUPD.current;let down=false;const t0=Date.now();
  const poll=async()=>{if(Date.now()-t0>180000){galaNotice('The portal hasn\'t come back after 3 minutes. Look at .portal/update.log, or run bash start-portal.sh.','error');return}
   try{const r=await fetch(url('/api/gala/update-status'),{cache:'no-store'});if(r.ok){const j=await r.json();
    if(down||(j.current&&j.current!==was)){location.reload();return}}else down=true}catch(e){down=true}
@@ -5063,7 +5063,7 @@ async function loadLive(){
   if(!j.ts){st.textContent='Nothing yet. The live view appears when the board watcher on the server runs with --live.';box.hidden=true;return}
   st.innerHTML=(!fresh?'<b class="err">Not updating</b> (last update '+ago(j.ts)+'). The watcher may be stopped.'
    :(j.busy?'<b>Claude is working</b>':'Claude is idle')+' · screen last changed '+agoShort(changed))+(j.title?' · '+esc(j.title):'');
-  if(changed!==liveTs){liveTs=changed;const pre=$('#livepre');const atBottom=box.hidden||pre.scrollTop+pre.clientHeight>=pre.scrollHeight-30;
+  if(changed!==liveTs&&!selectingIn($('#livepre'))){liveTs=changed;const pre=$('#livepre');const atBottom=box.hidden||pre.scrollTop+pre.clientHeight>=pre.scrollHeight-30;
    box.hidden=false;pre.innerHTML=ansiToHtml(j.text||'');if(atBottom)pre.scrollTop=pre.scrollHeight}
  }catch(e){if(full)$('#livestate').textContent='Could not reach the board: '+e.message}}
 $('#livecopy').onclick=()=>{const t=$('#livecodetext').textContent;const b=$('#livecopy');
@@ -5293,7 +5293,13 @@ function mdLines(lines,opt){ // lines are already HTML-escaped; opt.doc: a Markd
  if(code!==null)out.push('<pre><code>'+code.join('\n')+'</code></pre>');
  flushP();flushL();return out.join('');
 }
+// Is the person selecting text in el (to copy it)? Then the periodic refresh leaves el alone until they stop,
+// or the selection would vanish under them.
+function selectingIn(el){const s=window.getSelection&&window.getSelection();
+ if(!el||!s||s.isCollapsed||!s.rangeCount)return false;
+ const n=s.getRangeAt(0).commonAncestorContainer;return el.contains(n.nodeType===1?n:n.parentNode)}
 async function load(){
+ if(selectingIn($('#list')))return;   // text selected in a question or answer: refresh after
  // While someone is in an answer box, hold the refresh: always if they've typed something, and for
  // 20s of no activity if it's empty. After that the list refreshes and the box gets its focus back.
  const a=document.activeElement;let refocus=null;
@@ -5564,7 +5570,7 @@ function depCard(d){const p=depPct(d),st=(d.steps||[]).filter(x=>x&&typeof x==='
  ${wf?`<div class="depwait"><b>Needs you:</b> ${esc(wf.reason||'')}${wf.url&&/^https?:\/\//.test(wf.url)?` · <a href="${esc(wf.url)}" target="_blank" rel="noopener noreferrer">Open link</a>`:''}${wf.code?` · code <code>${esc(wf.code)}</code>`:''}</div>`:''}
  ${er?`<div class="deperr"><b>Failed${er.step?' at '+esc(er.step):''}:</b> ${esc(er.message||'')}${er.log?` · log: ${linkDocs(esc(String(er.log)))}`:''}</div>`:''}
  </div>`}
-function renderDeps(){$('#deplist').innerHTML=DEPS.length?DEPS.map(depCard).join(''):'<div class="empty">No deployments yet.</div>'}
+function renderDeps(){if(selectingIn($('#deplist')))return;$('#deplist').innerHTML=DEPS.length?DEPS.map(depCard).join(''):'<div class="empty">No deployments yet.</div>'}
 async function loadDeps(){
  clearTimeout(depTimer);
  try{DEPS=(await api('/api/deployments?limit=20')).deployments||[];renderDepStrip();if(view==='deploys')renderDeps()}catch(e){}
@@ -5702,6 +5708,7 @@ let dsearchT=null;
 $('#dsearch').oninput=()=>{clearTimeout(dsearchT);dsearchT=setTimeout(loadDocs,250)};
 $('#darch').onchange=loadDocs;
 async function loadDocs(){
+ if(selectingIn($('#docs')))return;
  const a=document.activeElement;if(a&&a.closest&&a.closest('#v-docs')&&a.id!=='dsearch'&&a.value&&a.type!=='checkbox')return;
  try{const p=new URLSearchParams();const s=$('#dsearch').value.trim();if(s)p.set('q',s);if($('#darch').checked)p.set('archived','1');
   const j=await api('/api/docs?'+p);maxMB=j.max_mb||maxMB;$('#maxmb').textContent=`Up to ${maxMB} MB per file. Everyone with access to the board can open these.`;
