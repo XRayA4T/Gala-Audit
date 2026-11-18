@@ -47,6 +47,19 @@ function renderReading(r){const box=$('#g-reading');if(!box)return;
  else box.innerHTML=`<details class="rd-done"${readOpen?' open':''}><summary class="meta">${r.started?'Data folder read in '+secs+'s'+(r.done?', '+r.done+' PDF'+(r.done>1?'s':'')+' read':', nothing new to read')+' · ':''}reading log</summary>${log}</details>`;
  const d=box.querySelector('details');if(d)d.addEventListener('toggle',()=>{readOpen=d.open});
  const nl=box.querySelector('.rd-log');if(nl)nl.scrollTop=atEnd?nl.scrollHeight:top}
+// what the portal is doing, asked for on its own (it answers straight away, even when the sessions are slow to load)
+let statusBusy=false;
+const dur=s=>s>=60?Math.floor(s/60)+'m '+(s%60)+'s':s+'s';
+function renderBusy(s){const b=$('#g-busy');if(!b)return;const h=[];
+ for(const o of s.offline||[])h.push(`<b>Linked folder inbox/${esc(o.name)}</b>${o.target?' (→ <code>'+esc(o.target)+'</code>)':''} ${o.why==='not answering'?'isn\'t answering':'can\'t be reached ('+esc(o.why)+')'} since ${new Date(o.since*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}: its files are skipped until it is back (checked every 30s).`);
+ if(s.step&&s.stepFor>=10)h.push(`<b>Busy for ${dur(s.stepFor)}:</b> ${esc(s.step)}${s.detail?' – '+esc(s.detail):''}.`
+  +(/inbox/.test(s.step)&&s.stepFor>=30?' If this doesn\'t change, a linked folder (a share on another computer) may not be answering: check that computer and its network share.':''));
+ else if(s.loopAgo!=null&&s.loopAgo>60&&!s.step)h.push('<b>The portal\'s file watcher hasn\'t run for '+dur(s.loopAgo)+'.</b>');
+ if(s.overviewFor>=10)h.push('Loading the sessions has taken '+dur(s.overviewFor)+' so far.');
+ b.hidden=!h.length;b.innerHTML=h.join('<br>')}
+async function pollStatus(){if(document.hidden||view!=='gala'||statusBusy)return;statusBusy=true;
+ try{const s=await api('/api/gala/status');if(s&&s.reading){renderReading(s.reading);renderBusy(s)}}catch(e){}finally{statusBusy=false}}
+setInterval(pollStatus,2000);
 function renderGalaHead(){
  $('#g-root').innerHTML='Data folder: <code>'+esc(GALA.root)+'</code><br>Inbox: <code>'+esc(GALA.inbox)+'</code>'
   +(GALA.waiting.length?` · <span class="gwarn">${GALA.waiting.length} file${GALA.waiting.length>1?'s':''} arriving</span>`:'');

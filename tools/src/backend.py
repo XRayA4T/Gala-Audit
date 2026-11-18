@@ -116,6 +116,9 @@ class Gala:
         self.tcache_file = os.path.join(self.root, ".portal-cache.json")
         # what the portal is reading, for the page's log box: {active, started, finished, done, total, lines}
         self._warm = False
+        self.step, self.step_detail, self.step_since, self.loop_at, self.ov_since = None, "", None, None, None
+        self._totals, self._totals_at = None, 0
+        self.plock, self.probes = threading.Lock(), {}   # linked inbox folders: path -> {ok, at, pending, since, why}
         self.reading = {"active": False, "started": None, "finished": None, "done": 0, "total": 0, "lines": [],
                         "files": []}
         # inbox file -> ((size, mtime), when this computer first saw it like that), to wait until it is fully
@@ -564,22 +567,17 @@ class Gala:
                     return n
         return max(have) if have else 1
 
-    def sort_inbox(self):
-        """Move every finished file in the inbox to its session. A file is finished once its size and time haven't
-        changed for one look and it is a few seconds old.
-        A folder in the inbox that is a symbolic link (e.g. to the folder the Gen7 computer saves into) is watched
-        too, but its files are copied, not moved, so that folder is left as it is; each file is copied once (again
-        only if it changes)."""
-        now = time.time()
-        found, linked = {}, set()
-        inbox_real = os.path.realpath(self.inbox)
-        visited = set()
-        for dirpath, dirs, files in os.walk(self.inbox, followlinks=True):
+    def _scan(self, walk, inbox_real, found, linked, visited, detail=True):
+        """Note the files under one part of the inbox: found[path] = (size, mtime); linked: files to copy, not move."""
+        for dirpath, dirs, files in walk:
             real = os.path.realpath(dirpath)
             if real in visited:          # a link loop
                 dirs[:] = []
                 continue
             visited.add(real)
+            if detail:
+                self.step_detail = "looking in %s" % (os.path.relpath(dirpath, self.root) if real.startswith(
+                    os.path.realpath(self.root) + os.sep) else dirpath)
             outside = not (real == inbox_real or real.startswith(inbox_real + os.sep))
             dirs[:] = [d for d in dirs if not d.startswith(".")]
             for n in files:
@@ -596,6 +594,51 @@ class Gala:
                         continue
                     linked.add(p)
                 found[p] = (st.st_size, st.st_mtime)
+
+    def sort_inbox(self):
+        """Move every finished file in the inbox to its session. A file is finished once its size and time haven't
+        changed for one look and it is a few seconds old.
+        A folder in the inbox that is a symbolic link (e.g. to the folder the Gen7 computer saves into) is watched
+        too, but its files are copied, not moved, so that folder is left as it is; each file is copied once (again
+        only if it changes)."""
+        now = time.time()
+        found, linked = {}, set()
+        inbox_real = os.path.realpath(self.inbox)
+        visited = set()
+        top, local, shares = self._inbox_split()
+        self._scan([(self.inbox, [], top)], inbox_real, found, linked, visited)
+        for d in local:
+            self._scan(os.walk(d, followlinks=True), inbox_real, found, linked, visited)
+        stalled = False
+        for d in shares:
+            # a share can go offline while it is being looked at: look in a thread of its own, wait at most 20s
+            f2, l2, box = {}, set(), {}
+
+            def look(d=d, f2=f2, l2=l2, box=box):
+                try:
+                    self._scan(os.walk(d, followlinks=True), inbox_real, f2, l2, set(visited), detail=False)
+                    box["ok"] = True
+                except Exception as e:
+                    box["err"] = e
+                with self.plock:
+                    if self.probes.get(d, {}).get("pending") and box.get("late"):
+                        self._probed(d, True, None)   # it answered in the end
+
+            if not stalled:
+                self.step_detail = "looking in inbox/%s" % os.path.basename(d)
+            t = threading.Thread(target=look, daemon=True, name="look " + d)
+            t.start()
+            t.join(20)
+            if t.is_alive():
+                box["late"] = True
+                stalled = True
+                self.step_detail = "inbox/%s stopped answering" % os.path.basename(d)
+                with self.plock:
+                    self.probes.setdefault(d, {})
+                    self._probed(d, False, "not answering", pending=True)
+                continue
+            found.update(f2)
+            linked |= l2
         seen = {p: (sig, self.seen[p][1] if p in self.seen and self.seen[p][0] == sig else now)
                 for p, sig in found.items()}
         ready = [p for p, (sig, since) in seen.items() if sig[0] > 0 and now - since >= SETTLE]
@@ -928,6 +971,14 @@ class Gala:
             return {"root": self.root, "inbox": self.inbox, "warming": True, "reading": self.reading_view(),
                     "auto": self.state.get("auto"), "log": self.state["log"][-40:][::-1], "waiting": [],
                     "tools": {t: bool(shutil.which(t)) for t in ("pdfinfo", "pdftoppm", "pdftotext")}}
+        self.ov_since = self.ov_since or time.time()
+        try:
+            return self._overview(inbox_in_root)
+        finally:
+            self.ov_since = None
+
+    def _overview(self, inbox_in_root):
+        totals = self._totals or (None, None)
         with self.lock:
             return {"reading": self.reading_view(),
                     "root": self.root, "inbox": self.inbox, "inboxRel": os.path.relpath(self.inbox, self.root)
@@ -939,7 +990,7 @@ class Gala:
                     "sessions": [self.session(n) for n in self.sessions()],
                     "ticks": self.state["ticks"],
                     "tools": {t: bool(shutil.which(t)) for t in ("pdfinfo", "pdftoppm", "pdftotext")},
-                    "summary": self.summary(), "archives": self.archives()}
+                    "summary": totals[0], "archives": totals[1]}
 
     # ---------------------------------------------------------------- asking Claude
     def P(self, n, sub, name=""):
@@ -1562,27 +1613,58 @@ class Gala:
             raise ValueError("nothing to ask yet for that (its files aren't in)")
         return {"question": row["id"]}
 
+    def _step(self, name, fn, *a):
+        """Run one step of the loop, noting what it is doing for the page (and in the reading log if it's slow)."""
+        self.step, self.step_detail, self.step_since = name, "", time.time()
+        try:
+            return fn(*a)
+        finally:
+            took = time.time() - self.step_since
+            if took >= 10:
+                self.rlog("%s took %.0fs%s" % (name[:1].upper() + name[1:], took,
+                                              " (last: %s)" % self.step_detail if self.step_detail else ""))
+                sys.stderr.write("gala: %s took %.0fs %s\n" % (name, took, self.step_detail))
+            self.step, self.step_detail, self.step_since = None, "", None
+
     def run(self, every=4):
         while True:
             try:
                 if not self._warm:   # read every PDF once now, not while a page waits
                     t0 = time.time()
-                    self.warm()
+                    self._step("reading the data folder", self.warm)
                     sys.stderr.write("gala: data folder read in %.1fs (%d PDFs)\n" % (time.time() - t0,
                                                                                     self.reading["done"]))
-                self.sort_inbox()
+                self._step("sorting the inbox", self.sort_inbox)
                 if not getattr(self, "_refiled", False):
-                    self.refile()
+                    self._step("checking files are in the right folders", self.refile)
                     self._refiled = True
-                self.ignore_strays()
-                self.auto_ask()
-                self.auto_compute()
+                self._step("setting aside Gen7 races not in the entries", self.ignore_strays)
+                self._step("deciding what to ask Claude", self.auto_ask)
+                self._step("starting the merge results and audits", self.auto_compute)
+                if time.time() - self._totals_at > 30:
+                    self._step("adding up the folder sizes", self.update_totals)
                 if time.time() - getattr(self, "_tsaved", 0) > 30:
                     self._tsaved = time.time()
-                    self.save_tool_cache()
+                    self._step("saving the PDF readings", self.save_tool_cache)
             except Exception as e:
                 sys.stderr.write("gala loop: %r\n" % (e,))
+                self.rlog("Problem: %r" % (e,), bad=True)
+            self.loop_at = time.time()
             time.sleep(every)
+
+    def update_totals(self):
+        """The data folder's totals for the Restart tab (walking every file: done here, not while a page waits)."""
+        self._totals = (self.summary(), self.archives())
+        self._totals_at = time.time()
+
+    def status(self):
+        """What the portal is doing now, without touching the data folder or waiting for a lock: for the page."""
+        now = time.time()
+        return {"reading": self.reading_view(), "warming": not self._warm,
+                "step": self.step, "detail": self.step_detail,
+                "stepFor": round(now - self.step_since) if self.step_since else 0,
+                "loopAgo": round(now - self.loop_at) if self.loop_at else None,
+                "overviewFor": round(now - self.ov_since) if self.ov_since else 0, "offline": self.offline()}
 
     # ---------------------------------------------------------------- quick fixes done in the portal
     def sheet_row(self, n, e, h, ln, ocr_names):
@@ -1875,15 +1957,115 @@ class Gala:
                     pass
         return files, size
 
+    # ---- linked folders in the inbox (shares on other computers). A share that is offline can make anything that
+    # looks at it wait for good, so they are only looked at after a probe in a thread of its own says they answer.
+    def _inbox_entries(self):
+        """The inbox's own entries, without looking through links or into shares: [(name, path, linked)]."""
+        out = []
+        try:
+            with os.scandir(self.inbox) as it:
+                ents = list(it)
+        except OSError:
+            return out
+        mounts = self._mounts()
+        for e in sorted(ents, key=lambda e: e.name.lower()):
+            if e.name.startswith("."):
+                continue
+            try:
+                linked = e.is_symlink() or (e.is_dir(follow_symlinks=False) and e.path in mounts)
+            except OSError:
+                continue
+            out.append((e.name, e.path, linked))
+        return out
+
+    def _mounts(self):
+        try:
+            with open("/proc/self/mounts", encoding="utf-8", errors="replace") as f:
+                return {l.split()[1].replace("\\040", " ") for l in f if len(l.split()) > 1}
+        except OSError:
+            return set()
+
+    def _inbox_split(self):
+        """The inbox's files, its own folders, and the linked folders (shares) that answer just now."""
+        top, local, shares = [], [], []
+        for name, p, linked in self._inbox_entries():
+            if linked:
+                if self.reachable(p):   # (whether it is a folder comes from the probe: asking again could hang)
+                    shares.append(p) if self.probes.get(p, {}).get("dir") else top.append(name)
+                continue
+            try:
+                (local if os.path.isdir(p) else top).append(p if os.path.isdir(p) else name)
+            except OSError:
+                continue
+        return top, local, shares
+
+    def reachable(self, path, wait=2.0):
+        """Whether a linked folder answers. Asked in a thread of its own, waiting at most `wait` seconds; one that
+        doesn't answer is skipped (and asked again every 30s) and shown on the page as offline."""
+        now = time.time()
+        with self.plock:
+            c = self.probes.get(path)
+            if c and (c.get("pending") or now - c["at"] < 30):
+                return c["ok"]
+            done = threading.Event()
+            c = self.probes[path] = dict(c or {}, pending=True, ok=bool(c and c.get("ok")), at=now)
+
+        def probe():
+            ok, why, isdir = True, "", False
+            try:
+                os.stat(path)
+                isdir = os.path.isdir(path)
+                if isdir:
+                    os.listdir(path)
+            except OSError as e:
+                ok, why = False, e.strerror or str(e)
+            with self.plock:
+                self.probes[path]["dir"] = isdir
+                self._probed(path, ok, why or None)
+            done.set()
+
+        threading.Thread(target=probe, daemon=True, name="probe " + path).start()
+        if not done.wait(wait):
+            with self.plock:
+                if self.probes[path].get("pending"):
+                    self._probed(path, False, "not answering", pending=True)
+        return self.probes[path]["ok"]
+
+    def _probed(self, path, ok, why, pending=False):
+        c = self.probes[path]
+        c.update(ok=ok, why=why, at=time.time(), pending=pending)
+        name = "inbox/" + os.path.basename(path)
+        try:
+            target = os.readlink(path)
+        except OSError:
+            target = path
+        if not ok and "since" not in c:
+            c["since"] = time.time()
+            self.rlog("Linked folder %s (%s) %s: skipped until it is back" % (
+                name, target, "isn't answering" if why == "not answering" else "can't be reached (%s)" % why), bad=True)
+        elif ok and "since" in c:
+            c.pop("since")
+            self.rlog("Linked folder %s (%s) is back" % (name, target))
+
+    def offline(self):
+        out = []
+        for p, c in list(self.probes.items()):
+            if not c.get("ok") and c.get("since"):
+                try:
+                    target = os.readlink(p)
+                except OSError:
+                    target = ""
+                out.append({"name": os.path.basename(p), "target": target, "since": c["since"],
+                            "why": c.get("why") or ""})
+        return out
+
     def _inbox_own(self):
         """What is in the inbox itself: files and folders, but not linked folders (those belong to other computers)."""
-        return [os.path.join(self.inbox, f["name"]) for f in _ls(self.inbox)
-                if not self._linked(os.path.join(self.inbox, f["name"]))]
+        return [p for name, p, linked in self._inbox_entries() if not linked]
 
-    @staticmethod
-    def _linked(path):
+    def _linked(self, path):
         """A folder that belongs to another computer: a symbolic link, or a share mounted straight into the inbox."""
-        return os.path.islink(path) or os.path.ismount(path)
+        return os.path.islink(path) or path in self._mounts()
 
     def summary(self):
         files, size = 0, 0
@@ -1894,7 +2076,7 @@ class Gala:
         return {"sessions": len(self.sessions()), "files": files, "bytes": size,
                 "questions": self.store.db.execute("SELECT COUNT(*) FROM questions").fetchone()[0],
                 "documents": self.store.db.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
-                "linked": [f["name"] for f in _ls(self.inbox) if self._linked(os.path.join(self.inbox, f["name"]))]}
+                "linked": [name for name, p, linked in self._inbox_entries() if linked]}
 
     def archives(self):
         out = []
@@ -1958,6 +2140,7 @@ class Gala:
                           "copied": copied}
             self.rechecks, self.cache, self.seen = {}, {}, {}
             self._warm = False   # the loop reads the (new) data folder again, with the log on the page
+            self._totals_at = 0
             for d in (self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
                 os.makedirs(d, exist_ok=True)
             self.save()
@@ -2011,6 +2194,7 @@ class Gala:
             self.state = st
             self.rechecks, self.cache, self.seen = {}, {}, {}
             self._warm = False   # the loop reads the (new) data folder again, with the log on the page
+            self._totals_at = 0
             for d in (self.inbox, os.path.join(self.root, "sessions"), os.path.join(self.root, "unsorted")):
                 os.makedirs(d, exist_ok=True)
             self.save()
@@ -2042,6 +2226,7 @@ class Gala:
         if not re.fullmatch(r"[\w -]{1,80}", name or "") or not os.path.isdir(p):
             raise ValueError("no such archive")
         shutil.rmtree(p)
+        self._totals_at = 0
         self.log("Archive %s deleted for good" % name)
 
     # ---- updates from GitHub (the portal folder is a git clone; update.sh does the work)

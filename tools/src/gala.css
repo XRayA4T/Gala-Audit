@@ -145,3 +145,4 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .rd-log .bad{color:var(--open)}
 .rd-done{margin-top:8px}.rd-done summary{cursor:pointer}.rd-done .rd-log{margin-top:6px}
 .rd-log .meta{font-size:inherit}
+.rd-busy{margin-top:10px;padding:8px 12px;border-radius:8px;border:1px solid var(--open);color:var(--fg);background:var(--field)}

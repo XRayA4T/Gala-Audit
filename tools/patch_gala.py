@@ -8,7 +8,7 @@ import re
 import sys
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
-VERSION = "0.15.3"
+VERSION = "0.15.5"
 s = open(sys.argv[1], encoding="utf-8").read()
 piece = lambda name: open(os.path.join(SRC, name), encoding="utf-8").read()  # noqa: E731
 
@@ -40,6 +40,17 @@ sub('''            if path == "/health":
             if path == "/api/gala/overview":
                 g = self._gala()
                 return self._json(200, g.overview() if g else {"root": None})
+            if path == "/api/gala/status":
+                g = self._gala()
+                return self._json(200, g.status() if g else {})
+            if path == "/api/gala/threads":
+                # what every thread of the portal is doing right now, to find what it is stuck on
+                import traceback
+                names = {t.ident: t.name for t in threading.enumerate()}
+                out = []
+                for tid, frame in sys._current_frames().items():
+                    out.append("--- %s\\n%s" % (names.get(tid, tid), "".join(traceback.format_stack(frame)[-12:])))
+                return self._send(200, "\\n".join(out), "text/plain; charset=utf-8")
             if path == "/api/gala/swimmers":
                 g = self._gala()
                 return self._json(200, {"swimmers": g.find_swimmers(int(q.get("session") or 1), q.get("q", ""),
