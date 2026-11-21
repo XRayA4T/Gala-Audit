@@ -20,7 +20,7 @@ each one into its session:
 
 | Folder | What | Who writes it |
 |---|---|---|
-| `data/sessions/S<n>/meet/` | Meet Manager files: the session's **entries export** (`Meet Entries-…zip` / `Hfile…hy3`), the **final** merge results export, the **printed lane sheets** (Meet Manager's PDF, not a scan) and other prints | people |
+| `data/sessions/S<n>/meet/` | Meet Manager files: the session's **entries export** (`Meet Entries-…zip` / `Hfile…hy3`), the **final** merge results export, the **session report** (one per gala: which events are in each session, so one entries export can serve every session), the **printed lane sheets** (Meet Manager's PDF, not a scan) and other prints | people |
 | `data/sessions/S<n>/gen7/` | **Gen7 race PDFs**, one per race (a reprint replaces the earlier copy) | people |
 | `data/sessions/S<n>/scans/` | **Lane sheet packs, one per event** (`Event 03 Lane Sheets.pdf`), DQ slip batches (`DQ…`), the ETD programme (`ETD…`) | people |
 | `data/sessions/S<n>/ocr/` | Your gala-ocr output for the session, and `dq-codes.json` | **you** |

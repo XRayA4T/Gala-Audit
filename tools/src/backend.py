@@ -376,6 +376,99 @@ class Gala:
                     "lanes": {e: sorted(v) for e, v in lanes.items()}}
         return self._cached("lanesprint", path, run) or {"events": [], "sheets": 0, "heats": {}, "lanes": {}}
 
+    def session_report(self, path):
+        """Meet Manager's Session Report (one per gala): {sessions: [{n, name, events: [in swim order], heats: {e: n}}]};
+        no sessions if the PDF isn't one."""
+        def run(p):
+            try:
+                txt = self._tool(["pdftotext", "-layout"], p, 60)
+            except (OSError, subprocess.SubprocessError):
+                return {"sessions": []}
+            if not re.search(r"(?i)\bSession Report\b", txt):
+                return {"sessions": []}
+            out, cur = [], None
+            for ln in txt.splitlines():
+                m = re.match(r"\s*Session:\s*(\d{1,2})\s*(.*?)\s*$", ln)
+                if m:
+                    cur = {"n": int(m.group(1)), "name": m.group(2), "events": [], "heats": {}}
+                    out.append(cur)
+                    continue
+                m = re.match(r"\s*[A-Za-z][A-Za-z ]*?\s+(\d{1,4})\s+\S.*?\s{2,}(\d+)\s+(\d+)\s+\d{1,2}:\d\d\s*[AP]M", ln)
+                if m and cur is not None:
+                    e = int(m.group(1))
+                    if e not in cur["events"]:
+                        cur["events"].append(e)
+                        cur["heats"][e] = int(m.group(3))
+            return {"sessions": [s for s in out if s["events"]]}
+        return self._cached("sessreport", path, run) or {"sessions": []}
+
+    def results_pdf_session(self, path):
+        """The session of Meet Manager's printed Results ("Results - Session 1 - Friday"), or 0 if it isn't one."""
+        m = re.search(r"Results\s*-\s*Session\s+(\d{1,2})\b", self.pdf_text(path) or "")
+        return int(m.group(1)) if m and "Finals Time" in (self.pdf_text(path) or "") else 0
+
+    def session_file(self):
+        """The gala's session report: (session it is in, file), the newest anywhere, or (None, None)."""
+        best = (None, None)
+        for m in self.sessions():
+            f = self.meet_files(m)["sessions"]
+            if f and (best[1] is None or f[-1]["mtime"] > best[1]["mtime"]):
+                best = (m, f[-1])
+        return best
+
+    def session_plan(self):
+        """{session: [events in swim order]} from the session report, or {} when there is none."""
+        m, f = self.session_file()
+        if not f:
+            return {}
+        rep = self.session_report(os.path.join(self.sdir(m, "meet"), f["name"]))
+        return {s["n"]: s["events"] for s in rep["sessions"]}
+
+    def _plan_details(self):
+        m, f = self.session_file()
+        return self.session_report(os.path.join(self.sdir(m, "meet"), f["name"]))["sessions"] if f else []
+
+    def plan_session(self, races):
+        """The session the session report gives every event of these Gen7 races, or None. It wins over Gen7's own
+        "Session:" line, which restarts at 1 when Gen7 is set up as a new meet for a later day."""
+        plan = self.session_plan()
+        found = {n for r in races for n, evs in plan.items() if r["event"] in evs}
+        return found.pop() if len(found) == 1 else None
+
+    def refile_gen7(self):
+        """Gen7 race PDFs in a session whose events the session report puts in another session are moved there
+        (not ones moved into a session by hand)."""
+        kept = self.state.get("keptGen7", [])
+        for n in self.sessions():
+            d = self.sdir(n, "gen7")
+            for f in _ls(d):
+                p = os.path.join(d, f["name"])
+                if f["dir"] or not f["name"].lower().endswith(".pdf") or "S%d/%s" % (n, f["name"]) in kept:
+                    continue
+                races = self.gen7(p)["races"]
+                m = self.plan_session(races) if races else None
+                if not m or m == n:
+                    continue
+                g = self.sdir(m, "gen7")
+                dest = os.path.join(g, f["name"])
+                if os.path.exists(dest):
+                    if _same_file(p, dest):
+                        os.unlink(p)
+                        continue
+                    dest = os.path.join(g, _unique(g, f["name"]))
+                shutil.move(p, dest)
+                self.log("%s → S%d/gen7 (the session report has event %s in session %d)"
+                         % (f["name"], m, ", ".join(str(e) for e in sorted({r["event"] for r in races})), m),
+                         name=f["name"], to="S%d/gen7" % m, kind="gen7")
+
+    def ensure_plan_sessions(self):
+        """Every session in the session report has its folders (a new session appears on the checklist)."""
+        have = set(self.sessions())
+        for n in self.session_plan():
+            if n not in have:
+                self.sdir(n)
+                self.log("Session %d created from the session report" % n, to="S%d" % n)
+
     def all_prints(self):
         """Every printed lane sheet PDF in any session: [(session, name, info)]. A print can cover several sessions."""
         out = []
@@ -471,7 +564,8 @@ class Gala:
 
     def meet_files(self, n):
         """The session's Meet Manager files by kind: entries, results, final, codes, print."""
-        out = {"entries": [], "results": [], "final": [], "codes": [], "lanesprint": [], "print": []}
+        out = {"entries": [], "results": [], "final": [], "codes": [], "lanesprint": [], "print": [], "sessions": [],
+               "resultspdf": []}
         for f in _ls(self.sdir(n, "meet")):
             if f["dir"]:
                 continue
@@ -503,6 +597,10 @@ class Gala:
         if ext in (".txt", ".csv"):
             return "codes"
         if ext == ".pdf":
+            if self.session_report(path)["sessions"]:
+                return "sessions"
+            if self.results_pdf_session(path):
+                return "resultspdf"
             return "lanesprint" if self.lane_print(path)["events"] else "print"
         if "final" in name:
             return "final"
@@ -532,6 +630,9 @@ class Gala:
                 if f:
                     base = self.hy3(os.path.join(self.sdir(m, "meet"), f[-1]["name"]))
                     break
+        plan = self.session_plan()
+        if base and plan:   # the session report says which events each session has, from one entries export
+            return {e: base[e] for e in plan.get(n, []) if e in base}
         if base and self.by_hundreds(base):
             mine = {e: v for e, v in base.items() if e // 100 == n}
             return mine if mine or not own else own
@@ -558,7 +659,7 @@ class Gala:
         if ext == ".pdf":
             g = self.gen7(path)
             if g["races"]:
-                return "gen7", "gen7", g["session"] or sess, g["races"][0]["event"]
+                return "gen7", "gen7", self.plan_session(g["races"]) or g["session"] or sess, g["races"][0]["event"]
             txt = self.pdf_text(path)
             if len(re.sub(r"\s+", "", txt)) > 300:      # a generated PDF (e.g. a Meet Manager print), not a scan
                 return self.meet_kind(path), "meet", sess, event
@@ -576,6 +677,15 @@ class Gala:
                 return best
             free = [n for n in have if not self.meet_files(n)["entries"]]
             return free[0] if free else (max(have) + 1 if have else 1)
+        if kind == "resultspdf":   # the printed results say their session
+            return self.results_pdf_session(path) or (max(have) if have else 1)
+        if kind == "sessions":   # one per gala: where the earlier one is, else the first session
+            there = [n for n in have if self.meet_files(n)["sessions"]]
+            return there[0] if there else (min(have) if have else 1)
+        if event is not None and kind in ("lanes", "dq", "etd"):
+            for n, evs in self.session_plan().items():
+                if event in evs:
+                    return n
         if kind == "results":   # one per gala: next to the one there is, else the first session
             there = [n for n in have if self.meet_files(n)["results"]]
             return there[0] if there else (min(have) if have else 1)
@@ -815,6 +925,19 @@ class Gala:
                 backed.append(f["name"])
             if backed:
                 note += " (replaces the entries export %s, kept in meet/.replaced)" % ", ".join(backed)
+        if folder == "meet" and self.meet_kind(dest) == "sessions":   # one per gala: the earlier ones are kept aside
+            backed = []
+            for m in self.sessions():
+                d = self.sdir(m, "meet")
+                for f in self.meet_files(m)["sessions"]:
+                    p = os.path.join(d, f["name"])
+                    if p == dest:
+                        continue
+                    os.makedirs(os.path.join(d, ".replaced"), exist_ok=True)
+                    shutil.move(p, os.path.join(d, ".replaced", "%s %s" % (time.strftime("%Y%m%d-%H%M%S"), f["name"])))
+                    backed.append(f["name"])
+            if backed:
+                note += " (replaces the session report %s, kept in meet/.replaced)" % ", ".join(backed)
         self.log("%s → %s%s" % (name, label, note + (" (copied)" if copy else "")), name=name, to=label, kind=kind)
         return label
 
@@ -1069,7 +1192,9 @@ class Gala:
                     packs.setdefault(e, []).append(s)
         asked = self.state["asked"]
         events = []
-        for e in sorted(set(expected) | set(gen7_by_event) | set(packs) | set(lanes_done)):
+        order = {e: i for i, e in enumerate(self.session_plan().get(n, []))}   # the session report's swim order
+        for e in sorted(set(expected) | set(gen7_by_event) | set(packs) | set(lanes_done),
+                        key=lambda e: (order.get(e, len(order)), e)):
             x = expected.get(e, {})
             heats = x.get("heats") or print_heats.get(e) or max(gen7_by_event.get(e, {0: 0}))
             have = sorted(gen7_by_event.get(e, {}))
@@ -1111,6 +1236,16 @@ class Gala:
                         pass
             ns = self.state.get("notSwum", {}).get("S%d:e%d" % (n, e)) or {}
             not_swum = [h for h in ns.get("heats", []) if h not in have]
+            hand_t = self.state["ticks"].get("S%d:e%d:handtimes" % (n, e))   # timed by hand only: no Gen7 race needed
+            for k_, f_ in hand.items():   # a heat swum in another event's heat ("timedIn"): that heat's race counts
+                m_ = re.fullmatch(r"%d-(\d+)-\d+" % e, k_)
+                t_ = re.fullmatch(r"(\d+)-(\d+)", str((f_ or {}).get("timedIn") or ""))
+                if m_ and t_ and int(t_.group(2)) in gen7_by_event.get(int(t_.group(1)), {}):
+                    gen7_by_event.setdefault(e, {}).setdefault(int(m_.group(1)), gen7_by_event[int(t_.group(1))][int(t_.group(2))])
+            have = sorted(gen7_by_event.get(e, {}))
+            if hand_t:
+                not_swum = sorted(set(not_swum) | {h for h in range(1, heats + 1) if h not in have})
+                inputs = inputs + [("hand times only", hand_t.get("at", 0))]
             if not_swum:   # confirmed on the checklist: part of what the event is audited from
                 inputs = inputs + [("not swum %s" % ",".join(map(str, not_swum)), ns.get("at", 0))]
             sig = hashlib.sha1(json.dumps(sorted(inputs)).encode()).hexdigest()[:12]
@@ -1134,7 +1269,8 @@ class Gala:
                 status = "waiting"
             events.append({"event": e, "desc": desc.get(e, ""), "heats": heats, "gen7": have,
                            "gen7Missing": [h for h in range(1, heats + 1) if h not in have and h not in not_swum],
-                           "notSwum": not_swum, "notSwumBy": ns.get("by") if not_swum else None,
+                           "notSwum": [] if hand_t else not_swum, "notSwumBy": ns.get("by") if not_swum and not hand_t else None,
+                           "handTimes": bool(hand_t),
                            "expected": bool(x), "lanes": len(x.get("lanes", [])) or len(print_lanes.get(e, ())) or None,
                            "packs": [p["name"] for p in pk], "printed": printed.get(e, []), "ocrLanes": len(lanes_done.get(e, ())),
                            "report": report["name"] if report else None, "ready": ready, "sig": sig,
@@ -1156,6 +1292,11 @@ class Gala:
                 "template": "sessions/S%d/meet/%s" % (tm, tf["name"]) if tf else None,
                 "templateName": tf["name"] if tf else None, "templateSession": tm,
                 "entriesFile": "sessions/S%d/meet/%s" % (em, ef["name"]) if ef else None,
+                "entriesName": ef["name"] if ef else None, "entriesSession": em,
+                "sessionsFile": ("sessions/S%d/meet/%s" % (self.session_file()[0], self.session_file()[1]["name"])) if self.session_file()[1] else None,
+                "sessionsName": self.session_file()[1]["name"] if self.session_file()[1] else None,
+                "sessionsSession": self.session_file()[0],
+                "sessionName": next((x["name"] for x in self._plan_details() if x["n"] == n), ""),
                 "jobs": {k: self.jobs.get("S%d:%s" % (n, k)) for k in ("merge", "final", "etd") if self.jobs.get("S%d:%s" % (n, k))},
                 "expected": {"events": len(expected), "heats": sum(e["heats"] for e in events if e["expected"])},
                 "races": len(races), "scans": scans, "events": events, "merged": merged, "finalReports": finals,
@@ -1438,6 +1579,10 @@ class Gala:
         own = self.meet_files(n)["codes"]
         if codes and own:
             out += ["--codes", os.path.join(self.sdir(n, "meet"), own[-1]["name"])]
+        hand = sorted(int(m.group(1)) for k in self.state["ticks"]
+                      for m in [re.fullmatch(r"S%d:e(\d+):handtimes" % n, k)] if m)
+        if hand:   # events timed by hand only (gala-ocr 1.6.10+)
+            out += ["--hand-times", ",".join(map(str, hand))]
         return out
 
     @staticmethod
@@ -1665,8 +1810,13 @@ class Gala:
         s = self.session(n)
         if not s["meet"]["final"] or not s["merged"]:
             raise ValueError("needs Meet Manager's final export and the session's merge results")
-        sig = hashlib.sha1(json.dumps([s["meet"]["final"][-1], s["merged"][-1]]).encode()).hexdigest()[:16]
+        sig = self._final_sig(s)
         self._start("S%d:final" % n, self._compute_final, (n,), who, why, sig)
+
+    @staticmethod
+    def _final_sig(s):
+        return hashlib.sha1(json.dumps([s["meet"]["final"][-1], s["merged"][-1]]
+                                       + s["meet"].get("resultspdf", [])[-1:]).encode()).hexdigest()[:16]
 
     def _compute_final(self, n):
         s = self.session(n)
@@ -1676,6 +1826,8 @@ class Gala:
                os.path.join(rep, "Session %d final audit.html" % n)]
         if os.path.exists(os.path.join(rep, "Session %d quick fixes.json" % n)):
             cmd += ["--quick-fixes", os.path.join(rep, "Session %d quick fixes.json" % n)]
+        if s["meet"].get("resultspdf"):   # Meet Manager's printed results: the Results exceptions section
+            cmd += ["--results", os.path.join(self.sdir(n, "meet"), s["meet"]["resultspdf"][-1])]
         ok, msg = self._run_script(cmd + self._script_opts(n, fixes=False))
         last = next((ln for ln in reversed(msg.splitlines()) if ln.strip() and not ln.startswith("Wrote")), "") if msg else ""
         return ok, ("Session %d final audit written by the portal (Session %d final audit.html)%s" % (n, n, ": " + last if last else "")
@@ -1786,7 +1938,7 @@ class Gala:
                     self.compute_session(n, "portal", "every event done")
             if s["meet"]["final"] and s["merged"]:
                 k = "S%d:final" % n
-                sig = hashlib.sha1(json.dumps([s["meet"]["final"][-1], s["merged"][-1]]).encode()).hexdigest()[:16]
+                sig = self._final_sig(s)
                 if (done.get(k) or {}).get("sig") != sig and self._job(k).get("state") != "running":
                     self.compute_final(n, "portal", "final export in")
 
@@ -1855,6 +2007,8 @@ class Gala:
                 if not getattr(self, "_refiled", False):
                     self._step("checking files are in the right folders", self.refile)
                     self._refiled = True
+                self._step("making the sessions in the session report", self.ensure_plan_sessions)
+                self._step("moving Gen7 races to the session the session report gives", self.refile_gen7)
                 self._step("setting aside Gen7 races not in the entries", self.ignore_strays)
                 self._step("deciding what to ask Claude", self.auto_ask)
                 self._step("starting the merge results and audits", self.auto_compute)
@@ -2048,10 +2202,16 @@ class Gala:
         swimmer = ({"id": str(sw.get("id") or "")[:12], "name": str(sw.get("name") or "")[:80]}
                    if sw and sw.get("name") else None)
         add = bool(fix.get("add")) and bool(swimmer)
+        timed_in = re.sub(r"\s+", "", str(fix.get("timedIn") or ""))
+        if timed_in and not re.fullmatch(r"\d{1,4}-\d{1,3}", timed_in):
+            raise ValueError("'timed in' must be an event and heat, like 8-1")
+        swims_event = str(fix.get("swimsEvent") or "").strip()
+        if swims_event and (not swims_event.isdigit() or int(swims_event) == int(e)):
+            raise ValueError("'counts for event' must be another event's number")
         key = "%d-%d-%d" % (int(e), int(h), int(ln))
         with self.lock:
             d = self.fixes(n)
-            if not (status or t or note or watches or swimmer):
+            if not (status or t or note or watches or swimmer or swims_event or timed_in):
                 d.pop(key, None)
                 text = "cleared"
             else:
@@ -2063,10 +2223,16 @@ class Gala:
                     d[key]["swimmer"] = swimmer
                 if add:
                     d[key]["add"] = True   # put the swim in the merge file for this swimmer (plugin 1.6.4+)
+                if swims_event:
+                    d[key]["swimsEvent"] = int(swims_event)   # the swim counts for the swimmer's entry in that event
+                if timed_in:
+                    d[key]["timedIn"] = timed_in   # timed in that event-heat's Gen7 race
                 text = ", ".join(x for x in (status and {"OK": "swam", "NS": "no-show", "DQ": "DQ " + code}[status],
                                              t, ", ".join("timer %s %s" % (c, w.get("time") or "accepted")
                                                           for c, w in watches.items()),
-                                             swimmer and "swimmer " + swimmer["name"], note and "note") if x)
+                                             swimmer and "swimmer " + swimmer["name"],
+                                             swims_event and "counts for event " + swims_event,
+                                             timed_in and "timed in " + timed_in, note and "note") if x)
             tmp = self.fixes_file(n) + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(d, f, indent=1, sort_keys=True)

@@ -132,6 +132,12 @@ sub("""function docUrl(u,kind){ // a link to one of this board's documents (rela
 """)
 sub("(?:https?:\\/\\/|\\/api\\/docs\\/)[^\\s)]+)", "(?:https?:\\/\\/|\\/api\\/docs\\/|\\/api\\/gala\\/)[^\\s)]+)")
 
+# the questions the portal asks get a tab of their own (Portal questions); the status tabs show the team's questions
+sub("const FILTERS=[['unresolved','Unresolved'],['open','Open'],['answered','Answered'],['on_hold','On hold'],['resolved','Resolved'],['all','All']];",
+    "const FILTERS=[['unresolved','Unresolved'],['open','Open'],['answered','Answered'],['on_hold','On hold'],['resolved','Resolved'],['portal','Portal questions'],['all','All']];")
+sub("api('/api/questions?status='+filter),api('/api/people')]);\n  $('#people')",
+    "api('/api/questions?status='+(filter==='portal'?'all':filter)),api('/api/people')]);\n  // the questions the portal asks (author portal) have a tab of their own; the status tabs show the team's\n  questions=questions.filter(q=>filter==='all'||(filter==='portal')===(q.author==='portal'));\n  $('#people')")
+sub("try{const [{questions},{people}]=await Promise.all([api('/api/questions?status='+", "try{let [{questions},{people}]=await Promise.all([api('/api/questions?status='+")
 # the board's own browser dialogs (the terminal address) become page dialogs too
 sub("""function changeTermUrl(){const v=prompt('Address of this board\\'s Claude Code terminal (as your browser reaches it, e.g. through the SSH tunnel):',termUrl());
  if(v===null)return;const t=v.trim();

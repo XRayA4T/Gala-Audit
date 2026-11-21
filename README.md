@@ -82,6 +82,8 @@ them on the **Gala** tab). Within a few seconds each one is sorted into its sess
 |---|---|---|
 | Meet entries export (`Meet Entries-…zip` / `Hfile…hy3`) | `.zip` / `.hy3`, "entr" in the name | `sessions/S<n>/meet` |
 | Final merge results export (per session) | "final" in the name | `sessions/S<n>/meet` |
+| Session report (Meet Manager's PDF, **once per gala**, a newer one replaces it) | its text ("Session Report", "Session: N") | `sessions/S<n>/meet` (the first session) |
+| Printed results (Meet Manager's Results PDF, per session, after the final results) | its text ("Results - Session N", "Finals Time") | `sessions/S<n>/meet`: adds a Results exceptions section to the final audit |
 
 The merge results are written from the entries export alone: Meet Manager's empty merge results export is no longer needed.
 | Printed lane sheets (Meet Manager's PDF, not the scan) | its text (Event, Lane, Heat) | `sessions/S<n>/meet` |

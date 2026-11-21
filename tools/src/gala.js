@@ -91,7 +91,7 @@ function renderSession(){
    <span class="ct">${x.pages==null?'? pages':`${x.done} / ${x.pages} pages`}${x.review?` · <span class="gwarn">${x.review} to check</span>`:''}${x.bad?` · <span class="gwarn">${x.bad} unreadable</span>`:''}</span>
    ${x.missingCount&&x.done?`<span class="miss meta">Not done yet: pages ${esc(x.missing.join(', '))}${x.missingCount>x.missing.length?' …':''}</span>`:''}</div>`}).join('')
   :'<div class="meta">No scans in this session yet.</div>';
- const ent=s.meet.entries.length?`${s.expected.events} events, ${s.expected.heats} heats expected (from ${esc(s.meet.entries[s.meet.entries.length-1])})`:'<span class="gwarn">No entries export yet</span>: events are only known as their files arrive.';
+ const ent=s.entriesFile?`${s.expected.events} events, ${s.expected.heats} heats expected (from ${esc(s.entriesName)}${s.entriesSession!==s.n?', session '+s.entriesSession:''})`:'<span class="gwarn">No entries export yet</span>: events are only known as their files arrive.';
  box.innerHTML=`<div class="card"><div class="gh-top"><div><h3 style="margin:0">Session ${s.n}</h3><div class="meta">${ent} · ${s.races} Gen7 race${s.races===1?'':'s'}</div></div>
    <a href="#checklist" data-goto="checklist">Checklist →</a></div>
   <div class="gstats">${stat(c('audited'),'audited')}${stat(c('asked'),'with Claude')}${c('transcribed')?stat(c('transcribed'),'transcribed'):''}${c('computing')?stat(c('computing'),'working'):''}${stat(c('ready'),'ready')}${stat(c('waiting'),'waiting')}${c('changed')?stat(c('changed'),'new files'):''}</div>
@@ -135,7 +135,7 @@ function renderChecklist(){setTimeout(swAll,0);
  const s=curSession(),box=$('#cl-body');if(s)loadCodes(s.n);
  if(!s){box.innerHTML='<div class="card meta">No sessions yet. Drop the session\'s Meet Manager entries export on the Gala tab (or in the inbox folder) to start.</div>';return}
  const qfKey=(e,f)=>'S'+s.n+':e'+e.event+':qf:'+f.heat+'.'+f.lane;
- const keys=['entries','lanesprint',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','final'].map(k=>'S'+s.n+':'+k)
+ const keys=['entries','sessreport','lanesprint',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','resultspdf','final'].map(k=>'S'+s.n+':'+k)
   .concat(s.events.flatMap(e=>(e.fixes||[]).map(f=>qfKey(e,f))));
  const ticked=keys.filter(k=>GALA.ticks[k]).length,pct=Math.round(100*ticked/keys.length);
  const dq=s.scans.filter(x=>x.kind==='dq'),etd=s.scans.filter(x=>x.kind==='etd');
@@ -157,6 +157,8 @@ function renderChecklist(){setTimeout(swAll,0);
         ${f._block&&!hf.time?'':`<label>Time <input name="time" value="${esc(hf.time||'')}" placeholder="m:ss.hh" size="8"></label>`}
         <label class="qfcode"${hf.status==='DQ'?'':' hidden'}>Code <input name="code" value="${esc(hf.code||'')}" list="dqcodes" size="6"></label>
         <label class="qfnote">Note <input name="note" value="${esc(hf.note||'')}" placeholder="what was fixed"></label>
+        <label class="qfnote" title="The swimmer swam another event in this heat: the swim counts for their entry in that event">Counts for event <input name="swimsEvent" value="${esc(hf.swimsEvent||'')}" size="3" inputmode="numeric" placeholder="–"></label>
+        <label class="qfnote" title="Swum in another event's heat (e.g. a time trial in event 8 heat 1): its Gen7 race times this swim">Timed in <input name="timedIn" value="${esc(hf.timedIn||'')}" size="5" placeholder="event-heat"></label>
         ${(()=>{const mi=/not in the merge file/i.test(f.checks.join(' ')),wr=!!(f.row&&f.row.writtenIn)||/written in/i.test(f.checks.join(' '));
           return `<button type="submit"${mi||wr||f._watch?' class="primary"':''}>${mi||wr?(hf.add?'Confirmed · update':mi?'Confirm swim':'Confirm swimmer'):f._watch?'Save &amp; recalculate':hf.by?'Update':'Save fix'}</button>`})()}${hf.by?'<button type="button" data-clearfix>Clear</button>':''}
         <span class="sm" data-fixmsg>${hf.by?esc('Fixed by '+hf.by+' · '+agoShort(hf.at)):'Or just tick it if nothing needs changing.'}</span></form>
@@ -166,7 +168,7 @@ function renderChecklist(){setTimeout(swAll,0);
         return `<details class="qf-page" data-qpd="${esc(dk)}" data-ticked="${t?1:0}"${open?' open':''}><summary class="sm"><a href="${esc(galaHref(rel))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a> <span class="meta">(scroll the page here, or open it)</span></summary><div class="qf-view" data-qfv="${esc(s.n+'|'+sc.scan+'|'+sc.page)}"><img loading="lazy" alt="${esc(sc.label)}, page ${esc(sc.page)}" src="${esc(u.toString())}"></div></details>`}).join(''):''}</div></li>`}).join('')}</ul></details></td></tr>`:'';
    return `<tr class="${t?'done':''}" data-cldrop="S${s.n}/scans">
     <td>${tickBox(key,'Event '+e.event)}</td>
-    <td><span class="evname">Event ${e.event}</span>${e.desc?`<div class="sm">${esc(e.desc)}</div>`:''}${!e.expected&&s.meet.entries.length?'<div class="sm gwarn">not in the entries</div>':''}${t?`<div class="sm">ticked by ${esc(t.by)}</div>`:''}</td>
+    <td><span class="evname">Event ${e.event}</span>${e.desc?`<div class="sm">${esc(e.desc)}</div>`:''}<label class="sm" title="No Gen7 race (e.g. a hand-timed time trial): audited and merged from the lane sheet watches">${tickBox(key+':handtimes','Event '+e.event+' hand times only')} hand times only</label>${!e.expected&&s.entriesFile?'<div class="sm gwarn">not in the entries</div>':''}${t?`<div class="sm">ticked by ${esc(t.by)}</div>`:''}</td>
     <td class="c">${e.printed.length?'<span class="ok" title="'+esc(e.printed.map(x=>x.split('/').pop()).join(', '))+'">✓</span>':'<span class="no" title="No printed lane sheets for this event">–</span>'}</td>
     <td>${e.packs.length?e.packs.map(p=>link(s,'scans',p)).join('<br>'):'<span class="no">–</span>'}</td>
     <td class="c">${g7}${e.gen7Missing.length&&e.gen7.length?`<div class="sm">missing ${esc(e.gen7Missing.join(', '))}</div>`:''}${(e.notSwum||[]).length?`<div class="sm" title="${esc('Confirmed by '+(e.notSwumBy||'someone'))}">not swum ${esc(e.notSwum.join(', '))}</div>`:''}</td>
@@ -183,8 +185,10 @@ function renderChecklist(){setTimeout(swAll,0);
   <div class="card">
   <div class="cl-sec">Start of the session</div>
   ${clRow(s,'S'+s.n+':entries','Meet entries export','From Meet Manager, for this session: the events, heats and lanes to expect (<code>Meet Entries-…zip</code> or its <code>Hfile…hy3</code>).',
-    s.meet.entries.map(n=>link(s,'meet',n)+(s.expected.events?` <span class="meta">(${s.expected.events} events, ${s.expected.heats} heats)</span>`:'')
+    (s.meet.entries.length?s.meet.entries.map(n=>link(s,'meet',n)):s.entriesFile?[`<a href="${esc(galaHref(s.entriesFile))}" target="_blank" rel="noopener">${esc(s.entriesName)}</a> <span class="meta">(in session ${s.entriesSession}; used for the whole gala)</span>`]:[]).map(x=>x+(s.expected.events?` <span class="meta">(${s.expected.events} events, ${s.expected.heats} heats)</span>`:'')
      +(s.events.some(e=>e.expected&&!e.seeded)?' <span class="meta">(not seeded: a pre-gala export; the merge results seed each swim from the lane sheets)</span>':'')),'S'+s.n+'/meet')}
+  ${clRow(s,'S'+s.n+':sessreport','Session report (Meet Manager)','<b>Once for the whole gala</b>, and it can be updated: Meet Manager\'s Session Report (PDF). It says which events are in each session, in swim order; one entries export then serves every session. A newer one replaces the old.',
+    s.sessionsFile?[`<a href="${esc(galaHref(s.sessionsFile))}" target="_blank" rel="noopener">${esc(s.sessionsName)}</a>`+(s.sessionName?` <span class="meta">(${esc(s.sessionName)}${s.sessionsSession!==s.n?'; in session '+s.sessionsSession:''})</span>`:'')]:[],'S'+s.n+'/meet')}
   ${clRow(s,'S'+s.n+':lanesprint','Printed lane sheets (Meet Manager)','The lane sheet PDF Meet Manager printed for the session (not the scan). Claude copies the names, ages, teams and seed times from it, which is much more accurate than reading them off the scans. Bring it in before the first event.',
     s.lanePrints.map(p=>`<a href="${esc(galaHref(p.path))}" target="_blank" rel="noopener">${esc(p.name)}</a>`+` <span class="meta">(${p.sheets} sheet${p.sheets===1?'':'s'}, event${p.events.length===1?'':'s'} ${esc(evRange(p.events))})</span>`),'S'+s.n+'/meet')}
   <div class="cl-sec">Each event, as it is swum</div>
@@ -196,6 +200,7 @@ function renderChecklist(){setTimeout(swAll,0);
   ${clRow(s,'S'+s.n+':codes','DQ codes','Each slip\'s code, given by Claude from '+(s.meet.codes.length?'the meet\'s own list ('+link(s,'meet',s.meet.codes[s.meet.codes.length-1])+')':'the full FINA list in the plugin (<code>gala-audit/data/dqcodesFINA.txt</code>); drop a <code>.txt</code> with the meet\'s own list in the inbox to use that instead')+'. Codes it wasn\'t sure of need the referee\'s OK.',s.dqCodes?[link(s,'ocr','dq-codes.json')]:[],null,true)}
   ${clRow(s,'S'+s.n+':merged','Session merge results (all events)','Written by Claude once every event is audited: one file with the whole session, and the session report.',s.merged.map(n=>link(s,'reports',n)).concat(s.sessionReport?['session report: '+link(s,'reports',s.sessionReport)]:[]),null,true)}
   ${clRow(s,'S'+s.n+':mmfinal','Final merge results export','Exported from Meet Manager after the audited results were imported and finalised (name it with "final").',s.meet.final.map(n=>link(s,'meet',n)),'S'+s.n+'/meet')}
+  ${clRow(s,'S'+s.n+':resultspdf','Results (Meet Manager PDF)','Meet Manager\'s printed Results for the session, after the final results are in. With the final export, the final audit then has a <b>Results exceptions</b> section: every swim where our merge results, the final export and the printed results don\'t all agree.',(s.meet.resultspdf||[]).map(n=>link(s,'meet',n)),'S'+s.n+'/meet')}
   ${clRow(s,'S'+s.n+':final','Final audit report','Written by the portal when the final export is in: every change made by hand in Meet Manager.',s.finalReports.map(n=>link(s,'reports',n)),null,true)}
   </div>`}
 async function galaUpload(folder,files,card){
