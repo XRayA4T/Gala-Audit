@@ -702,6 +702,46 @@ def _first(m):
     return int(next(g for g in m.groups() if g)) if m else None
 
 
+def merge_changes(old, new):
+    """The swims whose result differs between two merge results files (by swimmer ID and event): heat, lane, time,
+    status and DQ code; and entries in only one of them. One line each, for people to check."""
+    def read(path):
+        out, d1, key = {}, "", None
+        try:
+            with open(path, encoding="latin-1", newline="") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            return out
+        for ln in lines:
+            if ln.startswith("D1"):
+                d1 = ln
+            elif ln.startswith("E1"):
+                key = (ln[2:8].strip(), int(ln[38:42] or 0))
+                out[key] = {"name": "%s, %s" % (d1[8:28].strip(), d1[28:48].strip()), "res": None}
+            elif ln.startswith("E2") and key in out:
+                heat, lane = ln[20:23].strip(), ln[23:26].strip()
+                out[key]["res"] = (int(heat) if heat.isdigit() else 0, int(lane) if lane.isdigit() else 0,
+                                   ln[3:11].strip(), ln[12:15].strip())
+        return out
+
+    def show(r):
+        if not r or not r[0]:
+            return "no result"
+        return "H%d L%d %s%s" % (r[0], r[1], r[2] if r[2] not in ("", "0,00") else "no time",
+                                  {"R": " N/S", "": ""}.get(r[3], " " + r[3]))
+    a, b = read(old), read(new)
+    out = []
+    for k in sorted(set(a) | set(b), key=lambda k: (k[1], (b.get(k) or a.get(k))["name"])):
+        name = (b.get(k) or a.get(k))["name"]
+        if k not in b:
+            out.append("%s (ID %s): in the previous file only (%s)" % (name, k[0], show(a[k]["res"])))
+        elif k not in a:
+            out.append("%s (ID %s): new in this file (%s)" % (name, k[0], show(b[k]["res"])))
+        elif a[k]["res"] != b[k]["res"]:
+            out.append("%s (ID %s): %s -> %s" % (name, k[0], show(a[k]["res"]), show(b[k]["res"])))
+    return out
+
+
 def _ls(folder):
     out = []
     try:
@@ -1110,7 +1150,7 @@ class Gala:
 
     def meet_wide(self, n, kind):
         """The newest file of a kind in session n's meet folder, else in any session's: (session, file) or
-        (None, None). The empty merge results export (and a meet-wide entries export) is needed once per gala."""
+        (None, None). A meet-wide entries export can serve every session."""
         own = self.meet_files(n)[kind]
         if own and kind != "results":   # the empty results export: always the gala's newest, wherever it is
             return n, own[-1]
@@ -1429,6 +1469,20 @@ class Gala:
             shutil.copy2(path, dest)
         else:
             shutil.move(path, dest)
+        # A new entries export replaces the session's earlier one(s): they are kept in meet/.replaced, and every
+        # event is worked out again from the new one (its merge results are compared with the previous ones).
+        if folder == "meet" and self.meet_kind(dest) == "entries":
+            old_dir = os.path.join(dest_dir, ".replaced")
+            backed = []
+            for f in _ls(dest_dir):
+                p = os.path.join(dest_dir, f["name"])
+                if f["dir"] or p == dest or self.meet_kind(p) != "entries":
+                    continue
+                os.makedirs(old_dir, exist_ok=True)
+                shutil.move(p, os.path.join(old_dir, "%s %s" % (time.strftime("%Y%m%d-%H%M%S"), f["name"])))
+                backed.append(f["name"])
+            if backed:
+                note += " (replaces the entries export %s, kept in meet/.replaced)" % ", ".join(backed)
         self.log("%s → %s%s" % (name, label, note + (" (copied)" if copy else "")), name=name, to=label, kind=kind)
         return label
 
@@ -1691,7 +1745,7 @@ class Gala:
             report = next((f for f in reports if f["name"].lower().endswith(".html")
                            and re.search(r"(?i)\bevent\s*0*%d\b" % e, f["name"])), None)
             inputs = [(p["name"], p["mtime"]) for p in pk] + [(r["file"], r["mtime"]) for r in races if r["event"] == e]
-            # The merge results need the session's entries export and Meet Manager's empty merge results export;
+            # The merge results need the session's entries export (only that, from gala-ocr 1.6.10);
             # when they arrive after the event was done, the event is asked again (they are part of its inputs).
             seeded = (x.get("heats") or 0) > 0
             merge_inputs = []
@@ -1912,10 +1966,10 @@ class Gala:
         if kind == "merge":
             if not s["entriesFile"]:
                 return None
-            ent, res = "data/" + s["entriesFile"], ("data/" + s["template"]) if s["template"] else "-"
+            ent, res = "data/" + s["entriesFile"], "-"
             return ("Session %d: write the whole session's merge results for Meet Manager" % n,
                     "Every event of session %d is audited. Write one merge results file for the whole session from "
-                    "Meet Manager's empty merge results export `%s` and the entries `%s`.\n\n"
+                    "RESULTS `%s` (no merge results export: the entries export alone) and the entries `%s`.\n\n"
                     "1. Check every event of the session has been transcribed and audited and every DQ slip has a code "
                     "(`%s/dq-codes.json`); list anything missing.\n"
                     "2. Write the merge results with the **gala-audit** skill (unzip the entries' Hfile*.hy3 into a temp "
@@ -1937,7 +1991,7 @@ class Gala:
             ev = next((x for x in s["events"] if x["event"] == e), None)
             if not ev or not ev["canMerge"] or not ev["ocrLanes"]:
                 return None
-            ent, tpl = "data/" + s["entriesFile"], ("data/" + s["template"]) if s["template"] else "-"
+            ent, tpl = "data/" + s["entriesFile"], "-"
             mfile = "%s/Event %02d merge results %s.hy3" % (rep, e, STAMP)
             unread = [x["name"] for x in s["scans"] if x["kind"] == "dq" and x["pages"] and x["done"] < x["pages"]]
             codes = "%s/dq-codes.json" % ocr
@@ -2182,14 +2236,28 @@ class Gala:
                     return False, "Event %d: %d problem%s in the transcription files; Claude was asked to fix them" % (
                         e, len(bad), "" if len(bad) == 1 else "s")
             mfile = None
+            ev_rx = re.compile(r"(?i)\bevent\s*0*%d\b" % e)
+            prev = max((f for f in _ls(rep) if f["name"].lower().endswith(".hy3") and "merge results" in f["name"].lower()
+                        and ev_rx.search(f["name"])), key=lambda f: f["mtime"], default=None)
             if ev["canMerge"] and merge:
                 ent = self._entries_hy3(n, tmp)
-                tpl = self.meet_path(n, "results") or "-"
+                tpl = "-"   # entries export only: an empty merge results export is no longer used
                 mfile = os.path.join(rep, "Event %02d merge results %s.hy3" % (e, time.strftime("%Y-%m-%d_%H%M")))
                 ok, out = self._run_script([merge, ocr, gen7, ent, tpl, mfile, "--events", str(e)] + self._script_opts(n))
                 if not ok:
                     return False, "event %d merge results: %s" % (e, out.splitlines()[-1] if out else "failed")
                 notes.append("merge results %s" % os.path.basename(mfile))
+                if prev and prev["name"] != os.path.basename(mfile):
+                    changes = merge_changes(os.path.join(rep, prev["name"]), mfile)
+                    if changes:
+                        rpt = os.path.join(rep, "Event %02d merge changes %s.txt" % (e, time.strftime("%Y-%m-%d_%H%M")))
+                        with open(rpt, "w", encoding="utf-8") as fh:
+                            fh.write("Event %d: %s compared with %s\n\n%s\n" % (e, os.path.basename(mfile), prev["name"],
+                                                                               "\n".join(changes)))
+                        notes.append("%d result%s differ from the previous merge results (see %s)" % (
+                            len(changes), "" if len(changes) == 1 else "s", os.path.basename(rpt)))
+                    else:
+                        notes.append("no results changed from the previous merge results")
             else:
                 notes.append("no merge results yet (needs the entries export)")
             cmd = [audit, ocr, gen7, os.path.join(rep, "Event %02d audit.html" % e), "--events", str(e), "--scans", scans,
@@ -2244,7 +2312,7 @@ class Gala:
         tmp = tempfile.mkdtemp(prefix="gala-run-")
         try:
             ent = self._entries_hy3(n, tmp)
-            tpl = self.meet_path(n, "results") or "-"
+            tpl = "-"   # entries export only: an empty merge results export is no longer used
             out = os.path.join(rep, "Merge Meet Results-S%d-audit %s.hy3" % (n, time.strftime("%Y-%m-%d_%H%M")))
             ok, msg = self._run_script([self.find_script("merge_results.py"), ocr, gen7, ent, tpl, out] + self._script_opts(n))
             if not ok:
@@ -5263,7 +5331,7 @@ function renderChecklist(){setTimeout(swAll,0);
  const s=curSession(),box=$('#cl-body');if(s)loadCodes(s.n);
  if(!s){box.innerHTML='<div class="card meta">No sessions yet. Drop the session\'s Meet Manager entries export on the Gala tab (or in the inbox folder) to start.</div>';return}
  const qfKey=(e,f)=>'S'+s.n+':e'+e.event+':qf:'+f.heat+'.'+f.lane;
- const keys=['entries','lanesprint','mmresults',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','final'].map(k=>'S'+s.n+':'+k)
+ const keys=['entries','lanesprint',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','final'].map(k=>'S'+s.n+':'+k)
   .concat(s.events.flatMap(e=>(e.fixes||[]).map(f=>qfKey(e,f))));
  const ticked=keys.filter(k=>GALA.ticks[k]).length,pct=Math.round(100*ticked/keys.length);
  const dq=s.scans.filter(x=>x.kind==='dq'),etd=s.scans.filter(x=>x.kind==='etd');
@@ -5315,8 +5383,6 @@ function renderChecklist(){setTimeout(swAll,0);
      +(s.events.some(e=>e.expected&&!e.seeded)?' <span class="meta">(not seeded: a pre-gala export; the merge results seed each swim from the lane sheets)</span>':'')),'S'+s.n+'/meet')}
   ${clRow(s,'S'+s.n+':lanesprint','Printed lane sheets (Meet Manager)','The lane sheet PDF Meet Manager printed for the session (not the scan). Claude copies the names, ages, teams and seed times from it, which is much more accurate than reading them off the scans. Bring it in before the first event.',
     s.lanePrints.map(p=>`<a href="${esc(galaHref(p.path))}" target="_blank" rel="noopener">${esc(p.name)}</a>`+` <span class="meta">(${p.sheets} sheet${p.sheets===1?'':'s'}, event${p.events.length===1?'':'s'} ${esc(evRange(p.events))})</span>`),'S'+s.n+'/meet')}
-  ${clRow(s,'S'+s.n+':mmresults','Empty merge results export (Meet Manager)','<b>Once for the whole gala</b>: export merge results from Meet Manager before any results are in (name it with "Results"). Its header and layout are copied into every merge results file, in every session.',
-    s.template?[`<a href="${esc(galaHref(s.template))}" target="_blank" rel="noopener">${esc(s.templateName)}</a>`+(s.templateSession!==s.n?` <span class="meta">(in session ${s.templateSession}; used for the whole gala)</span>`:'')]:[],'S'+s.n+'/meet')}
   <div class="cl-sec">Each event, as it is swum</div>
   <div class="meta" style="margin-bottom:4px">An event is <b>ready</b> when its lane sheet pack and every heat's Gen7 race PDF are in${GALA.auto?'; Claude is then asked to transcribe and audit it':''}. Claude then writes the event's <b>merge results</b> (<code>.hy3</code>, to import into Meet Manager) and its <b>quick fixes</b>: the swims to check by hand, listed under the event to tick off as they're fixed. Drop a lane sheet pack on an event to add it.</div>
   ${ev}

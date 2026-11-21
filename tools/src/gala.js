@@ -135,7 +135,7 @@ function renderChecklist(){setTimeout(swAll,0);
  const s=curSession(),box=$('#cl-body');if(s)loadCodes(s.n);
  if(!s){box.innerHTML='<div class="card meta">No sessions yet. Drop the session\'s Meet Manager entries export on the Gala tab (or in the inbox folder) to start.</div>';return}
  const qfKey=(e,f)=>'S'+s.n+':e'+e.event+':qf:'+f.heat+'.'+f.lane;
- const keys=['entries','lanesprint','mmresults',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','final'].map(k=>'S'+s.n+':'+k)
+ const keys=['entries','lanesprint',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','final'].map(k=>'S'+s.n+':'+k)
   .concat(s.events.flatMap(e=>(e.fixes||[]).map(f=>qfKey(e,f))));
  const ticked=keys.filter(k=>GALA.ticks[k]).length,pct=Math.round(100*ticked/keys.length);
  const dq=s.scans.filter(x=>x.kind==='dq'),etd=s.scans.filter(x=>x.kind==='etd');
@@ -187,8 +187,6 @@ function renderChecklist(){setTimeout(swAll,0);
      +(s.events.some(e=>e.expected&&!e.seeded)?' <span class="meta">(not seeded: a pre-gala export; the merge results seed each swim from the lane sheets)</span>':'')),'S'+s.n+'/meet')}
   ${clRow(s,'S'+s.n+':lanesprint','Printed lane sheets (Meet Manager)','The lane sheet PDF Meet Manager printed for the session (not the scan). Claude copies the names, ages, teams and seed times from it, which is much more accurate than reading them off the scans. Bring it in before the first event.',
     s.lanePrints.map(p=>`<a href="${esc(galaHref(p.path))}" target="_blank" rel="noopener">${esc(p.name)}</a>`+` <span class="meta">(${p.sheets} sheet${p.sheets===1?'':'s'}, event${p.events.length===1?'':'s'} ${esc(evRange(p.events))})</span>`),'S'+s.n+'/meet')}
-  ${clRow(s,'S'+s.n+':mmresults','Empty merge results export (Meet Manager)','<b>Once for the whole gala</b>: export merge results from Meet Manager before any results are in (name it with "Results"). Its header and layout are copied into every merge results file, in every session.',
-    s.template?[`<a href="${esc(galaHref(s.template))}" target="_blank" rel="noopener">${esc(s.templateName)}</a>`+(s.templateSession!==s.n?` <span class="meta">(in session ${s.templateSession}; used for the whole gala)</span>`:'')]:[],'S'+s.n+'/meet')}
   <div class="cl-sec">Each event, as it is swum</div>
   <div class="meta" style="margin-bottom:4px">An event is <b>ready</b> when its lane sheet pack and every heat's Gen7 race PDF are in${GALA.auto?'; Claude is then asked to transcribe and audit it':''}. Claude then writes the event's <b>merge results</b> (<code>.hy3</code>, to import into Meet Manager) and its <b>quick fixes</b>: the swims to check by hand, listed under the event to tick off as they're fixed. Drop a lane sheet pack on an event to add it.</div>
   ${ev}

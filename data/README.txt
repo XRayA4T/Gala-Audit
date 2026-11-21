@@ -4,7 +4,7 @@ sorts them within a few seconds:
 
   inbox/                     new files arrive here (the scanner, the Gen7 computer, the browser)
   sessions/S1/meet/          Meet Manager: the session's entries export, printed lane sheets (the PDF, not
-                             the scan), merge results export, final export
+                             the scan), final export
   sessions/S1/gen7/          Gen7 race PDFs, one per race
   sessions/S1/scans/         lane sheet packs (one per event), DQ slips, ETD programme
   sessions/S1/ocr/           written by Claude (gala-ocr)

@@ -81,7 +81,9 @@ them on the **Gala** tab). Within a few seconds each one is sorted into its sess
 | What | How it's recognised | Goes to |
 |---|---|---|
 | Meet entries export (`Meet Entries-…zip` / `Hfile…hy3`) | `.zip` / `.hy3`, "entr" in the name | `sessions/S<n>/meet` |
-| Empty merge results export (**once per gala**) / final export (per session) | "result" / "final" in the name | `sessions/S<n>/meet` (the empty one: the first session) |
+| Final merge results export (per session) | "final" in the name | `sessions/S<n>/meet` |
+
+The merge results are written from the entries export alone: Meet Manager's empty merge results export is no longer needed.
 | Printed lane sheets (Meet Manager's PDF, not the scan) | its text (Event, Lane, Heat) | `sessions/S<n>/meet` |
 | Gen7 race PDF | its text (Event, Heat, Race #, Session) | `sessions/S<n>/gen7` |
 | Lane sheet pack | a scanned PDF, "Event 3" in the name | `sessions/S<n>/scans` |
