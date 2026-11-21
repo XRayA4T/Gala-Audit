@@ -1699,7 +1699,7 @@ class Gala:
                 f_ = self.meet_wide(n, kind_)[1]
                 if f_:
                     merge_inputs.append((f_["name"], f_["mtime"]))
-            can_merge = len(merge_inputs) == 2
+            can_merge = bool(self.meet_wide(n, "entries")[1])   # the entries export is enough (merge_results 1.6.10+)
             if can_merge:
                 inputs = inputs + merge_inputs
             ev_rx = re.compile(r"(?i)\bevent\s*0*%d\b" % e)
@@ -1910,9 +1910,9 @@ class Gala:
                         % (self.P(n, "scans", name), ocr))
             return None
         if kind == "merge":
-            if not s["template"] or not s["entriesFile"]:
+            if not s["entriesFile"]:
                 return None
-            ent, res = "data/" + s["entriesFile"], "data/" + s["template"]
+            ent, res = "data/" + s["entriesFile"], ("data/" + s["template"]) if s["template"] else "-"
             return ("Session %d: write the whole session's merge results for Meet Manager" % n,
                     "Every event of session %d is audited. Write one merge results file for the whole session from "
                     "Meet Manager's empty merge results export `%s` and the entries `%s`.\n\n"
@@ -1937,7 +1937,7 @@ class Gala:
             ev = next((x for x in s["events"] if x["event"] == e), None)
             if not ev or not ev["canMerge"] or not ev["ocrLanes"]:
                 return None
-            ent, tpl = "data/" + s["entriesFile"], "data/" + s["template"]
+            ent, tpl = "data/" + s["entriesFile"], ("data/" + s["template"]) if s["template"] else "-"
             mfile = "%s/Event %02d merge results %s.hy3" % (rep, e, STAMP)
             unread = [x["name"] for x in s["scans"] if x["kind"] == "dq" and x["pages"] and x["done"] < x["pages"]]
             codes = "%s/dq-codes.json" % ocr
@@ -2184,14 +2184,14 @@ class Gala:
             mfile = None
             if ev["canMerge"] and merge:
                 ent = self._entries_hy3(n, tmp)
-                tpl = self.meet_path(n, "results")
+                tpl = self.meet_path(n, "results") or "-"
                 mfile = os.path.join(rep, "Event %02d merge results %s.hy3" % (e, time.strftime("%Y-%m-%d_%H%M")))
                 ok, out = self._run_script([merge, ocr, gen7, ent, tpl, mfile, "--events", str(e)] + self._script_opts(n))
                 if not ok:
                     return False, "event %d merge results: %s" % (e, out.splitlines()[-1] if out else "failed")
                 notes.append("merge results %s" % os.path.basename(mfile))
             else:
-                notes.append("no merge results yet (needs the entries export and the empty merge results export)")
+                notes.append("no merge results yet (needs the entries export)")
             cmd = [audit, ocr, gen7, os.path.join(rep, "Event %02d audit.html" % e), "--events", str(e), "--scans", scans,
                    "--quick-fixes", os.path.join(rep, "Event %02d quick fixes.html" % e),
                    "--times", os.path.join(rep, "Event %02d times.json" % e)] + (["--merge", mfile] if mfile else [])
@@ -2229,8 +2229,8 @@ class Gala:
     def compute_session(self, n, who="portal", why=""):
         """The session's merge results (every event) and the session audit with its Quick Fix list."""
         s = self.session(n)
-        if not s["template"] or not s["entriesFile"]:
-            raise ValueError("needs the entries export and Meet Manager's empty merge results export")
+        if not s["entriesFile"]:
+            raise ValueError("needs the entries export")
         self._start("S%d:merge" % n, self._compute_session, (n,), who, why, self._session_sig(n, s))
 
     def _session_sig(self, n, s):
@@ -2244,7 +2244,7 @@ class Gala:
         tmp = tempfile.mkdtemp(prefix="gala-run-")
         try:
             ent = self._entries_hy3(n, tmp)
-            tpl = self.meet_path(n, "results")
+            tpl = self.meet_path(n, "results") or "-"
             out = os.path.join(rep, "Merge Meet Results-S%d-audit %s.hy3" % (n, time.strftime("%Y-%m-%d_%H%M")))
             ok, msg = self._run_script([self.find_script("merge_results.py"), ocr, gen7, ent, tpl, out] + self._script_opts(n))
             if not ok:
@@ -2333,8 +2333,6 @@ class Gala:
         lines = []
         if not s["entriesFile"]:
             lines.append("No entries export yet.")
-        if not s["template"]:
-            lines.append("No empty merge results export yet (one for the whole gala; needed for the merge results).")
         if not s["lanePrints"]:
             lines.append("No printed lane sheets yet.")
         for ev in s["events"]:
@@ -2382,7 +2380,7 @@ class Gala:
                         threading.Thread(target=self.compute_session_report, args=(n,), daemon=True).start()
             all_done = s["events"] and all(e["status"] == "audited" and (done.get("S%d:e%d:run" % (n, e["event"])) or {}).get("ok")
                                            for e in s["events"])
-            if all_done and s["template"] and s["entriesFile"]:
+            if all_done and s["entriesFile"]:
                 k = "S%d:merge" % n
                 if (done.get(k) or {}).get("sig") != self._session_sig(n, s) and self._job(k).get("state") != "running":
                     self.compute_session(n, "portal", "every event done")
@@ -5228,7 +5226,7 @@ function renderSession(){
   <h4 style="margin:10px 0 2px">OCR progress</h4>${scans}
   <div class="gask"><span class="meta" style="align-self:center" title="Done by the portal itself, from what Claude has read (no scans are read)">Run now:</span>
    <button type="button" data-ask="S${s.n}:check">Check the files</button>
-   <button type="button" data-ask="S${s.n}:merge"${s.template&&s.entriesFile?'':' disabled title="Needs the entries export and the empty merge results export"'}>Merge results</button>
+   <button type="button" data-ask="S${s.n}:merge"${s.entriesFile?'':' disabled title="Needs the entries export"'}>Merge results</button>
    <button type="button" data-ask="S${s.n}:final"${s.meet.final.length&&s.merged.length?'':' disabled title="Needs our merge results and Meet Manager\'s final export"'}>Final audit</button>
    <span class="meta" data-askmsg>${['merge','final','etd'].map(k=>{const j=(s.jobs||{})[k];if(!j)return '';
      const t={merge:'Merge results',final:'Final audit',etd:'ETD check'}[k];
@@ -5275,9 +5273,9 @@ function renderChecklist(){setTimeout(swAll,0);
    const fx=e.fixes||null,fxDone=fx?fx.filter(f=>GALA.ticks[qfKey(e,f)]).length:0;
    const fxCell=fx==null?'<span class="no">–</span>':fx.length?(fxDone===fx.length?`<span class="ok" title="All ${fx.length} ticked">done ✓ <span class="sm">(${fx.length})</span></span>`:`<span class="gwarn">${fxDone}/${fx.length}</span>`):'<span class="ok" title="No quick fixes">none ✓</span>';
    const lastFix=Math.max(0,...Object.values(e.handFixes||{}).map(h=>h.at||0)),needRegen=fx&&fx.length&&fxDone===fx.length&&lastFix>(e.mergeAt||0);
-   const regen=`<div><button type="button" class="primary regen" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'The portal writes the merge results, audit and quick fixes again from what is already transcribed, with the fixes made here and every DQ slip read and coded so far (no scans are read, no Claude)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export and the empty merge results export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
-   const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="${esc(!s.entriesFile?'No entries export':'No empty merge results export (one for the whole gala)')}">waiting</span>`)+regen;
-   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${needRegen?`<div class="qfdone">All quick fixes for event ${e.event} are done, and fixes were made since its merge results were written. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries and the empty merge results export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details data-qfd="S${s.n}:e${e.event}"${(QF_OPEN['S'+s.n+':e'+e.event]??(fxDone<fx.length))?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} ticked${fx.some(x=>x.cleared)?', '+fx.filter(x=>x.cleared).length+' settled by the re-check':''})${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
+   const regen=`<div><button type="button" class="primary regen" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'The portal writes the merge results, audit and quick fixes again from what is already transcribed, with the fixes made here and every DQ slip read and coded so far (no scans are read, no Claude)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
+   const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="No entries export">waiting</span>`)+regen;
+   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${needRegen?`<div class="qfdone">All quick fixes for event ${e.event} are done, and fixes were made since its merge results were written. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details data-qfd="S${s.n}:e${e.event}"${(QF_OPEN['S'+s.n+':e'+e.event]??(fxDone<fx.length))?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} ticked${fx.some(x=>x.cleared)?', '+fx.filter(x=>x.cleared).length+' settled by the re-check':''})${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
      <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
       return `<li class="${t?'done':''}${f.cleared?' cleared':''}">${tickBox(k,'Lane '+f.lane+' heat '+f.heat)}<div><b>Lane ${esc(f.lane)} · Heat ${esc(f.heat)}</b>${f.cleared?` <span class="st audited" title="${esc('No longer flagged since '+agoShort(f.clearedAt))}">settled by the re-check</span>`:''} <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>

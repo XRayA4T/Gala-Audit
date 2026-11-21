@@ -34,6 +34,10 @@ Folders called `.replaced` hold old copies; ignore them.
 `scans/pages/` holds each pack split into single pages for people to look at (named by lane from your
 transcriptions); always read the packs themselves, never the pages.
 
+**No swim marks on lane sheets** (Raymond, 2026-11-21): a printed swimmer's row whose timer columns hold only
+marks and no time (`/`, `-`, a dash or line across, `N/S`, `NS`, `----NS----`, "no swimmer", and so on) is a no-show:
+status `NO_SHOW`, with the marks described in `notes`. Don't record it as `SWAM` with no times.
+
 When the session's **printed lane sheets** are in `meet/`, always take the printed fields (names, ages, teams,
 seed times, heats) from them with gala-ocr's `original_sheets.py`, and read only the handwriting off the scans.
 The event questions name the print to use.
