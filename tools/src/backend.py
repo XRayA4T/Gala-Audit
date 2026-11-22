@@ -17,6 +17,7 @@ SKIP_NAME = re.compile(r"^[.~]|\.(part|partial|tmp|crdownload|download|lock)$|^(
 SESSION_RX = re.compile(r"(?i)(?:\bsession|\bsess|\bses)\s*[-_#.]?\s*(\d{1,2})(?!\d)|(?<![a-z0-9])s(\d{1,2})(?![0-9])")
 EVENT_RX = re.compile(r"(?i)(?:\bevent|\bevt|\bev|(?<![a-z0-9])e)\s*[-_#.]?\s*(\d{1,3})(?!\d)")
 GEN7_RX = re.compile(r"Event:\s*(\d+)\s+Heat:\s*(\d+)\s+Race\s*#\s*(\d+)")   # \s also matches line breaks
+GEN7_TIME = re.compile(r"(?<![\d:.])(?:\d{1,2}:)?\d{2}\.\d{2}(?![\d.])")   # a swim time on a Gen7 race
 GEN7_SESSION = re.compile(r"Session:\s*(\d+)")
 OCR_LANE = re.compile(r"-event0*(\d+)-lane(\d+)-p\d+\.json$", re.I)
 OCR_SLIP = re.compile(r"-event0*(\d+)-heat\d+-lane\d+-p\d+\.json$", re.I)
@@ -491,12 +492,16 @@ class Gala:
                 txt = ""
             races = []
             # pdftotext may put "Event: 7", "Heat: 2" and "Race # 44" on lines of their own, so search the whole
-            # text; the event title is the last line before "Event:".
-            for m in GEN7_RX.finditer(txt):
+            # text; the event title is the last line before "Event:". "timed": the race has a time on it (a race
+            # with none is a false start or a technical problem, and is passed over).
+            found = list(GEN7_RX.finditer(txt))
+            for i, m in enumerate(found):
                 before = [ln.strip() for ln in txt[:m.start()].splitlines() if ln.strip()]
                 desc = before[-1] if before else ""
+                seg = txt[m.end():found[i + 1].start() if i + 1 < len(found) else len(txt)]
                 races.append({"event": int(m.group(1)), "heat": int(m.group(2)), "race": int(m.group(3)),
-                              "desc": "" if GEN7_SESSION.search(desc) or "Event:" in desc else desc[:80]})
+                              "desc": "" if GEN7_SESSION.search(desc) or "Event:" in desc else desc[:80],
+                              "timed": bool(GEN7_TIME.search(seg))})
             s = GEN7_SESSION.search(txt)
             return {"session": int(s.group(1)) if s else None, "races": races}
         return self._cached("gen7", path, run) or {"session": None, "races": []}
@@ -1167,9 +1172,11 @@ class Gala:
             m = OCR_SLIP.search(o)
             if m:
                 slips_done.setdefault(int(m.group(1)), []).append(o)
-        gen7_by_event, desc = {}, {}
+        gen7_by_event, desc, timed = {}, {}, {}
         for r in races:
             gen7_by_event.setdefault(r["event"], {}).setdefault(r["heat"], r)
+            if r.get("timed", True):   # two or more races with times for one heat: the lane sheets decide
+                timed.setdefault(r["event"], {}).setdefault(r["heat"], set()).add(r["race"])
             if r["desc"]:
                 desc.setdefault(r["event"], r["desc"])
         hand = self.fixes(n)
@@ -1271,6 +1278,7 @@ class Gala:
                            "gen7Missing": [h for h in range(1, heats + 1) if h not in have and h not in not_swum],
                            "notSwum": [] if hand_t else not_swum, "notSwumBy": ns.get("by") if not_swum and not hand_t else None,
                            "handTimes": bool(hand_t),
+                           "multiRaces": {str(h): sorted(v) for h, v in sorted(timed.get(e, {}).items()) if len(v) > 1},
                            "expected": bool(x), "lanes": len(x.get("lanes", [])) or len(print_lanes.get(e, ())) or None,
                            "packs": [p["name"] for p in pk], "printed": printed.get(e, []), "ocrLanes": len(lanes_done.get(e, ())),
                            "report": report["name"] if report else None, "ready": ready, "sig": sig,
@@ -1280,7 +1288,9 @@ class Gala:
                            "seeded": seeded, "fixes": fixes, "recheck": self.rechecks.get((n, e)), "dqSlips": len(slips_done.get(e, [])),
                            "fixesFile": qf_file["name"][:-5] + ".html" if qf_file else None,
                            "handFixes": {k.split("-", 1)[1].replace("-", "."): v for k, v in hand.items()
-                                         if k.startswith("%d-" % e)}})
+                                         if k.startswith("%d-" % e) and k.count("-") == 2},
+                           "racePicks": {k.split("-")[1]: v.get("race") for k, v in hand.items()
+                                         if k.startswith("%d-" % e) and k.count("-") == 1}})
         merged = [f["name"] for f in sorted(reports, key=lambda f: f["mtime"])
                   if f["name"].lower().endswith(".hy3") and not re.search(r"(?i)\bevent\b", f["name"])]
         finals = [f["name"] for f in reports if f["name"].lower().endswith(".html") and "final" in f["name"].lower()]
@@ -1747,6 +1757,7 @@ class Gala:
             qf = int(m.group(1)) if m else None
             notes.append("%s quick fix%s" % (qf, "" if qf == 1 else "es") if qf is not None else "quick fixes written")
             self.rechecks.pop((n, e), None)
+            self.ask_race(n, e)
             self.compute_session_report(n)
             if inp["uncoded"]:
                 notes.append("%d DQ slip%s without a code (Claude was asked)" % (len(inp["uncoded"]), "" if len(inp["uncoded"]) == 1 else "s"))
@@ -1866,6 +1877,43 @@ class Gala:
         if self.ask(key, force=True):
             self.state["asked"][key]["sig"] = sig
             self.save()
+
+    def ask_race(self, n, e):
+        """Heats of the event with two or more Gen7 races with times that the lane sheets couldn't settle (the audit
+        put them in Quick Fix, "Several Gen7 races ..."): ask on the board which race each one is, once per set of
+        heats and races. The question is gala-claude's (so it hears the reply and records the race as a fix
+        "<event>-<heat>": {"race": N}), to anyone."""
+        qf = os.path.join(self.sdir(n, "reports"), "Event %02d quick fixes.json" % e)
+        heats = {}
+        try:
+            for r in json.load(open(qf, encoding="utf-8")):
+                for c in r.get("checks", []):
+                    if c.startswith("Several Gen7 races"):
+                        heats.setdefault(str(r["heat"]), c)
+        except (OSError, ValueError, TypeError, KeyError):
+            return
+        key = "S%d:races:%d" % (n, e)
+        prev = self.state["asked"].get(key)
+        if not heats:
+            return
+        sig = hashlib.sha1(json.dumps(heats, sort_keys=True).encode()).hexdigest()[:12]
+        if prev and prev.get("sig") == sig:
+            return
+        lines = ["- **Heat %s:** %s" % (h, c.split(": ", 1)[1] if ": " in c else c) for h, c in sorted(heats.items(), key=lambda x: int(x[0]))]
+        body = ("Gen7 has more than one race **with times** for %s of event %d, and the lane sheets don't show which race is "
+                "the heat:\n\n%s\n\nUntil it is settled the latest race is used, and every lane of %s is in "
+                "[Event %d quick fixes](/api/gala/file?path=sessions/S%d/reports/Event%%20%02d%%20quick%%20fixes.html).\n\n"
+                "**Which race is each heat?** Reply with the race number (or say how the heat was swum, e.g. a re-swim of "
+                "some lanes). gala-claude records it and the event is worked out again."
+                % ("heat " + next(iter(heats)) if len(heats) == 1 else "heats " + ", ".join(sorted(heats, key=int)), e,
+                   "\n".join(lines), "that heat" if len(heats) == 1 else "those heats", e, n, e))
+        title = "Session %d · Event %d: which Gen7 race is %s?" % (
+            n, e, "heat " + next(iter(heats)) if len(heats) == 1 else "heats " + ", ".join(sorted(heats, key=int)))
+        with self.lock:
+            row = self.store.post(title, body, CLAUDE_WHO, "anyone")
+            self.state["asked"][key] = {"ts": time.time(), "qid": row["id"], "sig": sig, "by": "portal"}
+            self.save()
+        self.log("Asked on the board: %s (question %d)" % (title, row["id"]), qid=row["id"])
 
     def ask_fix_transcription(self, n, e, problems):
         key = "S%d:fixocr:%d" % (n, e)
@@ -2177,6 +2225,25 @@ class Gala:
     def set_fix(self, n, e, h, ln, fix, who):
         if n not in self.sessions():
             raise ValueError("no such session")
+        if not ln and "race" in fix:   # the Gen7 race chosen for a whole heat: {"<event>-<heat>": {"race": N}}
+            race = str(fix.get("race") or "").strip()
+            if race and not race.isdigit():
+                raise ValueError("the race must be a Gen7 race number")
+            key = "%d-%d" % (int(e), int(h))
+            with self.lock:
+                d = self.fixes(n)
+                if race:
+                    d[key] = {"race": int(race), "note": str(fix.get("note") or "").strip()[:300],
+                              "by": str(who or "someone")[:60], "at": time.time()}
+                else:
+                    d.pop(key, None)
+                tmp = self.fixes_file(n) + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(d, f, indent=1, sort_keys=True)
+                os.replace(tmp, self.fixes_file(n))
+            self.log("Session %d event %d heat %d: %s" % (n, int(e), int(h), "Gen7 race %s chosen" % race if race
+                                                          else "the race chosen for it cleared"))
+            return
         status = str(fix.get("status") or "").upper()
         t = str(fix.get("time") or "").strip()
         code = str(fix.get("code") or "").strip()[:6]
@@ -2298,6 +2365,8 @@ class Gala:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         self.rechecks[key] = {"state": "done" if ok else "failed", "at": time.time(), "by": who, "msg": msg[-300:]}
+        if ok:
+            self.ask_race(n, e)
         self.log("Session %d event %d re-checked%s: %s" % (n, e, " by " + who if who else "", msg[-200:] if msg else
                                                           ("done" if ok else "failed")))
 
