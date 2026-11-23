@@ -1807,8 +1807,11 @@ class Gala:
                         notes.append("no results changed from the previous merge results")
             else:
                 notes.append("no merge results yet (needs the entries export)")
+            cfj = os.path.join(tmp, "confirmations.json")
+            with open(cfj, "w", encoding="utf-8") as fh:
+                json.dump([self.confirm_report(n, e)], fh)
             cmd = [audit, ocr, gen7, os.path.join(out_dir, "Event %02d audit.html" % e), "--events", str(e),
-                   "--scans", scans if final else tmp,
+                   "--scans", scans if final else tmp, "--confirmations", cfj,
                    "--quick-fixes", os.path.join(rep, "Event %02d quick fixes.html" % e),
                    "--times", os.path.join(rep, "Event %02d times.json" % e),
                    "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes",
@@ -1841,8 +1844,16 @@ class Gala:
         if not done:
             return False
         out = os.path.join(self.sdir(n, "reports"), "Session %d audit.html" % n)
-        ok, msg = self._run_script([audit, self.sdir(n, "ocr"), self.sdir(n, "gen7"), out, "--events", done,
-                                    "--scans", self.sdir(n, "scans")] + self._script_opts(n))
+        tmp = tempfile.mkdtemp(prefix="gala-session-")
+        try:
+            cfj = os.path.join(tmp, "confirmations.json")
+            with open(cfj, "w", encoding="utf-8") as fh:
+                json.dump([self.confirm_report(n, int(x)) for x in done.split(",")], fh)
+            ok, msg = self._run_script([audit, self.sdir(n, "ocr"), self.sdir(n, "gen7"), out, "--events", done,
+                                        "--scans", self.sdir(n, "scans"), "--confirmations", cfj, "--ocr-fixes"]
+                                       + self._script_opts(n))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
         if not ok:
             self.log("Session %d report: %s" % (n, msg.splitlines()[-1] if msg else "failed"))
         return ok
@@ -2904,9 +2915,9 @@ class Gala:
         dq_rows.sort(key=lambda x: (int(x["h"] or 0), int(x["l"] or 0)))   # by heat, then lane
         digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["code"]] for x in dq_rows]).encode()).hexdigest()[:12]
         decided_n = sum(1 for x in dq_rows if x["action"])
-        tick = ticks.get("S%d:e%d:cf:dq" % (n, e))
+        dq_tick = ticks.get("S%d:e%d:cf:dq" % (n, e))
         can = bool(dq_rows) and decided_n == len(dq_rows)
-        dq_done = not dq_rows or bool(tick and can and digests.get("dq") == digest)
+        dq_done = not dq_rows or bool(dq_tick and can and digests.get("dq") == digest)
         complete = complete and dq_done
         # Other checks: what isn't about the reading (a scratch that swam, several Gen7 races for a heat, the lane
         # sheet and Gen7 disagreeing on a lane): kept as it is, or the result changed with a reason.
@@ -2928,9 +2939,9 @@ class Gala:
         ck_rows.sort(key=lambda x: (int(x["h"] or 0), int(x["l"] or 0)))
         ck_digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["checks"]] for x in ck_rows]).encode()).hexdigest()[:12]
         ck_n = sum(1 for x in ck_rows if x["action"])
-        tick = ticks.get("S%d:e%d:cf:checks" % (n, e))
+        ck_tick = ticks.get("S%d:e%d:cf:checks" % (n, e))
         ck_can = bool(ck_rows) and ck_n == len(ck_rows)
-        ck_done = not ck_rows or bool(tick and ck_can and digests.get("checks") == ck_digest)
+        ck_done = not ck_rows or bool(ck_tick and ck_can and digests.get("checks") == ck_digest)
         complete = complete and ck_done
         # Swims not entered: a swimmer swimming a race they aren't entered in (a scratch that swam, an entry added for
         # a confirmed swim): the referee approves it (with a reason), or it is marked as no swim.
@@ -2951,17 +2962,17 @@ class Gala:
         ne_rows.sort(key=lambda x: (int(x["h"] or 0), int(x["l"] or 0)))
         ne_digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["kind"]] for x in ne_rows]).encode()).hexdigest()[:12]
         ne_n = sum(1 for x in ne_rows if x["action"])
-        tick = ticks.get("S%d:e%d:cf:entries" % (n, e))
+        ne_tick = ticks.get("S%d:e%d:cf:entries" % (n, e))
         ne_can = bool(ne_rows) and ne_n == len(ne_rows)
-        ne_done = not ne_rows or bool(tick and ne_can and digests.get("entries") == ne_digest)
+        ne_done = not ne_rows or bool(ne_tick and ne_can and digests.get("entries") == ne_digest)
         complete = complete and ne_done
         return {"ready": ready, "complete": complete, "sections": sections,
-                "entries": {"count": len(ne_rows), "decided": ne_n, "rows": ne_rows, "tick": tick, "can": ne_can,
-                            "done": ne_done, "changed": bool(tick and not ne_done)},
-                "checks": {"count": len(ck_rows), "decided": ck_n, "rows": ck_rows, "tick": tick, "can": ck_can,
-                           "done": ck_done, "changed": bool(tick and not ck_done)},
-                "dq": {"count": len(dq_rows), "decided": decided_n, "rows": dq_rows, "tick": tick, "can": can,
-                       "done": dq_done, "changed": bool(tick and not dq_done), "known": dqs is not None},
+                "entries": {"count": len(ne_rows), "decided": ne_n, "rows": ne_rows, "tick": ne_tick, "can": ne_can,
+                            "done": ne_done, "changed": bool(ne_tick and not ne_done)},
+                "checks": {"count": len(ck_rows), "decided": ck_n, "rows": ck_rows, "tick": ck_tick, "can": ck_can,
+                           "done": ck_done, "changed": bool(ck_tick and not ck_done)},
+                "dq": {"count": len(dq_rows), "decided": decided_n, "rows": dq_rows, "tick": dq_tick, "can": can,
+                       "done": dq_done, "changed": bool(dq_tick and not dq_done), "known": dqs is not None},
                 "digest": digest, "watchrule": watch}
 
     def confirm_digest(self, n, e):
@@ -2974,6 +2985,39 @@ class Gala:
         return hashlib.sha1(json.dumps([st.get("lines", {}), st.get("dq", {}), st.get("other", {}), st.get("entries", {})],
                                        sort_keys=True, default=str)
                             .encode()).hexdigest()[:12]
+
+    def confirm_report(self, n, e):
+        """Event e's Quick OCR fixes and confirmations as the audit report shows them (audit_report.py
+        --confirmations, gala-ocr 1.6.16+): what was flagged and done, and every confirmation with who made it."""
+        rep = self.sdir(n, "reports")
+        qp = os.path.join(rep, "Event %02d quick fixes.json" % e)
+        qf = self.qf_history(n, e, self._cached("qf", qp, _read_fixes) or []) if os.path.exists(qp) else []
+        c = self.confirmations(n, e, qf)
+        ticks, fixes = self.state["ticks"], self.fixes(n)
+        tk = lambda k: ({"by": ticks[k].get("by"), "at": ticks[k].get("at")} if ticks.get(k) else None)  # noqa: E731
+        quick = []
+        for f in qf:
+            if f.get("cleared"):   # no longer flagged: not a Quick OCR fix now
+                continue
+            fx = fixes.get("%d-%s-%s" % (e, f["heat"], f["lane"])) or {}
+            fx = {k: v for k, v in fx.items() if k != "confirmed" and v not in ("", None, [], {})}
+            quick.append({"heat": f["heat"], "lane": f["lane"], "inFile": f.get("inFile") or "",
+                          "checks": f.get("checks") or [], "tick": tk("S%d:e%d:qf:%s.%s" % (n, e, f["heat"], f["lane"])),
+                          "fix": fx})
+        out = {"event": e, "quickFixes": quick, "ready": bool(c and c["ready"]), "complete": bool(c and c["complete"]),
+               "sections": [], "dq": None, "entries": None, "checks": None}
+        if not c:
+            return out
+        for name in ("dq", "entries", "checks"):
+            b = c[name]
+            out[name] = {"count": b["count"], "decided": b["decided"], "done": b["done"],
+                         "tick": tk("S%d:e%d:cf:%s" % (n, e, name)), "rows": b["rows"]}
+        for sec in c["sections"]:
+            out["sections"].append({"key": sec["key"], "title": sec["title"], "what": sec["what"],
+                                    "options": sec["options"], "show": sec["show"], "count": sec["count"],
+                                    "confirmed": sec["confirmed"], "done": sec["done"],
+                                    "tick": tk("S%d:e%d:cf:%s" % (n, e, sec["key"])), "rows": sec["rows"]})
+        return out
 
     def _confirm_fix(self, n, e, h, ln, who, **want):
         """Put (a value) or take back (empty) the result fields a confirmation sets in fixes.json (time, status,
