@@ -813,6 +813,52 @@ def _same_file(a, b):
         return False
 
 
+
+# Confirmations: each swim with a time, by how its TP, PB and SW median agree (within CONFIRM_TOL hundredths).
+# (key, title, what it holds, options to pick from (the first needs no reason), the value shown when there's no choice)
+CONFIRM_TOL = 30
+CONFIRM_SECTIONS = [
+    ("allmatch", "All Match", "TP, PB and the SW median agree within 0.30 s: TP", ["tp", "sw", "pb"], "tp"),
+    ("nopb", "All Match NO PB", "No PB; TP and the SW median agree within 0.30 s: TP", ["tp", "sw"], "tp"),
+    ("notp", "All Match NO TP", "No TP; PB and the SW median agree within 0.30 s: the SW median", [], "sw"),
+    ("notppb", "SW Median - No TP or BP", "No TP and no PB: the SW median", [], "sw"),
+    ("overlap", "Overlap", "Two of the three pairs (TP-PB, TP-SW median, PB-SW median) agree within 0.30 s, the third "
+                "doesn't", ["tp", "sw", "pb"], None),
+    ("badtp", "Bad TP - Rest Match", "PB and the SW median agree within 0.30 s, TP doesn't", ["sw", "tp", "pb"], None),
+    ("badsw", "Bad SW Median - TP/BP Match", "TP and PB agree within 0.30 s, the SW median doesn't", ["tp", "sw", "pb"], None),
+    ("badpb", "Bad PB - TP/SW Median Match", "TP and the SW median agree within 0.30 s, PB doesn't", ["tp", "sw", "pb"], None),
+    ("notpmis", "NO TP - SW Median - BP Mismatch", "No TP; PB and the SW median don't agree within 0.30 s", ["sw", "pb"], None),
+    ("nomatch", "No Match", "No two of TP, PB and the SW median agree within 0.30 s", ["sw", "tp", "pb"], None),
+]
+PICK_NAME = {"tp": "TP", "pb": "PB", "sw": "SW median"}
+# Sections whose swims start confirmed with the first option; another pick (with a reason) can be made per swim.
+AUTO_CONFIRM = {"allmatch", "nopb"}
+
+
+def _hund(t):
+    """'1:05.32' or '32.10' -> hundredths (None if it isn't a time)."""
+    m = re.fullmatch(r"\s*(?:(\d{1,2}):)?(\d{1,2})\.(\d{2})\d*\s*", str(t or ""))
+    return (int(m.group(1) or 0) * 60 + int(m.group(2))) * 100 + int(m.group(3)) if m else None
+
+
+def confirm_category(tp, pb, med, tol=CONFIRM_TOL):
+    """The confirmation section of a swim from its TP, PB and SW median (hundredths or None)."""
+    ok = lambda a, b: a is not None and b is not None and abs(a - b) <= tol  # noqa: E731
+    if tp is not None and pb is not None and med is not None:
+        pairs = ok(tp, pb) + ok(tp, med) + ok(pb, med)
+        return ("allmatch" if pairs == 3 else "overlap" if pairs == 2 else "badsw" if ok(tp, pb)
+                else "badtp" if ok(pb, med) else "badpb" if ok(tp, med) else "nomatch")
+    if tp is not None and med is not None:
+        return "nopb" if ok(tp, med) else "nomatch"
+    if pb is not None and med is not None:
+        return "notp" if ok(pb, med) else "notpmis"
+    if med is not None:
+        return "notppb"
+    if tp is not None or pb is not None:   # TP and/or PB with no SW times
+        return "nomatch"
+    return None
+
+
 class Gala:
     def __init__(self, root, inbox, store):
         self.root = os.path.abspath(root)
@@ -1942,6 +1988,9 @@ class Gala:
                 status = "transcribed"
             else:
                 status = "waiting"
+            confirm = self.confirmations(n, e, fixes or []) if read else None
+            if confirm and not confirm["complete"] and status in ("audited", "changed", "transcribed"):
+                status = "confirm"
             events.append({"event": e, "desc": desc.get(e, ""), "heats": heats, "gen7": have,
                            "gen7Missing": [h for h in range(1, heats + 1) if h not in have and h not in not_swum],
                            "notSwum": [] if hand_t else not_swum, "notSwumBy": ns.get("by") if not_swum and not hand_t else None,
@@ -1953,7 +2002,7 @@ class Gala:
                            "status": status, "asked": a, "read": read, "packSig": pack_sig, "run": job or None,
                            "computed": self.state.get("computed", {}).get("S%d:e%d:run" % (n, e)), "merge": merge_file, "mergeAt": merge_f["mtime"] if merge_f else None,
                            "canMerge": can_merge,
-                           "seeded": seeded, "fixes": fixes, "recheck": self.rechecks.get((n, e)), "dqSlips": len(slips_done.get(e, [])),
+                           "seeded": seeded, "fixes": fixes, "confirm": confirm, "recheck": self.rechecks.get((n, e)), "dqSlips": len(slips_done.get(e, [])),
                            "fixesFile": qf_file["name"][:-5] + ".html" if qf_file else None,
                            "handFixes": {k.split("-", 1)[1].replace("-", "."): v for k, v in hand.items()
                                          if k.startswith("%d-" % e) and k.count("-") == 2},
@@ -2261,6 +2310,10 @@ class Gala:
                       for m in [re.fullmatch(r"S%d:e(\d+):handtimes" % n, k)] if m)
         if hand:   # events timed by hand only (gala-ocr 1.6.10+)
             out += ["--hand-times", ",".join(map(str, hand))]
+        if "S%d:watchrule" % n in self.state["ticks"]:
+            # A session whose results were published with the rule before gala-ocr 1.6.13: the SW median overrides
+            # TP when TP and PB agree with each other but not with the watches. Set by ticking S<n>:watchrule.
+            out += ["--watches-over-pad"]
         return out
 
     @staticmethod
@@ -2352,7 +2405,7 @@ class Gala:
                                                            if k in {f["name"] for f in slips})]] \
             + [[k, [[f["name"], f["mtime"]] for f in [self.meet_wide(n, k)[1]] if f]] for k in ("entries", "results")] \
             + [["codes", [[f["name"], f["mtime"]] for f in meet["codes"][-1:]]]] \
-            + [["notSwum", ev.get("notSwum") or []]]
+            + [["notSwum", ev.get("notSwum") or []]] + [["confirmed", self.confirm_digest(n, e)]]
         return {"complete": not missing, "missing": missing, "read": read, "uncoded": uncoded, "ev": ev,
                 "sig": hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]}
 
@@ -2394,15 +2447,19 @@ class Gala:
             ev_rx = re.compile(r"(?i)\bevent\s*0*%d\b" % e)
             prev = max((f for f in _ls(rep) if f["name"].lower().endswith(".hy3") and "merge results" in f["name"].lower()
                         and ev_rx.search(f["name"])), key=lambda f: f["mtime"], default=None)
+            cf = self.confirmations(n, e)
+            final = bool(cf and cf["complete"])   # confirmed: the merge results and audit are written
+            out_dir = rep if final else tmp
             if ev["canMerge"] and merge:
                 ent = self._entries_hy3(n, tmp)
                 tpl = "-"   # entries export only: an empty merge results export is no longer used
-                mfile = os.path.join(rep, "Event %02d merge results %s.hy3" % (e, time.strftime("%Y-%m-%d_%H%M")))
+                mfile = os.path.join(out_dir, "Event %02d merge results %s.hy3" % (e, time.strftime("%Y-%m-%d_%H%M")))
                 ok, out = self._run_script([merge, ocr, gen7, ent, tpl, mfile, "--events", str(e)] + self._script_opts(n))
                 if not ok:
                     return False, "event %d merge results: %s" % (e, out.splitlines()[-1] if out else "failed")
-                notes.append("merge results %s" % os.path.basename(mfile))
-                if prev and prev["name"] != os.path.basename(mfile):
+                if final:
+                    notes.append("merge results %s" % os.path.basename(mfile))
+                if final and prev and prev["name"] != os.path.basename(mfile):
                     changes = merge_changes(os.path.join(rep, prev["name"]), mfile)
                     if changes:
                         rpt = os.path.join(rep, "Event %02d merge changes %s.txt" % (e, time.strftime("%Y-%m-%d_%H%M")))
@@ -2415,15 +2472,19 @@ class Gala:
                         notes.append("no results changed from the previous merge results")
             else:
                 notes.append("no merge results yet (needs the entries export)")
-            cmd = [audit, ocr, gen7, os.path.join(rep, "Event %02d audit.html" % e), "--events", str(e), "--scans", scans,
+            cmd = [audit, ocr, gen7, os.path.join(out_dir, "Event %02d audit.html" % e), "--events", str(e),
+                   "--scans", scans if final else tmp,
                    "--quick-fixes", os.path.join(rep, "Event %02d quick fixes.html" % e),
-                   "--times", os.path.join(rep, "Event %02d times.json" % e)] + (["--merge", mfile] if mfile else [])
+                   "--times", os.path.join(rep, "Event %02d times.json" % e),
+                   "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes"] + (["--merge", mfile] if mfile else [])
             ok, out = self._run_script(cmd + self._script_opts(n))
             if not ok:
                 return False, "event %d audit: %s" % (e, out.splitlines()[-1] if out else "failed")
             m = re.search(r"(\d+) swims? in Quick Fix", out)
             qf = int(m.group(1)) if m else None
-            notes.append("%s quick fix%s" % (qf, "" if qf == 1 else "es") if qf is not None else "quick fixes written")
+            notes.append("%s quick OCR fix%s" % (qf, "" if qf == 1 else "es") if qf is not None else "quick fixes written")
+            if not final:
+                notes.append("the merge results and audit are written once its times and DQs are confirmed")
             self.rechecks.pop((n, e), None)
             self.ask_race(n, e)
             self.compute_session_report(n)
@@ -3014,14 +3075,11 @@ class Gala:
         tmp = tempfile.mkdtemp(prefix="gala-recheck-")
         cmd = [sys.executable, "-I", script, self.sdir(n, "ocr"), self.sdir(n, "gen7"), os.path.join(tmp, "audit.html"),
                "--events", str(e), "--scans", tmp, "--quick-fixes", qf,
-               "--times", os.path.join(rep, "Event %02d times.json" % e)]
+               "--times", os.path.join(rep, "Event %02d times.json" % e),
+               "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes"]
         if ev.get("merge"):
             cmd += ["--merge", os.path.join(rep, ev["merge"])]
-        if os.path.exists(self.fixes_file(n)):
-            cmd += ["--fixes", self.fixes_file(n)]
-        own = self.meet_files(n)["codes"]
-        if own:
-            cmd += ["--codes", os.path.join(self.sdir(n, "meet"), own[-1]["name"])]
+        cmd += self._script_opts(n)
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             ok = r.returncode == 0
@@ -3404,11 +3462,277 @@ class Gala:
                          stdin=subprocess.DEVNULL, start_new_session=True)
         self.log("Update started by %s; the portal restarts in a minute" % who)
 
+    # ---------------------------------------------------------------- confirmations (after the Quick OCR Fixes)
+    # Once an event's Quick OCR Fixes are all ticked, its DQs and its times are confirmed before its merge results and
+    # audit are written. Every swim with a time falls in one of CONFIRM_SECTIONS by how TP, PB and the SW median agree
+    # (within CONFIRM_TOL). In a section with options each swim is confirmed on its own: the value picked is its final
+    # time (a reason is needed for any but the first option); a pick that differs from the audit's final time is put in
+    # fixes.json as the swim's time. A section is ticked once all its swims are confirmed. DQs are confirmed (the code
+    # can be changed) or withdrawn with a reason. Kept in state.json: confirm["S<n>:e<e>"] = {"lines": {"H.L": {pick,
+    # reason, value, snap, by, at}}, "dq": {"H.L": {action, code, reason, orig, by, at}}, "digest": {section: digest}};
+    # the section ticks are ordinary checklist ticks, S<n>:e<e>:cf:<section>.
+    def _confirm_rows(self, n, e):
+        rep = self.sdir(n, "reports")
+        tf, df = os.path.join(rep, "Event %02d times.json" % e), os.path.join(rep, "Event %02d dqs.json" % e)
+
+        def lst(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+                return [x for x in d if isinstance(x, dict)] if isinstance(d, list) else []
+            except (OSError, ValueError):
+                return []
+        times = self._cached("cf-times", tf, lst) if os.path.exists(tf) else None
+        dqs = self._cached("cf-dqs", df, lst) if os.path.exists(df) else None
+        return times, dqs
+
+    def confirmations(self, n, e, qf=None):
+        """Event e's confirmations for the Checklist: {ready, complete, sections: [...], dq: {...}}, or None before the
+        portal has worked the event out (no times file yet). qf: the event's quick fixes (qf_history) if known."""
+        times, dqs = self._confirm_rows(n, e)
+        if times is None:
+            return None
+        if qf is None:
+            qp = os.path.join(self.sdir(n, "reports"), "Event %02d quick fixes.json" % e)
+            qf = self.qf_history(n, e, self._cached("qf", qp, _read_fixes) or []) if os.path.exists(qp) else []
+        ticks = self.state["ticks"]
+        ready = all(f.get("cleared") or ("S%d:e%d:qf:%s.%s" % (n, e, f["heat"], f["lane"])) in ticks for f in qf)
+        st = self.state.get("confirm", {}).get("S%d:e%d" % (n, e), {})
+        lines, decided, digests = st.get("lines", {}), st.get("dq", {}), st.get("digest", {})
+        watch = "S%d:watchrule" % n in ticks
+        by_sec = {k: [] for k, *_ in CONFIRM_SECTIONS}
+        for r in times:
+            if r.get("ns"):
+                continue
+            tp, pb, med = _hund(r.get("tp")), _hund(r.get("pb")), _hund(r.get("median"))
+            cat = confirm_category(tp, pb, med)
+            if not cat:
+                continue
+            k = "%s.%s" % (r.get("heat"), r.get("lane"))
+            # the SW median to hundredths, as the final time takes it (an even count's thousandths dropped)
+            vals = {"tp": r.get("tp") or "", "pb": r.get("pb") or "",
+                    "sw": re.sub(r"(\.\d\d)\d+$", r"\1", str(r.get("median") or ""))}
+            sec = next(x for x in CONFIRM_SECTIONS if x[0] == cat)
+            opts = [o for o in sec[3] if vals[o]]
+            default = opts[0] if opts else sec[4]
+            snap = "%s|%s|%s|%s" % (vals["tp"], vals["pb"], vals["sw"], cat)
+            ln = lines.get(k) or {}
+            row = {"h": r.get("heat"), "l": r.get("lane"), "name": r.get("name") or "", "tp": vals["tp"],
+                   "pb": vals["pb"], "med": vals["sw"], "final": r.get("final") or "", "dq": bool(r.get("dq")),
+                   "doubt": bool(r.get("doubt")),
+                   "sw": [[w.get("column"), w.get("time") or "", w.get("written") or "", w.get("confidence") or ""]
+                          for w in r.get("sw") or []],
+                   "opts": opts, "default": default}
+            if opts and ln:
+                row.update(pick=ln.get("pick"), reason=ln.get("reason") or "", by=ln.get("by"), at=ln.get("at"),
+                           stale=ln.get("snap") != snap)
+            elif opts and cat in AUTO_CONFIRM:   # confirmed with the default until another pick is made
+                row.update(pick=default, auto=True)
+            by_sec[cat].append(row)
+        sections = []
+        complete = ready
+        for key, title, what, options, show in CONFIRM_SECTIONS:
+            rows = sorted(by_sec[key], key=lambda x: (int(x["l"] or 0), int(x["h"] or 0)))   # by lane, then heat
+            digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["tp"], x["pb"], x["med"]] for x in rows]).encode()).hexdigest()[:12]
+            confirmed = sum(1 for x in rows if x.get("pick") and not x.get("stale")) if options else len(rows)
+            can = bool(rows) and confirmed == len(rows)
+            tick = ticks.get("S%d:e%d:cf:%s" % (n, e, key))
+            done = not rows or bool(tick and can and digests.get(key) == digest)
+            complete = complete and done
+            sections.append({"key": key, "title": title, "what": what, "options": options, "show": show,
+                             "count": len(rows), "confirmed": confirmed, "rows": rows, "tick": tick, "can": can,
+                             "done": done, "changed": bool(tick and not done)})
+        dq_rows = []
+        for d in dqs or []:
+            k = "%s.%s" % (d.get("heat"), d.get("lane"))
+            dc = decided.get(k) or {}
+            stale = bool(dc) and dc.get("orig", "") != (d.get("code") or "")
+            dq_rows.append({"h": d.get("heat"), "l": d.get("lane"), "name": d.get("name") or "",
+                            "infraction": d.get("infraction") or "", "back": d.get("back") or "",
+                            "code": d.get("code") or "", "codeText": d.get("codeText") or "", "codeNote": d.get("codeNote") or "",
+                            "source": d.get("source") or "", "scan": d.get("scan") or "", "page": d.get("page"),
+                            "findings": d.get("findings") or [], "action": dc.get("action") if dc and not stale else None,
+                            "newCode": dc.get("code") or "", "reason": dc.get("reason") or "", "by": dc.get("by"),
+                            "at": dc.get("at"), "stale": stale})
+        dq_rows.sort(key=lambda x: (int(x["h"] or 0), int(x["l"] or 0)))   # by heat, then lane
+        digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["code"]] for x in dq_rows]).encode()).hexdigest()[:12]
+        decided_n = sum(1 for x in dq_rows if x["action"])
+        tick = ticks.get("S%d:e%d:cf:dq" % (n, e))
+        can = bool(dq_rows) and decided_n == len(dq_rows)
+        dq_done = not dq_rows or bool(tick and can and digests.get("dq") == digest)
+        complete = complete and dq_done
+        return {"ready": ready, "complete": complete, "sections": sections,
+                "dq": {"count": len(dq_rows), "decided": decided_n, "rows": dq_rows, "tick": tick, "can": can,
+                       "done": dq_done, "changed": bool(tick and not dq_done), "known": dqs is not None},
+                "digest": digest, "watchrule": watch}
+
+    def confirm_digest(self, n, e):
+        """What the merge results depend on from the confirmations: 'open' until the event is fully confirmed, then
+        a hash of every pick and DQ decision (so a change made after that writes them again)."""
+        c = self.confirmations(n, e)
+        if not c or not c["complete"]:
+            return "open"
+        st = self.state.get("confirm", {}).get("S%d:e%d" % (n, e), {})
+        return hashlib.sha1(json.dumps([st.get("lines", {}), st.get("dq", {})], sort_keys=True, default=str)
+                            .encode()).hexdigest()[:12]
+
+    def _confirm_fix(self, n, e, h, ln, who, **want):
+        """Put (a value) or take back (empty) the result fields a confirmation sets in fixes.json (time, status,
+        code), leaving everything else in the swim's fix alone. What a confirmation set is kept in its "confirmed"."""
+        key = "%d-%d-%d" % (int(e), int(h), int(ln))
+        with self.lock:
+            d = self.fixes(n)
+            f = dict(d.get(key) or {})
+            mine = dict(f.get("confirmed") or {})
+            for k, v in want.items():
+                if k == "reason":
+                    continue
+                if v:
+                    f[k] = mine[k] = v
+                elif k in mine:
+                    if f.get(k) == mine[k]:
+                        f.pop(k, None)
+                    mine.pop(k)
+            if mine:
+                mine["reason"] = want.get("reason") or ""
+                f["confirmed"] = mine
+                f["by"], f["at"] = str(who or "someone")[:60], time.time()
+            else:
+                f.pop("confirmed", None)
+            if f.get("status") != "DQ":
+                f.pop("code", None)
+            if any(f.get(k) for k in ("status", "time", "note", "watches", "swimmer", "swimsEvent", "timedIn", "add")):
+                f.setdefault("status", "")
+                f.setdefault("time", "")
+                f.setdefault("note", "")
+                f.setdefault("by", str(who or "someone")[:60])
+                f.setdefault("at", time.time())
+                d[key] = f
+            else:
+                d.pop(key, None)
+            tmp = self.fixes_file(n) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(d, fh, indent=1, sort_keys=True)
+            os.replace(tmp, self.fixes_file(n))
+
+    def set_confirm(self, n, e, d, who):
+        """A confirmation from the Checklist: {kind: "line", heat, lane, pick, reason} (pick "" takes it back);
+        {kind: "dq", heat, lane, action: confirm|withdraw|"", code, reason}; {kind: "section", key, checked}."""
+        if n not in self.sessions():
+            raise ValueError("no such session")
+        e = int(e)
+        kind = str(d.get("kind") or "")
+        if kind == "section":
+            return self.tick("S%d:e%d:cf:%s" % (n, e, str(d.get("key") or "")), bool(d.get("checked")), who)
+        c = self.confirmations(n, e)
+        if not c:
+            raise ValueError("event %d hasn't been worked out yet" % e)
+        if not c["ready"] and not (kind == "line" and d.get("preset")):   # preset: a pick given ahead (e.g. by Claude)
+            raise ValueError("tick off event %d's Quick OCR fixes first" % e)
+        h, ln = int(d.get("heat") or 0), int(d.get("lane") or 0)
+        k = "%d.%d" % (h, ln)
+        reason = re.sub(r"\s+", " ", str(d.get("reason") or "")).strip()[:300]
+        who = str(who or "someone")[:60]
+        ev_state = lambda: self.state.setdefault("confirm", {}).setdefault("S%d:e%d" % (n, e), {})  # noqa: E731
+        if kind == "line":
+            row = next((r for s in c["sections"] for r in s["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
+            sec = next((s for s in c["sections"] for r in s["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
+            if not row or not row["opts"]:
+                raise ValueError("heat %d lane %d has nothing to confirm" % (h, ln))
+            pick = str(d.get("pick") or "")
+            if pick and pick not in row["opts"]:
+                raise ValueError("pick one of %s" % ", ".join(PICK_NAME[o] for o in row["opts"]))
+            if pick and pick != row["default"] and not reason:
+                raise ValueError("give a reason for %s (not %s)" % (PICK_NAME[pick], PICK_NAME[row["default"]]))
+            if sec["key"] in AUTO_CONFIRM and pick == row["default"]:
+                pick = ""   # back to the default these sections start with: nothing to keep
+            value = {"tp": row["tp"], "pb": row["pb"], "sw": row["med"]}.get(pick, "")
+            with self.lock:
+                lines = ev_state().setdefault("lines", {})
+                if pick:
+                    lines[k] = {"pick": pick, "reason": reason, "value": value, "by": who, "at": time.time(),
+                                "snap": "%s|%s|%s|%s" % (row["tp"], row["pb"], row["med"], sec["key"])}
+                    if d.get("preset"):
+                        lines[k]["preset"] = True
+                else:
+                    lines.pop(k, None)
+                self.save()
+            differs = bool(pick) and _hund(value) != _hund(row["final"])
+            self._confirm_fix(n, e, h, ln, who, time=value if differs else "", reason=reason)
+            self.log("Session %d event %d heat %d lane %d: %s" % (
+                n, e, h, ln, "%s %s confirmed%s%s" % (PICK_NAME[pick], value, " (the final time changes from %s)" % row["final"]
+                                                      if differs else "", ": " + reason if reason else "")
+                if pick else "time confirmation taken back"))
+            return
+        if kind == "dq":
+            row = next((r for r in c["dq"]["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
+            if not row:
+                raise ValueError("no DQ in heat %d lane %d" % (h, ln))
+            action = str(d.get("action") or "")
+            code = str(d.get("code") or "").strip()[:6]
+            if action not in ("", "confirm", "withdraw"):
+                raise ValueError("confirm or withdraw the DQ")
+            if action == "confirm" and not code:
+                raise ValueError("a DQ needs its code")
+            if action == "withdraw" and not reason:
+                raise ValueError("give the reason the DQ is withdrawn")
+            with self.lock:
+                dq = ev_state().setdefault("dq", {})
+                if action:
+                    dq[k] = {"action": action, "code": code if action == "confirm" else "", "reason": reason,
+                             "orig": row["code"], "by": who, "at": time.time()}
+                else:
+                    dq.pop(k, None)
+                self.save()
+            if action == "confirm" and (code != row["code"] or row["source"] != "slip"):
+                self._confirm_fix(n, e, h, ln, who, status="DQ", code=code, reason=reason)
+            elif action == "withdraw":
+                self._confirm_fix(n, e, h, ln, who, status="OK", code="", reason=reason)
+            else:
+                self._confirm_fix(n, e, h, ln, who, status="", code="")
+            self.log("Session %d event %d heat %d lane %d: %s" % (
+                n, e, h, ln, {"confirm": "DQ %s confirmed" % code, "withdraw": "DQ withdrawn: %s" % reason}.get(action, "DQ decision taken back")))
+            return
+        raise ValueError("unknown confirmation")
+
+    def confirm_section(self, n, e, key, checked, who):
+        """Tick or untick a confirmation section (S<n>:e<e>:cf:<key>): only when every swim in it is confirmed."""
+        c = self.confirmations(n, e)
+        if not c:
+            raise ValueError("event %d hasn't been worked out yet" % e)
+        if key == "dq":
+            sec, rows = c["dq"], c["dq"]["rows"]
+            digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["code"]] for x in rows]).encode()).hexdigest()[:12]
+        else:
+            sec = next((s for s in c["sections"] if s["key"] == key), None)
+            if not sec:
+                raise ValueError("no confirmation section %r" % key)
+            rows = sec["rows"]
+            digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["tp"], x["pb"], x["med"]] for x in rows]).encode()).hexdigest()[:12]
+        if checked and not c["ready"]:
+            raise ValueError("tick off event %d's Quick OCR fixes first" % e)
+        if checked and not sec["can"]:
+            raise ValueError("confirm every swim in it first" if rows else "nothing to confirm")
+        with self.lock:
+            dg = self.state.setdefault("confirm", {}).setdefault("S%d:e%d" % (n, e), {}).setdefault("digest", {})
+            if checked:
+                dg[key] = digest
+                self.state["ticks"]["S%d:e%d:cf:%s" % (n, e, key)] = {"by": str(who or "someone")[:60], "at": time.time()}
+            else:
+                dg.pop(key, None)
+                self.state["ticks"].pop("S%d:e%d:cf:%s" % (n, e, key), None)
+            self.save()
+        title = "DQs" if key == "dq" else sec["title"]
+        self.log("Session %d event %d: %s %s by %s" % (n, e, title, "confirmed" if checked else "unconfirmed", who or "someone"))
+
     def tick(self, key, checked, who, not_swum=None):
         """Tick a checklist item. For an event (S1:e105) ticked complete while heats have no Gen7 race, not_swum is the
         list of those heats, confirmed as not swum: the event then counts as having all its races."""
         if not re.fullmatch(r"S\d{1,2}:[\w.:=() \-]{1,200}", key or ""):
             raise ValueError("bad checklist key")
+        m = re.fullmatch(r"S(\d{1,2}):e(\d{1,4}):cf:(\w+)", key)
+        if m:   # a confirmation section: only once every swim in it is confirmed
+            return self.confirm_section(int(m.group(1)), int(m.group(2)), m.group(3), checked, who)
         with self.lock:
             ns = self.state.setdefault("notSwum", {})
             if checked:
@@ -4358,6 +4682,8 @@ class Handler(BaseHTTPRequestHandler):
                 g.recheck(int(d.get("session") or 0), int(d.get("event") or 0), who)
             elif path == "/api/gala/fix":
                 g.set_fix(int(d.get("session") or 0), d.get("event"), d.get("heat"), d.get("lane"), d, who)
+            elif path == "/api/gala/confirm":
+                g.set_confirm(int(d.get("session") or 0), d.get("event"), d, who)
             elif path == "/api/gala/split":
                 n = int(d.get("session") or 0)
                 if d.get("name"):
@@ -4483,7 +4809,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "update": self.server.updater.start(self._who(q))})
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
-            if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck",
+            if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/confirm", "/api/gala/recheck",
                         "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update", "/api/gala/split"):
                 return self._gala_post(path, q)
             if path == "/api/settings/logo":   # the image itself as the body; empty body removes it
@@ -5262,6 +5588,30 @@ ul.qf>li.cleared>div>ul{opacity:.75}
 .gfiles li{flex-wrap:wrap}.gfiles li .gpages{flex-basis:100%}.gpages li{border-top:0;padding:1px 0}
 .qf-page summary{cursor:pointer}.qf-page{margin-top:8px}
 .cl-ev .sm.warn{color:#b45309;font-weight:600}
+.st.confirm{border-color:#b45309;color:#b45309}
+.cfrow>td{padding-top:2px}
+.cfrow>td>details>summary{font-weight:600;cursor:pointer}
+.cfwrap{display:flex;flex-direction:column;gap:8px;margin:6px 0 4px}
+.cfwrap.locked{opacity:.6}
+.cfsec{border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+.cfsec.done{border-left:3px solid var(--ans)}
+.cfh{display:flex;gap:10px;align-items:flex-start}
+.cfh input[type=checkbox]{width:20px;height:20px;margin-top:2px;accent-color:var(--accent);flex:none}
+.cfn{display:inline-block;min-width:1.6em;text-align:center;border-radius:10px;padding:0 7px;font-size:.85em;font-weight:600;background:var(--line);color:var(--fg)}
+.cfsec details{margin-top:4px}
+.cfsec details>summary{cursor:pointer}
+table.cfrows{border-collapse:collapse;margin-top:4px;font-size:.92em}
+table.cfrows th,table.cfrows td{padding:3px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+table.cfrows th{font-weight:600;color:var(--muted);white-space:nowrap}
+table.cfrows td.t{font-variant-numeric:tabular-nums;white-space:nowrap}
+table.cfrows td.t label{display:inline-flex;gap:4px;align-items:center;cursor:pointer}
+table.cfrows tr.done{opacity:.75}
+table.cfrows td.cfpick{background:rgba(37,99,235,.14);font-weight:700;outline:2px solid var(--accent);outline-offset:-2px}
+table.cfrows td.cfsug{outline:2px dashed var(--accent);outline-offset:-2px}
+table.cfrows td.cfact{min-width:220px}
+table.cfrows td.cfact input[name=reason]{max-width:16em}
+ul.cff{margin:0;padding-left:16px}
+
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
 .drop.over{background:var(--drop);border-color:var(--accent)}
@@ -5435,13 +5785,13 @@ $('#me').onchange=()=>{store('qa-me',$('#me').value);refresh()};
 let QP_OPEN={},galaBusy=false,GALA=null,galaSig='',GSESS=+(store('qa-gsess')||0);
 function galaHref(rel,dl){const u=url('/api/gala/file');u.searchParams.set('path',rel);if(dl)u.searchParams.set('dl','1');return u.toString()}
 async function galaPost(path,body){return api(path,Object.assign({by:me()||'someone'},body||{}))}
-const ST_TXT={waiting:'waiting',ready:'ready',asked:'with Claude',transcribed:'transcribed',computing:'working…',audited:'audited',changed:'new files'};
+const ST_TXT={waiting:'waiting',ready:'ready',asked:'with Claude',transcribed:'transcribed',computing:'working…',audited:'audited',changed:'new files',confirm:'to confirm'};
 const FOLDER_TXT={meet:['Meet Manager files','Entries, merge results and final exports (.zip / .hy3)'],gen7:['Gen7 race PDFs','One PDF per race'],
  scans:['Scans','Lane sheet packs (one per event), DQ slips, ETD programme'],ocr:['OCR (Claude)','JSON per lane sheet, DQ slip and ETD page; dq-codes.json'],
  reports:['Reports (Claude)','Event and session audits, merge results .hy3, final audit']};
 function curSession(){if(!GALA||!GALA.sessions.length)return null;
  return GALA.sessions.find(s=>s.n===GSESS)||GALA.sessions[GALA.sessions.length-1]}
-function galaEditing(){const a=document.activeElement;return !!(a&&a.closest&&a.closest('form.qffix'))||!!document.querySelector('form.qffix[data-dirty]')}
+function galaEditing(){const a=document.activeElement;return !!(a&&a.closest&&a.closest('form.qffix,form.cffix,form.cfdq'))||!!(a&&a.form&&a.form.matches('form.cffix'))||!!document.querySelector('form.qffix[data-dirty],form.cffix[data-dirty],form.cfdq[data-dirty]')}
 let CODES={},CODES_FOR=null;
 async function loadCodes(n){if(CODES_FOR===n)return;CODES_FOR=n;
  try{const j=await api('/api/gala/codes?session='+n);CODES=j;let dl=$('#dqcodes');if(!dl){dl=document.createElement('datalist');dl.id='dqcodes';document.body.appendChild(dl)}
@@ -5568,10 +5918,11 @@ function renderChecklist(){setTimeout(swAll,0);
  if(!s){box.innerHTML='<div class="card meta">No sessions yet. Drop the session\'s Meet Manager entries export on the Gala tab (or in the inbox folder) to start.</div>';return}
  const qfKey=(e,f)=>'S'+s.n+':e'+e.event+':qf:'+f.heat+'.'+f.lane;
  const keys=['entries','sessreport','lanesprint',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','resultspdf','final'].map(k=>'S'+s.n+':'+k)
-  .concat(s.events.flatMap(e=>(e.fixes||[]).map(f=>qfKey(e,f))));
+  .concat(s.events.flatMap(e=>(e.fixes||[]).map(f=>qfKey(e,f))))
+  .concat(s.events.flatMap(e=>e.confirm?[...(e.confirm.dq.count?['dq']:[]),...e.confirm.sections.filter(x=>x.count).map(x=>x.key)].map(k=>'S'+s.n+':e'+e.event+':cf:'+k):[]));
  const ticked=keys.filter(k=>GALA.ticks[k]).length,pct=Math.round(100*ticked/keys.length);
  const dq=s.scans.filter(x=>x.kind==='dq'),etd=s.scans.filter(x=>x.kind==='etd');
- const ev=s.events.length?`<div class="tblwrap"><table class="cl-ev"><tr><th></th><th>Event</th><th class="c">Printed</th><th>Lane sheets</th><th class="c">Gen7 heats</th><th class="c">OCR lanes</th><th>Audit</th><th>Merge</th><th class="c">Quick fixes</th><th>Status</th><th></th></tr>`
+ const ev=s.events.length?`<div class="tblwrap"><table class="cl-ev"><tr><th></th><th>Event</th><th class="c">Printed</th><th>Lane sheets</th><th class="c">Gen7 heats</th><th class="c">OCR lanes</th><th>Audit</th><th>Merge</th><th class="c">Quick OCR fixes</th><th>Status</th><th></th></tr>`
   +s.events.map(e=>{const key='S'+s.n+':e'+e.event,t=GALA.ticks[key];
    const g7=e.heats?`${e.gen7.length}/${e.heats}`:(e.gen7.length||'–');
    const fx=e.fixes||null,fxDone=fx?fx.filter(f=>GALA.ticks[qfKey(e,f)]).length:0;
@@ -5579,7 +5930,7 @@ function renderChecklist(){setTimeout(swAll,0);
    const lastFix=Math.max(0,...Object.values(e.handFixes||{}).map(h=>h.at||0)),needRegen=fx&&fx.length&&fxDone===fx.length&&lastFix>(e.mergeAt||0);
    const regen=`<div><button type="button" class="primary regen" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'The portal writes the merge results, audit and quick fixes again from what is already transcribed, with the fixes made here and every DQ slip read and coded so far (no scans are read, no Claude)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
    const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="No entries export">waiting</span>`)+regen;
-   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${needRegen?`<div class="qfdone">All quick fixes for event ${e.event} are done, and fixes were made since its merge results were written. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details data-qfd="S${s.n}:e${e.event}"${(QF_OPEN['S'+s.n+':e'+e.event]??(fxDone<fx.length))?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} ticked${fx.some(x=>x.cleared)?', '+fx.filter(x=>x.cleared).length+' settled by the re-check':''})${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
+   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${needRegen?`<div class="qfdone">All quick fixes for event ${e.event} are done, and fixes were made since its merge results were written. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details data-qfd="S${s.n}:e${e.event}"${(QF_OPEN['S'+s.n+':e'+e.event]??(fxDone<fx.length))?' open':''}><summary>Quick OCR fixes for event ${e.event} (${fxDone} of ${fx.length} ticked${fx.some(x=>x.cleared)?', '+fx.filter(x=>x.cleared).length+' settled by the re-check':''})${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
      <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
       return `<li class="${t?'done':''}${f.cleared?' cleared':''}">${tickBox(k,'Lane '+f.lane+' heat '+f.heat)}<div><b>Lane ${esc(f.lane)} · Heat ${esc(f.heat)}</b>${f.cleared?` <span class="st audited" title="${esc('No longer flagged since '+agoShort(f.clearedAt))}">settled by the re-check</span>`:''} <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
@@ -5608,7 +5959,7 @@ function renderChecklist(){setTimeout(swAll,0);
     <td>${e.report?link(s,'reports',e.report):'–'}</td>
     <td>${mergeCell}</td><td class="c">${fxCell}</td>
     <td><span class="st ${e.status}">${esc(ST_TXT[e.status]||e.status)}</span>${e.computed&&!e.computed.ok&&e.status!=='computing'?`<div class="sm gwarn" title="${esc(e.computed.msg||'')}">portal: ${esc((e.computed.msg||'failed').slice(0,90))}</div>`:''}</td>
-    <td><button type="button" data-ask="${key}" ${e.packs.length?'':'disabled title="No lane sheet pack yet"'}>${e.asked?'Ask again':'Ask Claude'}</button></td></tr>${fxRows}`}).join('')+'</table></div>'
+    <td><button type="button" data-ask="${key}" ${e.packs.length?'':'disabled title="No lane sheet pack yet"'}>${e.asked?'Ask again':'Ask Claude'}</button></td></tr>${fxRows}${cfRows(s,e)}`}).join('')+'</table></div>'
   :'<div class="meta" style="padding:8px 0">No events yet. They come from the entries export, or appear as lane sheet packs and Gen7 races arrive.</div>';
  const scanFound=list=>list.map(x=>link(s,'scans',x.name)+` <span class="meta">(${x.done}/${x.pages??'?'} pages read)</span>`);
  box.innerHTML=`<div class="card clhead"><div class="gh-top"><div><h2>Session ${s.n} checklist</h2>
@@ -5624,7 +5975,7 @@ function renderChecklist(){setTimeout(swAll,0);
   ${clRow(s,'S'+s.n+':lanesprint','Printed lane sheets (Meet Manager)','The lane sheet PDF Meet Manager printed for the session (not the scan). Claude copies the names, ages, teams and seed times from it, which is much more accurate than reading them off the scans. Bring it in before the first event.',
     s.lanePrints.map(p=>`<a href="${esc(galaHref(p.path))}" target="_blank" rel="noopener">${esc(p.name)}</a>`+` <span class="meta">(${p.sheets} sheet${p.sheets===1?'':'s'}, event${p.events.length===1?'':'s'} ${esc(evRange(p.events))})</span>`),'S'+s.n+'/meet')}
   <div class="cl-sec">Each event, as it is swum</div>
-  <div class="meta" style="margin-bottom:4px">An event is <b>ready</b> when its lane sheet pack and every heat's Gen7 race PDF are in${GALA.auto?'; Claude is then asked to transcribe and audit it':''}. Claude then writes the event's <b>merge results</b> (<code>.hy3</code>, to import into Meet Manager) and its <b>quick fixes</b>: the swims to check by hand, listed under the event to tick off as they're fixed. Drop a lane sheet pack on an event to add it.</div>
+  <div class="meta" style="margin-bottom:4px">An event is <b>ready</b> when its lane sheet pack and every heat's Gen7 race PDF are in${GALA.auto?'; Claude is then asked to transcribe and audit it':''}. The portal then lists the event's <b>Quick OCR fixes</b> (misread watches, swimmers written in, watches more than 0.40 s from the push buttons) to fix and tick off, then its <b>confirmations</b>: the DQs and every swim's time, section by section. Once all are confirmed it writes the event's <b>merge results</b> (<code>.hy3</code>, to import into Meet Manager) and audit. Drop a lane sheet pack on an event to add it.</div>
   ${ev}
   <div class="cl-sec">During and after the session</div>
   ${clRow(s,'S'+s.n+':dq','DQ slips','The referees\' DQ slips, scanned (name the file with "DQ"). Claude reads each batch as it arrives.',scanFound(dq),'S'+s.n+'/scans')}
@@ -5693,8 +6044,10 @@ setInterval(()=>{if(!document.hidden&&(view==='gala'||view==='checklist'||view==
 function offerRegen(key,justDone){
  const m=/^S(\d+):e(\d+):qf:/.exec(key);if(!m)return;const n=+m[1],ev=+m[2];
  const s=GALA&&GALA.sessions.find(x=>x.n===n),e=s&&s.events.find(x=>x.event===ev);if(!e||!e.fixes||!e.canMerge)return;
- const left=e.fixes.filter(f=>{const k='S'+n+':e'+ev+':qf:'+f.heat+'.'+f.lane;return k!==justDone&&!GALA.ticks[k]});
+ const left=e.fixes.filter(f=>{const k='S'+n+':e'+ev+':qf:'+f.heat+'.'+f.lane;return k!==justDone&&!GALA.ticks[k]&&!f.cleared});
  if(left.length)return;
+ if(e.confirm&&!e.confirm.complete){galaNotice('Quick OCR fixes for event '+ev+' are done: now confirm its DQs and times, under the event. Its merge results and audit are written once all are confirmed.');
+  if(Object.values(e.handFixes||{}).some(h=>(h.at||0)>(e.mergeAt||0)))galaPost('/api/gala/recheck',{session:n,event:ev}).catch(()=>{});return}
  galaDialog({title:'All quick fixes for event '+ev+' are done',
   text:'Regenerate the event\'s merge results now, with the fixes made in the portal and every DQ slip read so far? No scans are read again.',
   ok:'Regenerate the merge results',cancel:'Not now'}).then(yes=>{if(!yes)return;
@@ -5906,6 +6259,85 @@ async function rsRestore(name,hasQ){const s=(GALA&&GALA.summary)||{};
 
 // remember a quick fix page opened or closed by hand (until the item is ticked or unticked)
 document.addEventListener('toggle',e=>{const d=e.target;if(d&&d.matches&&d.matches('details[data-qpd]'))QP_OPEN[d.dataset.qpd]={open:d.open,ticked:d.dataset.ticked==='1'}},true);
+// ---- confirmations: after an event's Quick OCR fixes are ticked off, its DQs and times are confirmed, section by
+// section; the merge results and audit are written once all are. Each swim's values: TP, PB, SW median, every SW time.
+const CF_OPEN={},PICK_TXT={tp:'TP',pb:'PB',sw:'SW median'};
+document.addEventListener('toggle',ev=>{const d=ev.target;if(d.matches&&d.matches('details[data-cfd]'))CF_OPEN[d.dataset.cfd]=d.open},true);
+function cfOpen(key,dflt){return CF_OPEN[key]??dflt}
+function cfSwCells(r){const by={};r.sw.forEach(w=>by[w[0]]=w);
+ return [1,2,3].map(c=>{const w=by[c];return `<td class="t">${w?esc(w[1])+(w[3]&&w[3]!=='HIGH'?` <span class="sm gwarn" title="${esc(w[3].toLowerCase())} confidence, written “${esc(w[2])}”">?</span>`:''):'<span class="no">–</span>'}</td>`}).join('')}
+function cfRow(s,e,sec,r){
+ const k=s.n+'|'+e.event+'|'+r.h+'|'+r.l,fid='cf-'+s.n+'-'+e.event+'-'+r.h+'-'+r.l,vals={tp:r.tp,pb:r.pb,sw:r.med},opts=r.opts||[];
+ const picked=opts.length?(r.pick&&!r.stale?r.pick:null):sec.show,sel=picked||r.default;
+ const cell=o=>{const v=vals[o];if(!v)return '<td class="t"><span class="no">–</span></td>';
+  const cls=o===picked?'cfpick':(!picked&&o===r.default&&opts.length?'cfsug':'');
+  return opts.includes(o)?`<td class="t ${cls}"><label><input type="radio" form="${fid}" name="pick" value="${o}"${o===sel?' checked':''}${r.pick&&!r.stale&&!r.auto?' disabled':''}> ${esc(v)}</label></td>`:`<td class="t ${cls}">${esc(v)}</td>`};
+ const lead=`<td>${esc(r.l)}</td><td>${esc(r.h)}</td><td>${esc(r.name||'–')}${r.dq?' <span class="sm gwarn">DQ</span>':''}${r.doubt?' <span class="sm" title="The audit kept TP: the watches don\'t agree with each other">in doubt</span>':''}</td>`;
+ const times=cell('tp')+cell('pb')+cell('sw')+cfSwCells(r);
+ if(!opts.length)return `<tr>${lead}${times}</tr>`;
+ const shownV=vals[picked||sel]||'',audit=r.final&&hund(r.final)!==hund(shownV)?`<div class="sm">audit: ${esc(r.final)}</div>`:'';
+ const act=r.auto?`<span class="sm meta">${esc(PICK_TXT[r.default])} (default)</span> <span data-cfother hidden><input name="reason" value="" placeholder="reason (not ${esc(PICK_TXT[r.default])})" size="18"> <button type="submit" class="primary">Confirm</button></span><div class="sm" data-cfmsg></div>`
+  :r.pick&&!r.stale?`<span class="ok">✓ ${esc(PICK_TXT[r.pick])}</span>${r.reason?` <span class="sm">· ${esc(r.reason)}</span>`:''}<div class="sm">${esc(r.by||'')} · ${esc(agoShort(r.at))} <button type="button" class="sm" data-cfundo>Change</button></div>`
+  :`<input name="reason" value="${esc(r.reason||'')}" placeholder="reason (not ${esc(PICK_TXT[r.default])})" size="18"${sel===r.default?' hidden':''}> <button type="submit" class="primary">Confirm</button>${r.stale?'<div class="sm gwarn">the times changed since it was confirmed: confirm again</div>':''}<div class="sm" data-cfmsg></div>`;
+ return `<tr class="${r.pick&&!r.stale?'done':''}">${lead}${times}<td class="cfact"><form id="${fid}" class="cffix" data-cf="${esc(k)}" data-default="${esc(r.default)}" autocomplete="off">${audit}${act}</form></td></tr>`}
+function cfHead(opts){return `<tr><th>Lane</th><th>Heat</th><th>Swimmer</th><th>TP</th><th>PB</th><th>SW median</th><th>SW1</th><th>SW2</th><th>SW3</th>${opts?'<th>Confirm</th>':''}</tr>`}
+function cfSection(s,e,c,sec){
+ const key='S'+s.n+':e'+e.event+':cf:'+sec.key,t=GALA.ticks[key],lock=!c.ready;
+ const state=!sec.count?'<span class="meta">nothing to confirm</span>':sec.done?`<span class="ok">confirmed ✓</span> <span class="sm">${esc(t?t.by+' · '+agoShort(t.at):'')}</span>`
+  :sec.changed?'<span class="gwarn">changed since it was ticked: check it and tick again</span>':sec.options.length?`<span class="${sec.confirmed===sec.count?'ok':'gwarn'}">${sec.confirmed} of ${sec.count} swims confirmed</span>`:'';
+ const box=sec.count?`<input type="checkbox" data-tick="${esc(key)}"${t?' checked':''}${lock||(!sec.can&&!t)?' disabled':''} aria-label="Confirm ${esc(sec.title)}" title="${esc(lock?'Tick off the Quick OCR fixes first':!sec.can?'Confirm every swim in it first':t?'Ticked by '+t.by:'Tick when checked')}">`:'<input type="checkbox" disabled>';
+ const shown=sec.show&&sec.options.length?` · <b>${esc(PICK_TXT[sec.show])}</b> is selected for every swim; pick another for a swim, with a reason`:sec.show?` · <b>${esc(PICK_TXT[sec.show])}</b> highlighted`:sec.options.length?` · pick ${sec.options.map(o=>PICK_TXT[o]).join(', ')}; a reason for anything but ${esc(PICK_TXT[sec.options[0]])}`:'';
+ const body=sec.count?`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&sec.options.length>0&&!sec.show&&!sec.done)?' open':''}><summary class="sm">${sec.count} swim${sec.count===1?'':'s'}, by lane</summary>
+  <div class="tblwrap"><table class="cfrows">${cfHead(sec.options.length)}${sec.rows.map(r=>cfRow(s,e,sec,r)).join('')}</table></div></details>`:'';
+ return `<div class="cfsec${sec.done&&sec.count?' done':''}"><div class="cfh">${box}<div><b>${esc(sec.title)}</b> <span class="cfn">${sec.count}</span> ${state}<div class="sm meta">${esc(sec.what)}${shown}</div></div></div>${body}</div>`}
+function cfDqs(s,e,c){
+ const d=c.dq,key='S'+s.n+':e'+e.event+':cf:dq',t=GALA.ticks[key],lock=!c.ready;
+ if(!d.known)return '';
+ const state=!d.count?'<span class="meta">no DQs</span>':d.done?`<span class="ok">confirmed ✓</span> <span class="sm">${esc(t?t.by+' · '+agoShort(t.at):'')}</span>`
+  :d.changed?'<span class="gwarn">changed since it was ticked: check it and tick again</span>':`<span class="${d.decided===d.count?'ok':'gwarn'}">${d.decided} of ${d.count} decided</span>`;
+ const box=d.count?`<input type="checkbox" data-tick="${esc(key)}"${t?' checked':''}${lock||(!d.can&&!t)?' disabled':''} aria-label="Confirm the DQs" title="${esc(lock?'Tick off the Quick OCR fixes first':!d.can?'Confirm or withdraw every DQ first':'Tick when checked')}">`:'<input type="checkbox" disabled>';
+ const rows=d.rows.map(r=>{const k=s.n+'|'+e.event+'|'+r.h+'|'+r.l,code=r.newCode||r.code;
+  const scan=r.scan?(()=>{const rel='sessions/S'+s.n+'/scans/'+r.scan;return ` <a class="sm" href="${esc(galaHref(rel))}#page=${esc(r.page)}" target="_blank" rel="noopener">slip, page ${esc(r.page)}</a>`})():'';
+  const dec=r.action?`<span class="${r.action==='confirm'?'ok':'gwarn'}">${r.action==='confirm'?'✓ DQ '+esc(r.newCode||r.code)+' confirmed':'DQ withdrawn'}</span>${r.reason?` <span class="sm">· ${esc(r.reason)}</span>`:''}<div class="sm">${esc(r.by||'')} · ${esc(agoShort(r.at))} <button type="button" class="sm" data-cfdq="undo">Change</button></div>`
+   :`<input name="code" value="${esc(code)}" list="dqcodes" size="6" aria-label="DQ code"> <button type="button" class="primary" data-cfdq="confirm">Confirm DQ</button> <button type="button" data-cfdq="withdraw">Withdraw</button><div><input name="reason" value="${esc(r.reason||'')}" placeholder="reason (needed to withdraw)" size="26"></div>${r.stale?'<div class="sm gwarn">the slip\'s code changed since it was decided: decide again</div>':''}<div class="sm" data-cfmsg></div>`;
+  return `<tr class="${r.action?'done':''}"><td>${esc(r.h)}</td><td>${esc(r.l)}</td><td>${esc(r.name||'–')}</td>
+   <td>${esc(r.infraction||'–')}${r.back?`<div class="sm">back: ${esc(r.back)}</div>`:''}${r.source==='sheet'?'<div class="sm gwarn">marked on the lane sheet; no slip</div>':''}${scan}</td>
+   <td class="t"><b>${esc(r.code||'–')}</b>${r.codeText?`<div class="sm">${esc(r.codeText)}</div>`:''}${r.codeNote?`<div class="sm gwarn">${esc(r.codeNote)}</div>`:''}</td>
+   <td>${r.findings.length?'<ul class="sm cff">'+r.findings.map(f=>`<li>${esc(f)}</li>`).join('')+'</ul>':''}</td>
+   <td><form class="cfdq" data-cf="${esc(k)}" autocomplete="off">${dec}</form></td></tr>`}).join('');
+ const body=d.count?`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&!d.done)?' open':''}><summary class="sm">${d.count} DQ${d.count===1?'':'s'}, by heat then lane</summary>
+  <div class="tblwrap"><table class="cfrows"><tr><th>Heat</th><th>Lane</th><th>Swimmer</th><th>Rule</th><th>Code</th><th>Checks</th><th>Confirm or withdraw</th></tr>${rows}</table></div></details>`:'';
+ return `<div class="cfsec${d.done&&d.count?' done':''}"><div class="cfh">${box}<div><b>DQs</b> <span class="cfn">${d.count}</span> ${state}<div class="sm meta">Each DQ with its rule and code (the code can be changed): confirm it, or withdraw it with a reason.</div></div></div>${body}</div>`}
+function cfRows(s,e){
+ const c=e.confirm;if(!c)return '';
+ const secs=c.sections.filter(x=>x.key!=='nomatch'||x.count),need=secs.filter(x=>x.count).length+(c.dq.count?1:0);
+ const done=secs.filter(x=>x.count&&x.done).length+(c.dq.count&&c.dq.done?1:0),key='S'+s.n+':e'+e.event+':cf';
+ const head=c.complete?`<span class="ok">all confirmed ✓</span>${e.status==='audited'?' · the merge results and audit are written':' · the merge results and audit are being written'}`
+  :!c.ready?'<span class="gwarn">tick off the Quick OCR fixes first</span>':`<span class="gwarn">${done} of ${need} confirmed</span> · the merge results and audit are written once all are`;
+ return `<tr class="qfrow cfrow"><td></td><td colspan="10"><details data-cfd="${esc(key)}"${cfOpen(key,c.ready&&!c.complete)?' open':''}><summary>Confirmations for event ${e.event} · ${head}</summary>
+  ${c.watchrule?'<div class="sm meta">This session\'s results were published with the rule before gala-ocr 1.6.13: where TP and PB agree but the SW median doesn\'t, the SW median was used. Those swims are set to SW median (“Glitch - used SW Median as it was better”).</div>':''}
+  <div class="cfwrap${c.ready?'':' locked'}">${cfDqs(s,e,c)}${secs.map(x=>cfSection(s,e,c,x)).join('')}</div></details></td></tr>`}
+function cfForm(el){const f=el&&(el.form||(el.closest&&el.closest('form')));return f&&f.matches('form.cffix,form.cfdq')?f:null}
+document.addEventListener('change',ev=>{const fm=cfForm(ev.target);if(!fm||!fm.matches('.cffix'))return;fm.dataset.dirty='1';
+ if(ev.target.name==='pick'){const o=fm.querySelector('[data-cfother]');if(o)o.hidden=ev.target.value===fm.dataset.default;
+  const r=fm.querySelector('input[name=reason]');if(r){if(!o)r.hidden=ev.target.value===fm.dataset.default;if(ev.target.value!==fm.dataset.default)r.focus()}
+  const tr=ev.target.closest('tr');tr.querySelectorAll('td.cfpick,td.cfsug').forEach(td=>td.classList.remove('cfpick','cfsug'));ev.target.closest('td').classList.add('cfsug')}});
+document.addEventListener('input',ev=>{const fm=cfForm(ev.target);if(fm)fm.dataset.dirty='1'});
+function cfSend(fm,body){const [n,event,heat,lane]=fm.dataset.cf.split('|'),msg=fm.querySelector('[data-cfmsg]');
+ return galaPost('/api/gala/confirm',Object.assign({session:+n,event:+event,heat:+heat,lane:+lane},body)).then(()=>{delete fm.dataset.dirty;document.activeElement&&document.activeElement.blur();galaSig='';loadGala()})
+  .catch(err=>{if(msg)msg.textContent=err.message;else galaNotice(err.message,'error')})}
+document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.cffix');if(!fm)return;ev.preventDefault();
+ const pick=([...fm.elements].find(x=>x.name==='pick'&&x.checked)||{}).value||fm.dataset.default,reason=((fm.querySelector('input[name=reason]')||{}).value||'').trim(),msg=fm.querySelector('[data-cfmsg]');
+ if(pick!==fm.dataset.default&&!reason){msg.textContent='Give a reason for '+PICK_TXT[pick]+' (not '+PICK_TXT[fm.dataset.default]+')';fm.querySelector('input[name=reason]').focus();return}
+ cfSend(fm,{kind:'line',pick,reason})});
+document.addEventListener('click',ev=>{
+ const u=ev.target.closest('[data-cfundo]');if(u){cfSend(u.closest('form.cffix'),{kind:'line',pick:''});return}
+ const b=ev.target.closest('[data-cfdq]');if(!b)return;const fm=b.closest('form.cfdq'),act=b.dataset.cfdq,msg=fm.querySelector('[data-cfmsg]');
+ if(act==='undo'){cfSend(fm,{kind:'dq',action:''});return}
+ const code=((fm.querySelector('input[name=code]')||{}).value||'').trim(),reason=((fm.querySelector('input[name=reason]')||{}).value||'').trim();
+ if(act==='confirm'&&!code){msg.textContent='A DQ needs its code';return}
+ if(act==='withdraw'&&!reason){msg.textContent='Give the reason the DQ is withdrawn';fm.querySelector('input[name=reason]').focus();return}
+ cfSend(fm,{kind:'dq',action:act,code,reason})});
 
 // ---- views
 if(location.hash==='#settings')location.hash='#users';

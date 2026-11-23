@@ -145,6 +145,52 @@ def _same_file(a, b):
         return False
 
 
+
+# Confirmations: each swim with a time, by how its TP, PB and SW median agree (within CONFIRM_TOL hundredths).
+# (key, title, what it holds, options to pick from (the first needs no reason), the value shown when there's no choice)
+CONFIRM_TOL = 30
+CONFIRM_SECTIONS = [
+    ("allmatch", "All Match", "TP, PB and the SW median agree within 0.30 s: TP", ["tp", "sw", "pb"], "tp"),
+    ("nopb", "All Match NO PB", "No PB; TP and the SW median agree within 0.30 s: TP", ["tp", "sw"], "tp"),
+    ("notp", "All Match NO TP", "No TP; PB and the SW median agree within 0.30 s: the SW median", [], "sw"),
+    ("notppb", "SW Median - No TP or BP", "No TP and no PB: the SW median", [], "sw"),
+    ("overlap", "Overlap", "Two of the three pairs (TP-PB, TP-SW median, PB-SW median) agree within 0.30 s, the third "
+                "doesn't", ["tp", "sw", "pb"], None),
+    ("badtp", "Bad TP - Rest Match", "PB and the SW median agree within 0.30 s, TP doesn't", ["sw", "tp", "pb"], None),
+    ("badsw", "Bad SW Median - TP/BP Match", "TP and PB agree within 0.30 s, the SW median doesn't", ["tp", "sw", "pb"], None),
+    ("badpb", "Bad PB - TP/SW Median Match", "TP and the SW median agree within 0.30 s, PB doesn't", ["tp", "sw", "pb"], None),
+    ("notpmis", "NO TP - SW Median - BP Mismatch", "No TP; PB and the SW median don't agree within 0.30 s", ["sw", "pb"], None),
+    ("nomatch", "No Match", "No two of TP, PB and the SW median agree within 0.30 s", ["sw", "tp", "pb"], None),
+]
+PICK_NAME = {"tp": "TP", "pb": "PB", "sw": "SW median"}
+# Sections whose swims start confirmed with the first option; another pick (with a reason) can be made per swim.
+AUTO_CONFIRM = {"allmatch", "nopb"}
+
+
+def _hund(t):
+    """'1:05.32' or '32.10' -> hundredths (None if it isn't a time)."""
+    m = re.fullmatch(r"\s*(?:(\d{1,2}):)?(\d{1,2})\.(\d{2})\d*\s*", str(t or ""))
+    return (int(m.group(1) or 0) * 60 + int(m.group(2))) * 100 + int(m.group(3)) if m else None
+
+
+def confirm_category(tp, pb, med, tol=CONFIRM_TOL):
+    """The confirmation section of a swim from its TP, PB and SW median (hundredths or None)."""
+    ok = lambda a, b: a is not None and b is not None and abs(a - b) <= tol  # noqa: E731
+    if tp is not None and pb is not None and med is not None:
+        pairs = ok(tp, pb) + ok(tp, med) + ok(pb, med)
+        return ("allmatch" if pairs == 3 else "overlap" if pairs == 2 else "badsw" if ok(tp, pb)
+                else "badtp" if ok(pb, med) else "badpb" if ok(tp, med) else "nomatch")
+    if tp is not None and med is not None:
+        return "nopb" if ok(tp, med) else "nomatch"
+    if pb is not None and med is not None:
+        return "notp" if ok(pb, med) else "notpmis"
+    if med is not None:
+        return "notppb"
+    if tp is not None or pb is not None:   # TP and/or PB with no SW times
+        return "nomatch"
+    return None
+
+
 class Gala:
     def __init__(self, root, inbox, store):
         self.root = os.path.abspath(root)
@@ -1274,6 +1320,9 @@ class Gala:
                 status = "transcribed"
             else:
                 status = "waiting"
+            confirm = self.confirmations(n, e, fixes or []) if read else None
+            if confirm and not confirm["complete"] and status in ("audited", "changed", "transcribed"):
+                status = "confirm"
             events.append({"event": e, "desc": desc.get(e, ""), "heats": heats, "gen7": have,
                            "gen7Missing": [h for h in range(1, heats + 1) if h not in have and h not in not_swum],
                            "notSwum": [] if hand_t else not_swum, "notSwumBy": ns.get("by") if not_swum and not hand_t else None,
@@ -1285,7 +1334,7 @@ class Gala:
                            "status": status, "asked": a, "read": read, "packSig": pack_sig, "run": job or None,
                            "computed": self.state.get("computed", {}).get("S%d:e%d:run" % (n, e)), "merge": merge_file, "mergeAt": merge_f["mtime"] if merge_f else None,
                            "canMerge": can_merge,
-                           "seeded": seeded, "fixes": fixes, "recheck": self.rechecks.get((n, e)), "dqSlips": len(slips_done.get(e, [])),
+                           "seeded": seeded, "fixes": fixes, "confirm": confirm, "recheck": self.rechecks.get((n, e)), "dqSlips": len(slips_done.get(e, [])),
                            "fixesFile": qf_file["name"][:-5] + ".html" if qf_file else None,
                            "handFixes": {k.split("-", 1)[1].replace("-", "."): v for k, v in hand.items()
                                          if k.startswith("%d-" % e) and k.count("-") == 2},
@@ -1593,6 +1642,10 @@ class Gala:
                       for m in [re.fullmatch(r"S%d:e(\d+):handtimes" % n, k)] if m)
         if hand:   # events timed by hand only (gala-ocr 1.6.10+)
             out += ["--hand-times", ",".join(map(str, hand))]
+        if "S%d:watchrule" % n in self.state["ticks"]:
+            # A session whose results were published with the rule before gala-ocr 1.6.13: the SW median overrides
+            # TP when TP and PB agree with each other but not with the watches. Set by ticking S<n>:watchrule.
+            out += ["--watches-over-pad"]
         return out
 
     @staticmethod
@@ -1684,7 +1737,7 @@ class Gala:
                                                            if k in {f["name"] for f in slips})]] \
             + [[k, [[f["name"], f["mtime"]] for f in [self.meet_wide(n, k)[1]] if f]] for k in ("entries", "results")] \
             + [["codes", [[f["name"], f["mtime"]] for f in meet["codes"][-1:]]]] \
-            + [["notSwum", ev.get("notSwum") or []]]
+            + [["notSwum", ev.get("notSwum") or []]] + [["confirmed", self.confirm_digest(n, e)]]
         return {"complete": not missing, "missing": missing, "read": read, "uncoded": uncoded, "ev": ev,
                 "sig": hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]}
 
@@ -1726,15 +1779,19 @@ class Gala:
             ev_rx = re.compile(r"(?i)\bevent\s*0*%d\b" % e)
             prev = max((f for f in _ls(rep) if f["name"].lower().endswith(".hy3") and "merge results" in f["name"].lower()
                         and ev_rx.search(f["name"])), key=lambda f: f["mtime"], default=None)
+            cf = self.confirmations(n, e)
+            final = bool(cf and cf["complete"])   # confirmed: the merge results and audit are written
+            out_dir = rep if final else tmp
             if ev["canMerge"] and merge:
                 ent = self._entries_hy3(n, tmp)
                 tpl = "-"   # entries export only: an empty merge results export is no longer used
-                mfile = os.path.join(rep, "Event %02d merge results %s.hy3" % (e, time.strftime("%Y-%m-%d_%H%M")))
+                mfile = os.path.join(out_dir, "Event %02d merge results %s.hy3" % (e, time.strftime("%Y-%m-%d_%H%M")))
                 ok, out = self._run_script([merge, ocr, gen7, ent, tpl, mfile, "--events", str(e)] + self._script_opts(n))
                 if not ok:
                     return False, "event %d merge results: %s" % (e, out.splitlines()[-1] if out else "failed")
-                notes.append("merge results %s" % os.path.basename(mfile))
-                if prev and prev["name"] != os.path.basename(mfile):
+                if final:
+                    notes.append("merge results %s" % os.path.basename(mfile))
+                if final and prev and prev["name"] != os.path.basename(mfile):
                     changes = merge_changes(os.path.join(rep, prev["name"]), mfile)
                     if changes:
                         rpt = os.path.join(rep, "Event %02d merge changes %s.txt" % (e, time.strftime("%Y-%m-%d_%H%M")))
@@ -1747,15 +1804,19 @@ class Gala:
                         notes.append("no results changed from the previous merge results")
             else:
                 notes.append("no merge results yet (needs the entries export)")
-            cmd = [audit, ocr, gen7, os.path.join(rep, "Event %02d audit.html" % e), "--events", str(e), "--scans", scans,
+            cmd = [audit, ocr, gen7, os.path.join(out_dir, "Event %02d audit.html" % e), "--events", str(e),
+                   "--scans", scans if final else tmp,
                    "--quick-fixes", os.path.join(rep, "Event %02d quick fixes.html" % e),
-                   "--times", os.path.join(rep, "Event %02d times.json" % e)] + (["--merge", mfile] if mfile else [])
+                   "--times", os.path.join(rep, "Event %02d times.json" % e),
+                   "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes"] + (["--merge", mfile] if mfile else [])
             ok, out = self._run_script(cmd + self._script_opts(n))
             if not ok:
                 return False, "event %d audit: %s" % (e, out.splitlines()[-1] if out else "failed")
             m = re.search(r"(\d+) swims? in Quick Fix", out)
             qf = int(m.group(1)) if m else None
-            notes.append("%s quick fix%s" % (qf, "" if qf == 1 else "es") if qf is not None else "quick fixes written")
+            notes.append("%s quick OCR fix%s" % (qf, "" if qf == 1 else "es") if qf is not None else "quick fixes written")
+            if not final:
+                notes.append("the merge results and audit are written once its times and DQs are confirmed")
             self.rechecks.pop((n, e), None)
             self.ask_race(n, e)
             self.compute_session_report(n)
@@ -2346,14 +2407,11 @@ class Gala:
         tmp = tempfile.mkdtemp(prefix="gala-recheck-")
         cmd = [sys.executable, "-I", script, self.sdir(n, "ocr"), self.sdir(n, "gen7"), os.path.join(tmp, "audit.html"),
                "--events", str(e), "--scans", tmp, "--quick-fixes", qf,
-               "--times", os.path.join(rep, "Event %02d times.json" % e)]
+               "--times", os.path.join(rep, "Event %02d times.json" % e),
+               "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes"]
         if ev.get("merge"):
             cmd += ["--merge", os.path.join(rep, ev["merge"])]
-        if os.path.exists(self.fixes_file(n)):
-            cmd += ["--fixes", self.fixes_file(n)]
-        own = self.meet_files(n)["codes"]
-        if own:
-            cmd += ["--codes", os.path.join(self.sdir(n, "meet"), own[-1]["name"])]
+        cmd += self._script_opts(n)
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             ok = r.returncode == 0
@@ -2736,11 +2794,277 @@ class Gala:
                          stdin=subprocess.DEVNULL, start_new_session=True)
         self.log("Update started by %s; the portal restarts in a minute" % who)
 
+    # ---------------------------------------------------------------- confirmations (after the Quick OCR Fixes)
+    # Once an event's Quick OCR Fixes are all ticked, its DQs and its times are confirmed before its merge results and
+    # audit are written. Every swim with a time falls in one of CONFIRM_SECTIONS by how TP, PB and the SW median agree
+    # (within CONFIRM_TOL). In a section with options each swim is confirmed on its own: the value picked is its final
+    # time (a reason is needed for any but the first option); a pick that differs from the audit's final time is put in
+    # fixes.json as the swim's time. A section is ticked once all its swims are confirmed. DQs are confirmed (the code
+    # can be changed) or withdrawn with a reason. Kept in state.json: confirm["S<n>:e<e>"] = {"lines": {"H.L": {pick,
+    # reason, value, snap, by, at}}, "dq": {"H.L": {action, code, reason, orig, by, at}}, "digest": {section: digest}};
+    # the section ticks are ordinary checklist ticks, S<n>:e<e>:cf:<section>.
+    def _confirm_rows(self, n, e):
+        rep = self.sdir(n, "reports")
+        tf, df = os.path.join(rep, "Event %02d times.json" % e), os.path.join(rep, "Event %02d dqs.json" % e)
+
+        def lst(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+                return [x for x in d if isinstance(x, dict)] if isinstance(d, list) else []
+            except (OSError, ValueError):
+                return []
+        times = self._cached("cf-times", tf, lst) if os.path.exists(tf) else None
+        dqs = self._cached("cf-dqs", df, lst) if os.path.exists(df) else None
+        return times, dqs
+
+    def confirmations(self, n, e, qf=None):
+        """Event e's confirmations for the Checklist: {ready, complete, sections: [...], dq: {...}}, or None before the
+        portal has worked the event out (no times file yet). qf: the event's quick fixes (qf_history) if known."""
+        times, dqs = self._confirm_rows(n, e)
+        if times is None:
+            return None
+        if qf is None:
+            qp = os.path.join(self.sdir(n, "reports"), "Event %02d quick fixes.json" % e)
+            qf = self.qf_history(n, e, self._cached("qf", qp, _read_fixes) or []) if os.path.exists(qp) else []
+        ticks = self.state["ticks"]
+        ready = all(f.get("cleared") or ("S%d:e%d:qf:%s.%s" % (n, e, f["heat"], f["lane"])) in ticks for f in qf)
+        st = self.state.get("confirm", {}).get("S%d:e%d" % (n, e), {})
+        lines, decided, digests = st.get("lines", {}), st.get("dq", {}), st.get("digest", {})
+        watch = "S%d:watchrule" % n in ticks
+        by_sec = {k: [] for k, *_ in CONFIRM_SECTIONS}
+        for r in times:
+            if r.get("ns"):
+                continue
+            tp, pb, med = _hund(r.get("tp")), _hund(r.get("pb")), _hund(r.get("median"))
+            cat = confirm_category(tp, pb, med)
+            if not cat:
+                continue
+            k = "%s.%s" % (r.get("heat"), r.get("lane"))
+            # the SW median to hundredths, as the final time takes it (an even count's thousandths dropped)
+            vals = {"tp": r.get("tp") or "", "pb": r.get("pb") or "",
+                    "sw": re.sub(r"(\.\d\d)\d+$", r"\1", str(r.get("median") or ""))}
+            sec = next(x for x in CONFIRM_SECTIONS if x[0] == cat)
+            opts = [o for o in sec[3] if vals[o]]
+            default = opts[0] if opts else sec[4]
+            snap = "%s|%s|%s|%s" % (vals["tp"], vals["pb"], vals["sw"], cat)
+            ln = lines.get(k) or {}
+            row = {"h": r.get("heat"), "l": r.get("lane"), "name": r.get("name") or "", "tp": vals["tp"],
+                   "pb": vals["pb"], "med": vals["sw"], "final": r.get("final") or "", "dq": bool(r.get("dq")),
+                   "doubt": bool(r.get("doubt")),
+                   "sw": [[w.get("column"), w.get("time") or "", w.get("written") or "", w.get("confidence") or ""]
+                          for w in r.get("sw") or []],
+                   "opts": opts, "default": default}
+            if opts and ln:
+                row.update(pick=ln.get("pick"), reason=ln.get("reason") or "", by=ln.get("by"), at=ln.get("at"),
+                           stale=ln.get("snap") != snap)
+            elif opts and cat in AUTO_CONFIRM:   # confirmed with the default until another pick is made
+                row.update(pick=default, auto=True)
+            by_sec[cat].append(row)
+        sections = []
+        complete = ready
+        for key, title, what, options, show in CONFIRM_SECTIONS:
+            rows = sorted(by_sec[key], key=lambda x: (int(x["l"] or 0), int(x["h"] or 0)))   # by lane, then heat
+            digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["tp"], x["pb"], x["med"]] for x in rows]).encode()).hexdigest()[:12]
+            confirmed = sum(1 for x in rows if x.get("pick") and not x.get("stale")) if options else len(rows)
+            can = bool(rows) and confirmed == len(rows)
+            tick = ticks.get("S%d:e%d:cf:%s" % (n, e, key))
+            done = not rows or bool(tick and can and digests.get(key) == digest)
+            complete = complete and done
+            sections.append({"key": key, "title": title, "what": what, "options": options, "show": show,
+                             "count": len(rows), "confirmed": confirmed, "rows": rows, "tick": tick, "can": can,
+                             "done": done, "changed": bool(tick and not done)})
+        dq_rows = []
+        for d in dqs or []:
+            k = "%s.%s" % (d.get("heat"), d.get("lane"))
+            dc = decided.get(k) or {}
+            stale = bool(dc) and dc.get("orig", "") != (d.get("code") or "")
+            dq_rows.append({"h": d.get("heat"), "l": d.get("lane"), "name": d.get("name") or "",
+                            "infraction": d.get("infraction") or "", "back": d.get("back") or "",
+                            "code": d.get("code") or "", "codeText": d.get("codeText") or "", "codeNote": d.get("codeNote") or "",
+                            "source": d.get("source") or "", "scan": d.get("scan") or "", "page": d.get("page"),
+                            "findings": d.get("findings") or [], "action": dc.get("action") if dc and not stale else None,
+                            "newCode": dc.get("code") or "", "reason": dc.get("reason") or "", "by": dc.get("by"),
+                            "at": dc.get("at"), "stale": stale})
+        dq_rows.sort(key=lambda x: (int(x["h"] or 0), int(x["l"] or 0)))   # by heat, then lane
+        digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["code"]] for x in dq_rows]).encode()).hexdigest()[:12]
+        decided_n = sum(1 for x in dq_rows if x["action"])
+        tick = ticks.get("S%d:e%d:cf:dq" % (n, e))
+        can = bool(dq_rows) and decided_n == len(dq_rows)
+        dq_done = not dq_rows or bool(tick and can and digests.get("dq") == digest)
+        complete = complete and dq_done
+        return {"ready": ready, "complete": complete, "sections": sections,
+                "dq": {"count": len(dq_rows), "decided": decided_n, "rows": dq_rows, "tick": tick, "can": can,
+                       "done": dq_done, "changed": bool(tick and not dq_done), "known": dqs is not None},
+                "digest": digest, "watchrule": watch}
+
+    def confirm_digest(self, n, e):
+        """What the merge results depend on from the confirmations: 'open' until the event is fully confirmed, then
+        a hash of every pick and DQ decision (so a change made after that writes them again)."""
+        c = self.confirmations(n, e)
+        if not c or not c["complete"]:
+            return "open"
+        st = self.state.get("confirm", {}).get("S%d:e%d" % (n, e), {})
+        return hashlib.sha1(json.dumps([st.get("lines", {}), st.get("dq", {})], sort_keys=True, default=str)
+                            .encode()).hexdigest()[:12]
+
+    def _confirm_fix(self, n, e, h, ln, who, **want):
+        """Put (a value) or take back (empty) the result fields a confirmation sets in fixes.json (time, status,
+        code), leaving everything else in the swim's fix alone. What a confirmation set is kept in its "confirmed"."""
+        key = "%d-%d-%d" % (int(e), int(h), int(ln))
+        with self.lock:
+            d = self.fixes(n)
+            f = dict(d.get(key) or {})
+            mine = dict(f.get("confirmed") or {})
+            for k, v in want.items():
+                if k == "reason":
+                    continue
+                if v:
+                    f[k] = mine[k] = v
+                elif k in mine:
+                    if f.get(k) == mine[k]:
+                        f.pop(k, None)
+                    mine.pop(k)
+            if mine:
+                mine["reason"] = want.get("reason") or ""
+                f["confirmed"] = mine
+                f["by"], f["at"] = str(who or "someone")[:60], time.time()
+            else:
+                f.pop("confirmed", None)
+            if f.get("status") != "DQ":
+                f.pop("code", None)
+            if any(f.get(k) for k in ("status", "time", "note", "watches", "swimmer", "swimsEvent", "timedIn", "add")):
+                f.setdefault("status", "")
+                f.setdefault("time", "")
+                f.setdefault("note", "")
+                f.setdefault("by", str(who or "someone")[:60])
+                f.setdefault("at", time.time())
+                d[key] = f
+            else:
+                d.pop(key, None)
+            tmp = self.fixes_file(n) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(d, fh, indent=1, sort_keys=True)
+            os.replace(tmp, self.fixes_file(n))
+
+    def set_confirm(self, n, e, d, who):
+        """A confirmation from the Checklist: {kind: "line", heat, lane, pick, reason} (pick "" takes it back);
+        {kind: "dq", heat, lane, action: confirm|withdraw|"", code, reason}; {kind: "section", key, checked}."""
+        if n not in self.sessions():
+            raise ValueError("no such session")
+        e = int(e)
+        kind = str(d.get("kind") or "")
+        if kind == "section":
+            return self.tick("S%d:e%d:cf:%s" % (n, e, str(d.get("key") or "")), bool(d.get("checked")), who)
+        c = self.confirmations(n, e)
+        if not c:
+            raise ValueError("event %d hasn't been worked out yet" % e)
+        if not c["ready"] and not (kind == "line" and d.get("preset")):   # preset: a pick given ahead (e.g. by Claude)
+            raise ValueError("tick off event %d's Quick OCR fixes first" % e)
+        h, ln = int(d.get("heat") or 0), int(d.get("lane") or 0)
+        k = "%d.%d" % (h, ln)
+        reason = re.sub(r"\s+", " ", str(d.get("reason") or "")).strip()[:300]
+        who = str(who or "someone")[:60]
+        ev_state = lambda: self.state.setdefault("confirm", {}).setdefault("S%d:e%d" % (n, e), {})  # noqa: E731
+        if kind == "line":
+            row = next((r for s in c["sections"] for r in s["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
+            sec = next((s for s in c["sections"] for r in s["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
+            if not row or not row["opts"]:
+                raise ValueError("heat %d lane %d has nothing to confirm" % (h, ln))
+            pick = str(d.get("pick") or "")
+            if pick and pick not in row["opts"]:
+                raise ValueError("pick one of %s" % ", ".join(PICK_NAME[o] for o in row["opts"]))
+            if pick and pick != row["default"] and not reason:
+                raise ValueError("give a reason for %s (not %s)" % (PICK_NAME[pick], PICK_NAME[row["default"]]))
+            if sec["key"] in AUTO_CONFIRM and pick == row["default"]:
+                pick = ""   # back to the default these sections start with: nothing to keep
+            value = {"tp": row["tp"], "pb": row["pb"], "sw": row["med"]}.get(pick, "")
+            with self.lock:
+                lines = ev_state().setdefault("lines", {})
+                if pick:
+                    lines[k] = {"pick": pick, "reason": reason, "value": value, "by": who, "at": time.time(),
+                                "snap": "%s|%s|%s|%s" % (row["tp"], row["pb"], row["med"], sec["key"])}
+                    if d.get("preset"):
+                        lines[k]["preset"] = True
+                else:
+                    lines.pop(k, None)
+                self.save()
+            differs = bool(pick) and _hund(value) != _hund(row["final"])
+            self._confirm_fix(n, e, h, ln, who, time=value if differs else "", reason=reason)
+            self.log("Session %d event %d heat %d lane %d: %s" % (
+                n, e, h, ln, "%s %s confirmed%s%s" % (PICK_NAME[pick], value, " (the final time changes from %s)" % row["final"]
+                                                      if differs else "", ": " + reason if reason else "")
+                if pick else "time confirmation taken back"))
+            return
+        if kind == "dq":
+            row = next((r for r in c["dq"]["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
+            if not row:
+                raise ValueError("no DQ in heat %d lane %d" % (h, ln))
+            action = str(d.get("action") or "")
+            code = str(d.get("code") or "").strip()[:6]
+            if action not in ("", "confirm", "withdraw"):
+                raise ValueError("confirm or withdraw the DQ")
+            if action == "confirm" and not code:
+                raise ValueError("a DQ needs its code")
+            if action == "withdraw" and not reason:
+                raise ValueError("give the reason the DQ is withdrawn")
+            with self.lock:
+                dq = ev_state().setdefault("dq", {})
+                if action:
+                    dq[k] = {"action": action, "code": code if action == "confirm" else "", "reason": reason,
+                             "orig": row["code"], "by": who, "at": time.time()}
+                else:
+                    dq.pop(k, None)
+                self.save()
+            if action == "confirm" and (code != row["code"] or row["source"] != "slip"):
+                self._confirm_fix(n, e, h, ln, who, status="DQ", code=code, reason=reason)
+            elif action == "withdraw":
+                self._confirm_fix(n, e, h, ln, who, status="OK", code="", reason=reason)
+            else:
+                self._confirm_fix(n, e, h, ln, who, status="", code="")
+            self.log("Session %d event %d heat %d lane %d: %s" % (
+                n, e, h, ln, {"confirm": "DQ %s confirmed" % code, "withdraw": "DQ withdrawn: %s" % reason}.get(action, "DQ decision taken back")))
+            return
+        raise ValueError("unknown confirmation")
+
+    def confirm_section(self, n, e, key, checked, who):
+        """Tick or untick a confirmation section (S<n>:e<e>:cf:<key>): only when every swim in it is confirmed."""
+        c = self.confirmations(n, e)
+        if not c:
+            raise ValueError("event %d hasn't been worked out yet" % e)
+        if key == "dq":
+            sec, rows = c["dq"], c["dq"]["rows"]
+            digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["code"]] for x in rows]).encode()).hexdigest()[:12]
+        else:
+            sec = next((s for s in c["sections"] if s["key"] == key), None)
+            if not sec:
+                raise ValueError("no confirmation section %r" % key)
+            rows = sec["rows"]
+            digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["tp"], x["pb"], x["med"]] for x in rows]).encode()).hexdigest()[:12]
+        if checked and not c["ready"]:
+            raise ValueError("tick off event %d's Quick OCR fixes first" % e)
+        if checked and not sec["can"]:
+            raise ValueError("confirm every swim in it first" if rows else "nothing to confirm")
+        with self.lock:
+            dg = self.state.setdefault("confirm", {}).setdefault("S%d:e%d" % (n, e), {}).setdefault("digest", {})
+            if checked:
+                dg[key] = digest
+                self.state["ticks"]["S%d:e%d:cf:%s" % (n, e, key)] = {"by": str(who or "someone")[:60], "at": time.time()}
+            else:
+                dg.pop(key, None)
+                self.state["ticks"].pop("S%d:e%d:cf:%s" % (n, e, key), None)
+            self.save()
+        title = "DQs" if key == "dq" else sec["title"]
+        self.log("Session %d event %d: %s %s by %s" % (n, e, title, "confirmed" if checked else "unconfirmed", who or "someone"))
+
     def tick(self, key, checked, who, not_swum=None):
         """Tick a checklist item. For an event (S1:e105) ticked complete while heats have no Gen7 race, not_swum is the
         list of those heats, confirmed as not swum: the event then counts as having all its races."""
         if not re.fullmatch(r"S\d{1,2}:[\w.:=() \-]{1,200}", key or ""):
             raise ValueError("bad checklist key")
+        m = re.fullmatch(r"S(\d{1,2}):e(\d{1,4}):cf:(\w+)", key)
+        if m:   # a confirmation section: only once every swim in it is confirmed
+            return self.confirm_section(int(m.group(1)), int(m.group(2)), m.group(3), checked, who)
         with self.lock:
             ns = self.state.setdefault("notSwum", {})
             if checked:

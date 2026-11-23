@@ -70,7 +70,7 @@ sub('''            if path == "/api/board/update":
                 return self._json(200, {"ok": True, "update": self.server.updater.start(self._who(q))})
             if path == "/api/gala/upload":
                 return self._gala_upload(q)
-            if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/recheck",
+            if path in ("/api/gala/tick", "/api/gala/auto", "/api/gala/ask", "/api/gala/move", "/api/gala/session", "/api/gala/fix", "/api/gala/confirm", "/api/gala/recheck",
                         "/api/gala/restart", "/api/gala/archive-delete", "/api/gala/archive-restore", "/api/gala/update", "/api/gala/split"):
                 return self._gala_post(path, q)''')
 # the web terminal through the portal (/terminal/ro/, /terminal/rw/, the admin key) is part of the QA board itself

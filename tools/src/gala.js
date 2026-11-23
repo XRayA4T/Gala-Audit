@@ -3,13 +3,13 @@
 let QP_OPEN={},galaBusy=false,GALA=null,galaSig='',GSESS=+(store('qa-gsess')||0);
 function galaHref(rel,dl){const u=url('/api/gala/file');u.searchParams.set('path',rel);if(dl)u.searchParams.set('dl','1');return u.toString()}
 async function galaPost(path,body){return api(path,Object.assign({by:me()||'someone'},body||{}))}
-const ST_TXT={waiting:'waiting',ready:'ready',asked:'with Claude',transcribed:'transcribed',computing:'working…',audited:'audited',changed:'new files'};
+const ST_TXT={waiting:'waiting',ready:'ready',asked:'with Claude',transcribed:'transcribed',computing:'working…',audited:'audited',changed:'new files',confirm:'to confirm'};
 const FOLDER_TXT={meet:['Meet Manager files','Entries, merge results and final exports (.zip / .hy3)'],gen7:['Gen7 race PDFs','One PDF per race'],
  scans:['Scans','Lane sheet packs (one per event), DQ slips, ETD programme'],ocr:['OCR (Claude)','JSON per lane sheet, DQ slip and ETD page; dq-codes.json'],
  reports:['Reports (Claude)','Event and session audits, merge results .hy3, final audit']};
 function curSession(){if(!GALA||!GALA.sessions.length)return null;
  return GALA.sessions.find(s=>s.n===GSESS)||GALA.sessions[GALA.sessions.length-1]}
-function galaEditing(){const a=document.activeElement;return !!(a&&a.closest&&a.closest('form.qffix'))||!!document.querySelector('form.qffix[data-dirty]')}
+function galaEditing(){const a=document.activeElement;return !!(a&&a.closest&&a.closest('form.qffix,form.cffix,form.cfdq'))||!!(a&&a.form&&a.form.matches('form.cffix'))||!!document.querySelector('form.qffix[data-dirty],form.cffix[data-dirty],form.cfdq[data-dirty]')}
 let CODES={},CODES_FOR=null;
 async function loadCodes(n){if(CODES_FOR===n)return;CODES_FOR=n;
  try{const j=await api('/api/gala/codes?session='+n);CODES=j;let dl=$('#dqcodes');if(!dl){dl=document.createElement('datalist');dl.id='dqcodes';document.body.appendChild(dl)}
@@ -136,10 +136,11 @@ function renderChecklist(){setTimeout(swAll,0);
  if(!s){box.innerHTML='<div class="card meta">No sessions yet. Drop the session\'s Meet Manager entries export on the Gala tab (or in the inbox folder) to start.</div>';return}
  const qfKey=(e,f)=>'S'+s.n+':e'+e.event+':qf:'+f.heat+'.'+f.lane;
  const keys=['entries','sessreport','lanesprint',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','resultspdf','final'].map(k=>'S'+s.n+':'+k)
-  .concat(s.events.flatMap(e=>(e.fixes||[]).map(f=>qfKey(e,f))));
+  .concat(s.events.flatMap(e=>(e.fixes||[]).map(f=>qfKey(e,f))))
+  .concat(s.events.flatMap(e=>e.confirm?[...(e.confirm.dq.count?['dq']:[]),...e.confirm.sections.filter(x=>x.count).map(x=>x.key)].map(k=>'S'+s.n+':e'+e.event+':cf:'+k):[]));
  const ticked=keys.filter(k=>GALA.ticks[k]).length,pct=Math.round(100*ticked/keys.length);
  const dq=s.scans.filter(x=>x.kind==='dq'),etd=s.scans.filter(x=>x.kind==='etd');
- const ev=s.events.length?`<div class="tblwrap"><table class="cl-ev"><tr><th></th><th>Event</th><th class="c">Printed</th><th>Lane sheets</th><th class="c">Gen7 heats</th><th class="c">OCR lanes</th><th>Audit</th><th>Merge</th><th class="c">Quick fixes</th><th>Status</th><th></th></tr>`
+ const ev=s.events.length?`<div class="tblwrap"><table class="cl-ev"><tr><th></th><th>Event</th><th class="c">Printed</th><th>Lane sheets</th><th class="c">Gen7 heats</th><th class="c">OCR lanes</th><th>Audit</th><th>Merge</th><th class="c">Quick OCR fixes</th><th>Status</th><th></th></tr>`
   +s.events.map(e=>{const key='S'+s.n+':e'+e.event,t=GALA.ticks[key];
    const g7=e.heats?`${e.gen7.length}/${e.heats}`:(e.gen7.length||'–');
    const fx=e.fixes||null,fxDone=fx?fx.filter(f=>GALA.ticks[qfKey(e,f)]).length:0;
@@ -147,7 +148,7 @@ function renderChecklist(){setTimeout(swAll,0);
    const lastFix=Math.max(0,...Object.values(e.handFixes||{}).map(h=>h.at||0)),needRegen=fx&&fx.length&&fxDone===fx.length&&lastFix>(e.mergeAt||0);
    const regen=`<div><button type="button" class="primary regen" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge&&e.ocrLanes?'':'disabled'} title="${esc(e.canMerge?(e.ocrLanes?'The portal writes the merge results, audit and quick fixes again from what is already transcribed, with the fixes made here and every DQ slip read and coded so far (no scans are read, no Claude)':'The lane sheets aren\'t transcribed yet'):'Needs the entries export')}">${e.merge?'Regenerate':'Generate'}</button>${e.dqSlips?`<span class="sm"> ${e.dqSlips} DQ</span>`:''}</div>`;
    const mergeCell=(e.merge?link(s,'reports',e.merge):e.canMerge?'<span class="no">–</span>':`<span class="no" title="No entries export">waiting</span>`)+regen;
-   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${needRegen?`<div class="qfdone">All quick fixes for event ${e.event} are done, and fixes were made since its merge results were written. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details data-qfd="S${s.n}:e${e.event}"${(QF_OPEN['S'+s.n+':e'+e.event]??(fxDone<fx.length))?' open':''}><summary>Quick fixes for event ${e.event} (${fxDone} of ${fx.length} ticked${fx.some(x=>x.cleared)?', '+fx.filter(x=>x.cleared).length+' settled by the re-check':''})${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
+   const fxRows=fx&&fx.length?`<tr class="qfrow"><td></td><td colspan="10">${needRegen?`<div class="qfdone">All quick fixes for event ${e.event} are done, and fixes were made since its merge results were written. <button type="button" class="primary" data-ask="S${s.n}:remerge:${e.event}" ${e.canMerge?'':'disabled title="Needs the entries export"'}>Regenerate the merge results</button> <span class="sm">with the fixes made here and every DQ slip read so far</span></div>`:''}<details data-qfd="S${s.n}:e${e.event}"${(QF_OPEN['S'+s.n+':e'+e.event]??(fxDone<fx.length))?' open':''}><summary>Quick OCR fixes for event ${e.event} (${fxDone} of ${fx.length} ticked${fx.some(x=>x.cleared)?', '+fx.filter(x=>x.cleared).length+' settled by the re-check':''})${e.recheck?` · <span class="${e.recheck.state==='failed'?'gwarn':''}">${e.recheck.state==='running'?'re-checking…':e.recheck.state==='failed'?'re-check failed: '+esc(e.recheck.msg||''):'re-checked '+esc(agoShort(e.recheck.at))+(e.recheck.msg?' ('+esc(e.recheck.msg)+')':'')}</span>`:''} · <button type="button" class="sm" data-recheck="${s.n}|${e.event}">Check again</button>${Object.keys(e.handFixes||{}).length?` · ${Object.keys(e.handFixes).length} fixed in the portal`:''}${e.fixesFile?` · <a href="${esc(galaHref('sessions/S'+s.n+'/reports/'+e.fixesFile))}" target="_blank" rel="noopener">printable list</a>`:''}</summary>
      <ul class="qf">${fx.map(f=>{const k=qfKey(e,f),t=GALA.ticks[k],hf=(e.handFixes||{})[f.heat+'.'+f.lane]||{};
       return `<li class="${t?'done':''}${f.cleared?' cleared':''}">${tickBox(k,'Lane '+f.lane+' heat '+f.heat)}<div><b>Lane ${esc(f.lane)} · Heat ${esc(f.heat)}</b>${f.cleared?` <span class="st audited" title="${esc('No longer flagged since '+agoShort(f.clearedAt))}">settled by the re-check</span>`:''} <span class="meta">in the merge file: ${esc(f.inFile||'–')}</span>
        <ul>${f.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
@@ -176,7 +177,7 @@ function renderChecklist(){setTimeout(swAll,0);
     <td>${e.report?link(s,'reports',e.report):'–'}</td>
     <td>${mergeCell}</td><td class="c">${fxCell}</td>
     <td><span class="st ${e.status}">${esc(ST_TXT[e.status]||e.status)}</span>${e.computed&&!e.computed.ok&&e.status!=='computing'?`<div class="sm gwarn" title="${esc(e.computed.msg||'')}">portal: ${esc((e.computed.msg||'failed').slice(0,90))}</div>`:''}</td>
-    <td><button type="button" data-ask="${key}" ${e.packs.length?'':'disabled title="No lane sheet pack yet"'}>${e.asked?'Ask again':'Ask Claude'}</button></td></tr>${fxRows}`}).join('')+'</table></div>'
+    <td><button type="button" data-ask="${key}" ${e.packs.length?'':'disabled title="No lane sheet pack yet"'}>${e.asked?'Ask again':'Ask Claude'}</button></td></tr>${fxRows}${cfRows(s,e)}`}).join('')+'</table></div>'
   :'<div class="meta" style="padding:8px 0">No events yet. They come from the entries export, or appear as lane sheet packs and Gen7 races arrive.</div>';
  const scanFound=list=>list.map(x=>link(s,'scans',x.name)+` <span class="meta">(${x.done}/${x.pages??'?'} pages read)</span>`);
  box.innerHTML=`<div class="card clhead"><div class="gh-top"><div><h2>Session ${s.n} checklist</h2>
@@ -192,7 +193,7 @@ function renderChecklist(){setTimeout(swAll,0);
   ${clRow(s,'S'+s.n+':lanesprint','Printed lane sheets (Meet Manager)','The lane sheet PDF Meet Manager printed for the session (not the scan). Claude copies the names, ages, teams and seed times from it, which is much more accurate than reading them off the scans. Bring it in before the first event.',
     s.lanePrints.map(p=>`<a href="${esc(galaHref(p.path))}" target="_blank" rel="noopener">${esc(p.name)}</a>`+` <span class="meta">(${p.sheets} sheet${p.sheets===1?'':'s'}, event${p.events.length===1?'':'s'} ${esc(evRange(p.events))})</span>`),'S'+s.n+'/meet')}
   <div class="cl-sec">Each event, as it is swum</div>
-  <div class="meta" style="margin-bottom:4px">An event is <b>ready</b> when its lane sheet pack and every heat's Gen7 race PDF are in${GALA.auto?'; Claude is then asked to transcribe and audit it':''}. Claude then writes the event's <b>merge results</b> (<code>.hy3</code>, to import into Meet Manager) and its <b>quick fixes</b>: the swims to check by hand, listed under the event to tick off as they're fixed. Drop a lane sheet pack on an event to add it.</div>
+  <div class="meta" style="margin-bottom:4px">An event is <b>ready</b> when its lane sheet pack and every heat's Gen7 race PDF are in${GALA.auto?'; Claude is then asked to transcribe and audit it':''}. The portal then lists the event's <b>Quick OCR fixes</b> (misread watches, swimmers written in, watches more than 0.40 s from the push buttons) to fix and tick off, then its <b>confirmations</b>: the DQs and every swim's time, section by section. Once all are confirmed it writes the event's <b>merge results</b> (<code>.hy3</code>, to import into Meet Manager) and audit. Drop a lane sheet pack on an event to add it.</div>
   ${ev}
   <div class="cl-sec">During and after the session</div>
   ${clRow(s,'S'+s.n+':dq','DQ slips','The referees\' DQ slips, scanned (name the file with "DQ"). Claude reads each batch as it arrives.',scanFound(dq),'S'+s.n+'/scans')}
@@ -261,8 +262,10 @@ setInterval(()=>{if(!document.hidden&&(view==='gala'||view==='checklist'||view==
 function offerRegen(key,justDone){
  const m=/^S(\d+):e(\d+):qf:/.exec(key);if(!m)return;const n=+m[1],ev=+m[2];
  const s=GALA&&GALA.sessions.find(x=>x.n===n),e=s&&s.events.find(x=>x.event===ev);if(!e||!e.fixes||!e.canMerge)return;
- const left=e.fixes.filter(f=>{const k='S'+n+':e'+ev+':qf:'+f.heat+'.'+f.lane;return k!==justDone&&!GALA.ticks[k]});
+ const left=e.fixes.filter(f=>{const k='S'+n+':e'+ev+':qf:'+f.heat+'.'+f.lane;return k!==justDone&&!GALA.ticks[k]&&!f.cleared});
  if(left.length)return;
+ if(e.confirm&&!e.confirm.complete){galaNotice('Quick OCR fixes for event '+ev+' are done: now confirm its DQs and times, under the event. Its merge results and audit are written once all are confirmed.');
+  if(Object.values(e.handFixes||{}).some(h=>(h.at||0)>(e.mergeAt||0)))galaPost('/api/gala/recheck',{session:n,event:ev}).catch(()=>{});return}
  galaDialog({title:'All quick fixes for event '+ev+' are done',
   text:'Regenerate the event\'s merge results now, with the fixes made in the portal and every DQ slip read so far? No scans are read again.',
   ok:'Regenerate the merge results',cancel:'Not now'}).then(yes=>{if(!yes)return;
@@ -474,3 +477,82 @@ async function rsRestore(name,hasQ){const s=(GALA&&GALA.summary)||{};
 
 // remember a quick fix page opened or closed by hand (until the item is ticked or unticked)
 document.addEventListener('toggle',e=>{const d=e.target;if(d&&d.matches&&d.matches('details[data-qpd]'))QP_OPEN[d.dataset.qpd]={open:d.open,ticked:d.dataset.ticked==='1'}},true);
+// ---- confirmations: after an event's Quick OCR fixes are ticked off, its DQs and times are confirmed, section by
+// section; the merge results and audit are written once all are. Each swim's values: TP, PB, SW median, every SW time.
+const CF_OPEN={},PICK_TXT={tp:'TP',pb:'PB',sw:'SW median'};
+document.addEventListener('toggle',ev=>{const d=ev.target;if(d.matches&&d.matches('details[data-cfd]'))CF_OPEN[d.dataset.cfd]=d.open},true);
+function cfOpen(key,dflt){return CF_OPEN[key]??dflt}
+function cfSwCells(r){const by={};r.sw.forEach(w=>by[w[0]]=w);
+ return [1,2,3].map(c=>{const w=by[c];return `<td class="t">${w?esc(w[1])+(w[3]&&w[3]!=='HIGH'?` <span class="sm gwarn" title="${esc(w[3].toLowerCase())} confidence, written “${esc(w[2])}”">?</span>`:''):'<span class="no">–</span>'}</td>`}).join('')}
+function cfRow(s,e,sec,r){
+ const k=s.n+'|'+e.event+'|'+r.h+'|'+r.l,fid='cf-'+s.n+'-'+e.event+'-'+r.h+'-'+r.l,vals={tp:r.tp,pb:r.pb,sw:r.med},opts=r.opts||[];
+ const picked=opts.length?(r.pick&&!r.stale?r.pick:null):sec.show,sel=picked||r.default;
+ const cell=o=>{const v=vals[o];if(!v)return '<td class="t"><span class="no">–</span></td>';
+  const cls=o===picked?'cfpick':(!picked&&o===r.default&&opts.length?'cfsug':'');
+  return opts.includes(o)?`<td class="t ${cls}"><label><input type="radio" form="${fid}" name="pick" value="${o}"${o===sel?' checked':''}${r.pick&&!r.stale&&!r.auto?' disabled':''}> ${esc(v)}</label></td>`:`<td class="t ${cls}">${esc(v)}</td>`};
+ const lead=`<td>${esc(r.l)}</td><td>${esc(r.h)}</td><td>${esc(r.name||'–')}${r.dq?' <span class="sm gwarn">DQ</span>':''}${r.doubt?' <span class="sm" title="The audit kept TP: the watches don\'t agree with each other">in doubt</span>':''}</td>`;
+ const times=cell('tp')+cell('pb')+cell('sw')+cfSwCells(r);
+ if(!opts.length)return `<tr>${lead}${times}</tr>`;
+ const shownV=vals[picked||sel]||'',audit=r.final&&hund(r.final)!==hund(shownV)?`<div class="sm">audit: ${esc(r.final)}</div>`:'';
+ const act=r.auto?`<span class="sm meta">${esc(PICK_TXT[r.default])} (default)</span> <span data-cfother hidden><input name="reason" value="" placeholder="reason (not ${esc(PICK_TXT[r.default])})" size="18"> <button type="submit" class="primary">Confirm</button></span><div class="sm" data-cfmsg></div>`
+  :r.pick&&!r.stale?`<span class="ok">✓ ${esc(PICK_TXT[r.pick])}</span>${r.reason?` <span class="sm">· ${esc(r.reason)}</span>`:''}<div class="sm">${esc(r.by||'')} · ${esc(agoShort(r.at))} <button type="button" class="sm" data-cfundo>Change</button></div>`
+  :`<input name="reason" value="${esc(r.reason||'')}" placeholder="reason (not ${esc(PICK_TXT[r.default])})" size="18"${sel===r.default?' hidden':''}> <button type="submit" class="primary">Confirm</button>${r.stale?'<div class="sm gwarn">the times changed since it was confirmed: confirm again</div>':''}<div class="sm" data-cfmsg></div>`;
+ return `<tr class="${r.pick&&!r.stale?'done':''}">${lead}${times}<td class="cfact"><form id="${fid}" class="cffix" data-cf="${esc(k)}" data-default="${esc(r.default)}" autocomplete="off">${audit}${act}</form></td></tr>`}
+function cfHead(opts){return `<tr><th>Lane</th><th>Heat</th><th>Swimmer</th><th>TP</th><th>PB</th><th>SW median</th><th>SW1</th><th>SW2</th><th>SW3</th>${opts?'<th>Confirm</th>':''}</tr>`}
+function cfSection(s,e,c,sec){
+ const key='S'+s.n+':e'+e.event+':cf:'+sec.key,t=GALA.ticks[key],lock=!c.ready;
+ const state=!sec.count?'<span class="meta">nothing to confirm</span>':sec.done?`<span class="ok">confirmed ✓</span> <span class="sm">${esc(t?t.by+' · '+agoShort(t.at):'')}</span>`
+  :sec.changed?'<span class="gwarn">changed since it was ticked: check it and tick again</span>':sec.options.length?`<span class="${sec.confirmed===sec.count?'ok':'gwarn'}">${sec.confirmed} of ${sec.count} swims confirmed</span>`:'';
+ const box=sec.count?`<input type="checkbox" data-tick="${esc(key)}"${t?' checked':''}${lock||(!sec.can&&!t)?' disabled':''} aria-label="Confirm ${esc(sec.title)}" title="${esc(lock?'Tick off the Quick OCR fixes first':!sec.can?'Confirm every swim in it first':t?'Ticked by '+t.by:'Tick when checked')}">`:'<input type="checkbox" disabled>';
+ const shown=sec.show&&sec.options.length?` · <b>${esc(PICK_TXT[sec.show])}</b> is selected for every swim; pick another for a swim, with a reason`:sec.show?` · <b>${esc(PICK_TXT[sec.show])}</b> highlighted`:sec.options.length?` · pick ${sec.options.map(o=>PICK_TXT[o]).join(', ')}; a reason for anything but ${esc(PICK_TXT[sec.options[0]])}`:'';
+ const body=sec.count?`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&sec.options.length>0&&!sec.show&&!sec.done)?' open':''}><summary class="sm">${sec.count} swim${sec.count===1?'':'s'}, by lane</summary>
+  <div class="tblwrap"><table class="cfrows">${cfHead(sec.options.length)}${sec.rows.map(r=>cfRow(s,e,sec,r)).join('')}</table></div></details>`:'';
+ return `<div class="cfsec${sec.done&&sec.count?' done':''}"><div class="cfh">${box}<div><b>${esc(sec.title)}</b> <span class="cfn">${sec.count}</span> ${state}<div class="sm meta">${esc(sec.what)}${shown}</div></div></div>${body}</div>`}
+function cfDqs(s,e,c){
+ const d=c.dq,key='S'+s.n+':e'+e.event+':cf:dq',t=GALA.ticks[key],lock=!c.ready;
+ if(!d.known)return '';
+ const state=!d.count?'<span class="meta">no DQs</span>':d.done?`<span class="ok">confirmed ✓</span> <span class="sm">${esc(t?t.by+' · '+agoShort(t.at):'')}</span>`
+  :d.changed?'<span class="gwarn">changed since it was ticked: check it and tick again</span>':`<span class="${d.decided===d.count?'ok':'gwarn'}">${d.decided} of ${d.count} decided</span>`;
+ const box=d.count?`<input type="checkbox" data-tick="${esc(key)}"${t?' checked':''}${lock||(!d.can&&!t)?' disabled':''} aria-label="Confirm the DQs" title="${esc(lock?'Tick off the Quick OCR fixes first':!d.can?'Confirm or withdraw every DQ first':'Tick when checked')}">`:'<input type="checkbox" disabled>';
+ const rows=d.rows.map(r=>{const k=s.n+'|'+e.event+'|'+r.h+'|'+r.l,code=r.newCode||r.code;
+  const scan=r.scan?(()=>{const rel='sessions/S'+s.n+'/scans/'+r.scan;return ` <a class="sm" href="${esc(galaHref(rel))}#page=${esc(r.page)}" target="_blank" rel="noopener">slip, page ${esc(r.page)}</a>`})():'';
+  const dec=r.action?`<span class="${r.action==='confirm'?'ok':'gwarn'}">${r.action==='confirm'?'✓ DQ '+esc(r.newCode||r.code)+' confirmed':'DQ withdrawn'}</span>${r.reason?` <span class="sm">· ${esc(r.reason)}</span>`:''}<div class="sm">${esc(r.by||'')} · ${esc(agoShort(r.at))} <button type="button" class="sm" data-cfdq="undo">Change</button></div>`
+   :`<input name="code" value="${esc(code)}" list="dqcodes" size="6" aria-label="DQ code"> <button type="button" class="primary" data-cfdq="confirm">Confirm DQ</button> <button type="button" data-cfdq="withdraw">Withdraw</button><div><input name="reason" value="${esc(r.reason||'')}" placeholder="reason (needed to withdraw)" size="26"></div>${r.stale?'<div class="sm gwarn">the slip\'s code changed since it was decided: decide again</div>':''}<div class="sm" data-cfmsg></div>`;
+  return `<tr class="${r.action?'done':''}"><td>${esc(r.h)}</td><td>${esc(r.l)}</td><td>${esc(r.name||'–')}</td>
+   <td>${esc(r.infraction||'–')}${r.back?`<div class="sm">back: ${esc(r.back)}</div>`:''}${r.source==='sheet'?'<div class="sm gwarn">marked on the lane sheet; no slip</div>':''}${scan}</td>
+   <td class="t"><b>${esc(r.code||'–')}</b>${r.codeText?`<div class="sm">${esc(r.codeText)}</div>`:''}${r.codeNote?`<div class="sm gwarn">${esc(r.codeNote)}</div>`:''}</td>
+   <td>${r.findings.length?'<ul class="sm cff">'+r.findings.map(f=>`<li>${esc(f)}</li>`).join('')+'</ul>':''}</td>
+   <td><form class="cfdq" data-cf="${esc(k)}" autocomplete="off">${dec}</form></td></tr>`}).join('');
+ const body=d.count?`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&!d.done)?' open':''}><summary class="sm">${d.count} DQ${d.count===1?'':'s'}, by heat then lane</summary>
+  <div class="tblwrap"><table class="cfrows"><tr><th>Heat</th><th>Lane</th><th>Swimmer</th><th>Rule</th><th>Code</th><th>Checks</th><th>Confirm or withdraw</th></tr>${rows}</table></div></details>`:'';
+ return `<div class="cfsec${d.done&&d.count?' done':''}"><div class="cfh">${box}<div><b>DQs</b> <span class="cfn">${d.count}</span> ${state}<div class="sm meta">Each DQ with its rule and code (the code can be changed): confirm it, or withdraw it with a reason.</div></div></div>${body}</div>`}
+function cfRows(s,e){
+ const c=e.confirm;if(!c)return '';
+ const secs=c.sections.filter(x=>x.key!=='nomatch'||x.count),need=secs.filter(x=>x.count).length+(c.dq.count?1:0);
+ const done=secs.filter(x=>x.count&&x.done).length+(c.dq.count&&c.dq.done?1:0),key='S'+s.n+':e'+e.event+':cf';
+ const head=c.complete?`<span class="ok">all confirmed ✓</span>${e.status==='audited'?' · the merge results and audit are written':' · the merge results and audit are being written'}`
+  :!c.ready?'<span class="gwarn">tick off the Quick OCR fixes first</span>':`<span class="gwarn">${done} of ${need} confirmed</span> · the merge results and audit are written once all are`;
+ return `<tr class="qfrow cfrow"><td></td><td colspan="10"><details data-cfd="${esc(key)}"${cfOpen(key,c.ready&&!c.complete)?' open':''}><summary>Confirmations for event ${e.event} · ${head}</summary>
+  ${c.watchrule?'<div class="sm meta">This session\'s results were published with the rule before gala-ocr 1.6.13: where TP and PB agree but the SW median doesn\'t, the SW median was used. Those swims are set to SW median (“Glitch - used SW Median as it was better”).</div>':''}
+  <div class="cfwrap${c.ready?'':' locked'}">${cfDqs(s,e,c)}${secs.map(x=>cfSection(s,e,c,x)).join('')}</div></details></td></tr>`}
+function cfForm(el){const f=el&&(el.form||(el.closest&&el.closest('form')));return f&&f.matches('form.cffix,form.cfdq')?f:null}
+document.addEventListener('change',ev=>{const fm=cfForm(ev.target);if(!fm||!fm.matches('.cffix'))return;fm.dataset.dirty='1';
+ if(ev.target.name==='pick'){const o=fm.querySelector('[data-cfother]');if(o)o.hidden=ev.target.value===fm.dataset.default;
+  const r=fm.querySelector('input[name=reason]');if(r){if(!o)r.hidden=ev.target.value===fm.dataset.default;if(ev.target.value!==fm.dataset.default)r.focus()}
+  const tr=ev.target.closest('tr');tr.querySelectorAll('td.cfpick,td.cfsug').forEach(td=>td.classList.remove('cfpick','cfsug'));ev.target.closest('td').classList.add('cfsug')}});
+document.addEventListener('input',ev=>{const fm=cfForm(ev.target);if(fm)fm.dataset.dirty='1'});
+function cfSend(fm,body){const [n,event,heat,lane]=fm.dataset.cf.split('|'),msg=fm.querySelector('[data-cfmsg]');
+ return galaPost('/api/gala/confirm',Object.assign({session:+n,event:+event,heat:+heat,lane:+lane},body)).then(()=>{delete fm.dataset.dirty;document.activeElement&&document.activeElement.blur();galaSig='';loadGala()})
+  .catch(err=>{if(msg)msg.textContent=err.message;else galaNotice(err.message,'error')})}
+document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.cffix');if(!fm)return;ev.preventDefault();
+ const pick=([...fm.elements].find(x=>x.name==='pick'&&x.checked)||{}).value||fm.dataset.default,reason=((fm.querySelector('input[name=reason]')||{}).value||'').trim(),msg=fm.querySelector('[data-cfmsg]');
+ if(pick!==fm.dataset.default&&!reason){msg.textContent='Give a reason for '+PICK_TXT[pick]+' (not '+PICK_TXT[fm.dataset.default]+')';fm.querySelector('input[name=reason]').focus();return}
+ cfSend(fm,{kind:'line',pick,reason})});
+document.addEventListener('click',ev=>{
+ const u=ev.target.closest('[data-cfundo]');if(u){cfSend(u.closest('form.cffix'),{kind:'line',pick:''});return}
+ const b=ev.target.closest('[data-cfdq]');if(!b)return;const fm=b.closest('form.cfdq'),act=b.dataset.cfdq,msg=fm.querySelector('[data-cfmsg]');
+ if(act==='undo'){cfSend(fm,{kind:'dq',action:''});return}
+ const code=((fm.querySelector('input[name=code]')||{}).value||'').trim(),reason=((fm.querySelector('input[name=reason]')||{}).value||'').trim();
+ if(act==='confirm'&&!code){msg.textContent='A DQ needs its code';return}
+ if(act==='withdraw'&&!reason){msg.textContent='Give the reason the DQ is withdrawn';fm.querySelector('input[name=reason]').focus();return}
+ cfSend(fm,{kind:'dq',action:act,code,reason})});

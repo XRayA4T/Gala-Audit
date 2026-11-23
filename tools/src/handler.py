@@ -138,6 +138,8 @@
                 g.recheck(int(d.get("session") or 0), int(d.get("event") or 0), who)
             elif path == "/api/gala/fix":
                 g.set_fix(int(d.get("session") or 0), d.get("event"), d.get("heat"), d.get("lane"), d, who)
+            elif path == "/api/gala/confirm":
+                g.set_confirm(int(d.get("session") or 0), d.get("event"), d, who)
             elif path == "/api/gala/split":
                 n = int(d.get("session") or 0)
                 if d.get("name"):
