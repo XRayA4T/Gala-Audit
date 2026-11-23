@@ -821,7 +821,10 @@ CONFIRM_SECTIONS = [
     ("allmatch", "All Match", "TP, PB and the SW median agree within 0.30 s: TP", ["tp", "sw", "pb"], "tp"),
     ("nopb", "All Match NO PB", "No PB; TP and the SW median agree within 0.30 s: TP", ["tp", "sw"], "tp"),
     ("notp", "All Match NO TP", "No TP; PB and the SW median agree within 0.30 s: the SW median", [], "sw"),
-    ("notppb", "SW Median - No TP or BP", "No TP and no PB: the SW median", [], "sw"),
+    ("notppb", "SW Median - No TP or BP - all SW within 0.3s", "No TP and no PB; the SW times all within 0.30 s of each "
+               "other: the SW median", [], "sw"),
+    ("notppbx", "SW Median - No TP or BP - not all SW within 0.3s", "No TP and no PB; the SW times more than 0.30 s apart, "
+                "or only one: the SW median", [], "sw"),
     ("overlap", "Overlap", "Two of the three pairs (TP-PB, TP-SW median, PB-SW median) agree within 0.30 s, the third "
                 "doesn't", ["tp", "sw", "pb"], None),
     ("badtp", "Bad TP - Rest Match", "PB and the SW median agree within 0.30 s, TP doesn't", ["sw", "tp", "pb"], None),
@@ -841,8 +844,8 @@ def _hund(t):
     return (int(m.group(1) or 0) * 60 + int(m.group(2))) * 100 + int(m.group(3)) if m else None
 
 
-def confirm_category(tp, pb, med, tol=CONFIRM_TOL):
-    """The confirmation section of a swim from its TP, PB and SW median (hundredths or None)."""
+def confirm_category(tp, pb, med, tol=CONFIRM_TOL, sw=None):
+    """The confirmation section of a swim from its TP, PB and SW median (hundredths or None), and its SW times."""
     ok = lambda a, b: a is not None and b is not None and abs(a - b) <= tol  # noqa: E731
     if tp is not None and pb is not None and med is not None:
         pairs = ok(tp, pb) + ok(tp, med) + ok(pb, med)
@@ -852,8 +855,9 @@ def confirm_category(tp, pb, med, tol=CONFIRM_TOL):
         return "nopb" if ok(tp, med) else "nomatch"
     if pb is not None and med is not None:
         return "notp" if ok(pb, med) else "notpmis"
-    if med is not None:
-        return "notppb"
+    if med is not None:   # the SW median alone: do the watches all agree (within the tolerance of each other)?
+        sw = [x for x in sw or [] if x is not None]
+        return "notppb" if len(sw) >= 2 and max(sw) - min(sw) <= tol else "notppbx"
     if tp is not None or pb is not None:   # TP and/or PB with no SW times
         return "nomatch"
     return None
@@ -3531,7 +3535,7 @@ class Gala:
             if r.get("ns") or "%s.%s" % (r.get("heat"), r.get("lane")) in no_swim:   # a no-show, or marked as no swim
                 continue
             tp, pb, med = _hund(r.get("tp")), _hund(r.get("pb")), _hund(r.get("median"))
-            cat = confirm_category(tp, pb, med)
+            cat = confirm_category(tp, pb, med, sw=[_hund(w.get("time")) for w in r.get("sw") or []])
             if not cat:
                 continue
             k = "%s.%s" % (r.get("heat"), r.get("lane"))
@@ -3551,7 +3555,7 @@ class Gala:
                    "opts": opts, "default": default}
             if opts and ln:
                 row.update(pick=ln.get("pick"), reason=ln.get("reason") or "", by=ln.get("by"), at=ln.get("at"),
-                           stale=ln.get("snap") != snap)
+                           stale=ln.get("snap") != snap, all=bool(ln.get("all")))
             elif opts and cat in AUTO_CONFIRM:   # confirmed with the default until another pick is made
                 row.update(pick=default, auto=True)
             by_sec[cat].append(row)
@@ -3745,6 +3749,30 @@ class Gala:
         reason = re.sub(r"\s+", " ", str(d.get("reason") or "")).strip()[:300]
         who = str(who or "someone")[:60]
         ev_state = lambda: self.state.setdefault("confirm", {}).setdefault("S%d:e%d" % (n, e), {})  # noqa: E731
+        if kind == "all":   # Confirm all: every swim in a section not confirmed yet, with its suggested value
+            sec = next((s for s in c["sections"] if s["key"] == str(d.get("key") or "")), None)
+            if not sec or not sec["options"]:
+                raise ValueError("that section has nothing to confirm swim by swim")
+            todo = [r for r in sec["rows"] if r["opts"] and not r.get("auto") and not (r.get("pick") and not r.get("stale"))
+                    and not (r.get("stale") and r.get("pick") != r["default"])]   # a changed pick stays for a person
+            now, changed = time.time(), []
+            with self.lock:
+                lines = ev_state().setdefault("lines", {})
+                for r in todo:
+                    value = {"tp": r["tp"], "pb": r["pb"], "sw": r["med"]}[r["default"]]
+                    lines["%s.%s" % (r["h"], r["l"])] = {
+                        "pick": r["default"], "reason": "", "value": value, "by": who, "at": now, "all": True,
+                        "snap": "%s|%s|%s|%s" % (r["tp"], r["pb"], r["med"], sec["key"])}
+                    changed.append((r, value if _hund(value) != _hund(r["final"]) else ""))
+                self.save()
+            for r, value in changed:   # a time that differs from the audit's goes into the fixes; else none is kept
+                self._confirm_fix(n, e, int(r["h"]), int(r["l"]), who, time=value, reason="")
+            changed = [(r, v) for r, v in changed if v]
+            self.log("Session %d event %d: %s: %d swim%s confirmed with the suggested value (Confirm all)%s" % (
+                n, e, sec["title"], len(todo), "" if len(todo) == 1 else "s",
+                "; the final time changes for %s" % ", ".join("heat %s lane %s" % (r["h"], r["l"]) for r, _ in changed)
+                if changed else ""))
+            return {"confirmed": len(todo), "changed": len(changed)}
         if kind == "line":
             row = next((r for s in c["sections"] for r in s["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
             sec = next((s for s in c["sections"] for r in s["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
@@ -6468,7 +6496,11 @@ function cfDeltas(r){const tp=hund(r.tp),pb=hund(r.pb),sw=hund(r.med);
  const d=(a,b)=>{if(a==null||b==null)return '<td class="t"><span class="no">–</span></td>';const x=a-b;
   return `<td class="t${Math.abs(x)>30?' cfbig':''}">${x>0?'+':x<0?'−':''}${(Math.abs(x)/100).toFixed(2)}</td>`};
  return d(tp,pb)+d(tp,sw)+d(pb,sw)}
-function cfHead(opts){return `<tr><th>Lane</th><th>Heat</th><th>Swimmer</th><th>TP</th><th>PB</th><th>SW median</th><th>SW1</th><th>SW2</th><th>SW3</th><th title="TP − PB">ΔTP/PB</th><th title="TP − SW median">ΔTP/SW</th><th title="PB − SW median">ΔPB/SW</th>${opts?'<th>Confirm</th>':''}</tr>`}
+// the swims Confirm all would confirm: not confirmed yet (a changed pick whose times changed stays for a person)
+function cfTodo(sec){return sec.rows.filter(r=>(r.opts||[]).length&&!r.auto&&!(r.pick&&!r.stale)&&!(r.stale&&r.pick!==r.default))}
+function cfAllBtn(s,e,c,sec){const todo=cfTodo(sec),lock=!c.ready;
+ return `<button type="button" class="sm primary" data-cfall="${esc(s.n+'|'+e.event+'|'+sec.key)}"${lock||!todo.length?' disabled':''} title="${esc(lock?'Tick off the Quick OCR fixes first':!todo.length?'Every swim is confirmed':'Confirm the '+todo.length+' swim'+(todo.length===1?'':'s')+' not confirmed yet with the suggested value')}">Confirm all${todo.length?' ('+todo.length+')':''}</button>`}
+function cfHead(opts,all){return `<tr><th>Lane</th><th>Heat</th><th>Swimmer</th><th>TP</th><th>PB</th><th>SW median</th><th>SW1</th><th>SW2</th><th>SW3</th><th title="TP − PB">ΔTP/PB</th><th title="TP − SW median">ΔTP/SW</th><th title="PB − SW median">ΔPB/SW</th>${opts?`<th>${all||'Confirm'}</th>`:''}</tr>`}
 function cfSection(s,e,c,sec){
  const key='S'+s.n+':e'+e.event+':cf:'+sec.key,t=GALA.ticks[key],lock=!c.ready;
  const state=!sec.count?'<span class="meta">nothing to confirm</span>':sec.done?`<span class="ok">confirmed ✓</span> <span class="sm">${esc(t?t.by+' · '+agoShort(t.at):'')}</span>`
@@ -6476,7 +6508,7 @@ function cfSection(s,e,c,sec){
  const box=sec.count?`<input type="checkbox" data-tick="${esc(key)}"${t?' checked':''}${lock||(!sec.can&&!t)?' disabled':''} aria-label="Confirm ${esc(sec.title)}" title="${esc(lock?'Tick off the Quick OCR fixes first':!sec.can?'Confirm every swim in it first':t?'Ticked by '+t.by:'Tick when checked')}">`:'<input type="checkbox" disabled>';
  const shown=sec.show&&sec.options.length?` · <b>${esc(PICK_TXT[sec.show])}</b> is selected for every swim; pick another for a swim, with a reason`:sec.show?` · <b>${esc(PICK_TXT[sec.show])}</b> highlighted`:sec.options.length?` · pick ${sec.options.map(o=>PICK_TXT[o]).join(', ')}; a reason for anything but ${esc(PICK_TXT[sec.options[0]])}`:'';
  const body=sec.count?`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&sec.options.length>0&&!sec.show&&!sec.done)?' open':''}><summary class="sm">${sec.count} swim${sec.count===1?'':'s'}, by lane</summary>
-  <div class="tblwrap"><table class="cfrows">${cfHead(sec.options.length)}${sec.rows.map(r=>cfRow(s,e,sec,r)).join('')}</table></div></details>`:'';
+  <div class="tblwrap"><table class="cfrows">${cfHead(sec.options.length,cfAllBtn(s,e,c,sec))}${sec.rows.map(r=>cfRow(s,e,sec,r)).join('')}</table></div></details>`:'';
  return `<div class="cfsec${sec.done&&sec.count?' done':''}"><div class="cfh">${box}<div><b>${esc(sec.title)}</b> <span class="cfn">${sec.count}</span> ${state}<div class="sm meta">${esc(sec.what)}${shown}</div></div></div>${body}</div>`}
 function cfDqs(s,e,c){
  const d=c.dq,key='S'+s.n+':e'+e.event+':cf:dq',t=GALA.ticks[key],lock=!c.ready;
@@ -6560,6 +6592,25 @@ document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.cffix')
  const pick=([...fm.elements].find(x=>x.name==='pick'&&x.checked)||{}).value||fm.dataset.default,reason=((fm.querySelector('input[name=reason]')||{}).value||'').trim(),msg=fm.querySelector('[data-cfmsg]');
  if(pick!==fm.dataset.default&&!reason){msg.textContent='Give a reason for '+PICK_TXT[pick]+' (not '+PICK_TXT[fm.dataset.default]+')';fm.querySelector('input[name=reason]').focus();return}
  cfSend(fm,{kind:'line',pick,reason})});
+document.addEventListener('click',async ev=>{const b=ev.target.closest('[data-cfall]');if(!b)return;
+ const [n,event,key]=b.dataset.cfall.split('|'),s=(GALA.sessions||[]).find(x=>x.n===+n),e=s&&s.events.find(x=>x.event===+event);
+ const sec=e&&e.confirm&&e.confirm.sections.find(x=>x.key===key);if(!sec)return;
+ const todo=cfTodo(sec),vals=r=>({tp:r.tp,pb:r.pb,sw:r.med}),sug=[...new Set(todo.map(r=>PICK_TXT[r.default]))].join(' or ');
+ const moves=todo.filter(r=>r.final&&hund(vals(r)[r.default])!==hund(r.final)).length;
+ const left=sec.rows.filter(r=>r.stale&&r.pick&&r.pick!==r.default).length;
+ if(!todo.length)return;
+ const o={title:`Confirm all in ${sec.title}?`,
+  text:`Event ${event}: the ${todo.length} swim${todo.length===1?'':'s'} not confirmed yet ${todo.length===1?'is':'are'} confirmed with the suggested value (${sug}).`
+   +(moves?` For ${moves} of them that isn't the audit's time, so the final time changes.`:'')
+   +' Swims already confirmed keep their value.'+(left?` ${left} swim${left===1?'':'s'} whose times changed since another value was picked ${left===1?'is':'are'} left for you to confirm.`:''),
+  check:left?'':'Tick the section as confirmed too',checked:true,ok:'Confirm all',cancel:'Cancel'};
+ if(!await galaDialog(o))return;
+ b.disabled=true;
+ try{await galaPost('/api/gala/confirm',{session:+n,event:+event,kind:'all',key});
+  if(o.checked&&!left)await galaPost('/api/gala/tick',{key:'S'+n+':e'+event+':cf:'+key,checked:true});
+  galaNotice(`${sec.title}: ${todo.length} swim${todo.length===1?'':'s'} confirmed`,'ok')}
+ catch(err){galaNotice(err.message,'error')}
+ galaSig='';loadGala()});
 document.addEventListener('click',ev=>{const b=ev.target.closest('[data-cfne]');if(!b)return;
  const fm=b.closest('form.cfne'),act=b.dataset.cfne,msg=fm.querySelector('[data-cfmsg]'),reason=((fm.querySelector('[name=reason]')||{}).value||'').trim();
  if(act==='undo'){cfSend(fm,{kind:'entry',action:''});return}

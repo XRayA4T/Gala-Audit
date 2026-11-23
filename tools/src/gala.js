@@ -503,7 +503,11 @@ function cfDeltas(r){const tp=hund(r.tp),pb=hund(r.pb),sw=hund(r.med);
  const d=(a,b)=>{if(a==null||b==null)return '<td class="t"><span class="no">–</span></td>';const x=a-b;
   return `<td class="t${Math.abs(x)>30?' cfbig':''}">${x>0?'+':x<0?'−':''}${(Math.abs(x)/100).toFixed(2)}</td>`};
  return d(tp,pb)+d(tp,sw)+d(pb,sw)}
-function cfHead(opts){return `<tr><th>Lane</th><th>Heat</th><th>Swimmer</th><th>TP</th><th>PB</th><th>SW median</th><th>SW1</th><th>SW2</th><th>SW3</th><th title="TP − PB">ΔTP/PB</th><th title="TP − SW median">ΔTP/SW</th><th title="PB − SW median">ΔPB/SW</th>${opts?'<th>Confirm</th>':''}</tr>`}
+// the swims Confirm all would confirm: not confirmed yet (a changed pick whose times changed stays for a person)
+function cfTodo(sec){return sec.rows.filter(r=>(r.opts||[]).length&&!r.auto&&!(r.pick&&!r.stale)&&!(r.stale&&r.pick!==r.default))}
+function cfAllBtn(s,e,c,sec){const todo=cfTodo(sec),lock=!c.ready;
+ return `<button type="button" class="sm primary" data-cfall="${esc(s.n+'|'+e.event+'|'+sec.key)}"${lock||!todo.length?' disabled':''} title="${esc(lock?'Tick off the Quick OCR fixes first':!todo.length?'Every swim is confirmed':'Confirm the '+todo.length+' swim'+(todo.length===1?'':'s')+' not confirmed yet with the suggested value')}">Confirm all${todo.length?' ('+todo.length+')':''}</button>`}
+function cfHead(opts,all){return `<tr><th>Lane</th><th>Heat</th><th>Swimmer</th><th>TP</th><th>PB</th><th>SW median</th><th>SW1</th><th>SW2</th><th>SW3</th><th title="TP − PB">ΔTP/PB</th><th title="TP − SW median">ΔTP/SW</th><th title="PB − SW median">ΔPB/SW</th>${opts?`<th>${all||'Confirm'}</th>`:''}</tr>`}
 function cfSection(s,e,c,sec){
  const key='S'+s.n+':e'+e.event+':cf:'+sec.key,t=GALA.ticks[key],lock=!c.ready;
  const state=!sec.count?'<span class="meta">nothing to confirm</span>':sec.done?`<span class="ok">confirmed ✓</span> <span class="sm">${esc(t?t.by+' · '+agoShort(t.at):'')}</span>`
@@ -511,7 +515,7 @@ function cfSection(s,e,c,sec){
  const box=sec.count?`<input type="checkbox" data-tick="${esc(key)}"${t?' checked':''}${lock||(!sec.can&&!t)?' disabled':''} aria-label="Confirm ${esc(sec.title)}" title="${esc(lock?'Tick off the Quick OCR fixes first':!sec.can?'Confirm every swim in it first':t?'Ticked by '+t.by:'Tick when checked')}">`:'<input type="checkbox" disabled>';
  const shown=sec.show&&sec.options.length?` · <b>${esc(PICK_TXT[sec.show])}</b> is selected for every swim; pick another for a swim, with a reason`:sec.show?` · <b>${esc(PICK_TXT[sec.show])}</b> highlighted`:sec.options.length?` · pick ${sec.options.map(o=>PICK_TXT[o]).join(', ')}; a reason for anything but ${esc(PICK_TXT[sec.options[0]])}`:'';
  const body=sec.count?`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&sec.options.length>0&&!sec.show&&!sec.done)?' open':''}><summary class="sm">${sec.count} swim${sec.count===1?'':'s'}, by lane</summary>
-  <div class="tblwrap"><table class="cfrows">${cfHead(sec.options.length)}${sec.rows.map(r=>cfRow(s,e,sec,r)).join('')}</table></div></details>`:'';
+  <div class="tblwrap"><table class="cfrows">${cfHead(sec.options.length,cfAllBtn(s,e,c,sec))}${sec.rows.map(r=>cfRow(s,e,sec,r)).join('')}</table></div></details>`:'';
  return `<div class="cfsec${sec.done&&sec.count?' done':''}"><div class="cfh">${box}<div><b>${esc(sec.title)}</b> <span class="cfn">${sec.count}</span> ${state}<div class="sm meta">${esc(sec.what)}${shown}</div></div></div>${body}</div>`}
 function cfDqs(s,e,c){
  const d=c.dq,key='S'+s.n+':e'+e.event+':cf:dq',t=GALA.ticks[key],lock=!c.ready;
@@ -595,6 +599,25 @@ document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.cffix')
  const pick=([...fm.elements].find(x=>x.name==='pick'&&x.checked)||{}).value||fm.dataset.default,reason=((fm.querySelector('input[name=reason]')||{}).value||'').trim(),msg=fm.querySelector('[data-cfmsg]');
  if(pick!==fm.dataset.default&&!reason){msg.textContent='Give a reason for '+PICK_TXT[pick]+' (not '+PICK_TXT[fm.dataset.default]+')';fm.querySelector('input[name=reason]').focus();return}
  cfSend(fm,{kind:'line',pick,reason})});
+document.addEventListener('click',async ev=>{const b=ev.target.closest('[data-cfall]');if(!b)return;
+ const [n,event,key]=b.dataset.cfall.split('|'),s=(GALA.sessions||[]).find(x=>x.n===+n),e=s&&s.events.find(x=>x.event===+event);
+ const sec=e&&e.confirm&&e.confirm.sections.find(x=>x.key===key);if(!sec)return;
+ const todo=cfTodo(sec),vals=r=>({tp:r.tp,pb:r.pb,sw:r.med}),sug=[...new Set(todo.map(r=>PICK_TXT[r.default]))].join(' or ');
+ const moves=todo.filter(r=>r.final&&hund(vals(r)[r.default])!==hund(r.final)).length;
+ const left=sec.rows.filter(r=>r.stale&&r.pick&&r.pick!==r.default).length;
+ if(!todo.length)return;
+ const o={title:`Confirm all in ${sec.title}?`,
+  text:`Event ${event}: the ${todo.length} swim${todo.length===1?'':'s'} not confirmed yet ${todo.length===1?'is':'are'} confirmed with the suggested value (${sug}).`
+   +(moves?` For ${moves} of them that isn't the audit's time, so the final time changes.`:'')
+   +' Swims already confirmed keep their value.'+(left?` ${left} swim${left===1?'':'s'} whose times changed since another value was picked ${left===1?'is':'are'} left for you to confirm.`:''),
+  check:left?'':'Tick the section as confirmed too',checked:true,ok:'Confirm all',cancel:'Cancel'};
+ if(!await galaDialog(o))return;
+ b.disabled=true;
+ try{await galaPost('/api/gala/confirm',{session:+n,event:+event,kind:'all',key});
+  if(o.checked&&!left)await galaPost('/api/gala/tick',{key:'S'+n+':e'+event+':cf:'+key,checked:true});
+  galaNotice(`${sec.title}: ${todo.length} swim${todo.length===1?'':'s'} confirmed`,'ok')}
+ catch(err){galaNotice(err.message,'error')}
+ galaSig='';loadGala()});
 document.addEventListener('click',ev=>{const b=ev.target.closest('[data-cfne]');if(!b)return;
  const fm=b.closest('form.cfne'),act=b.dataset.cfne,msg=fm.querySelector('[data-cfmsg]'),reason=((fm.querySelector('[name=reason]')||{}).value||'').trim();
  if(act==='undo'){cfSend(fm,{kind:'entry',action:''});return}

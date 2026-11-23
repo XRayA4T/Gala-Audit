@@ -153,7 +153,10 @@ CONFIRM_SECTIONS = [
     ("allmatch", "All Match", "TP, PB and the SW median agree within 0.30 s: TP", ["tp", "sw", "pb"], "tp"),
     ("nopb", "All Match NO PB", "No PB; TP and the SW median agree within 0.30 s: TP", ["tp", "sw"], "tp"),
     ("notp", "All Match NO TP", "No TP; PB and the SW median agree within 0.30 s: the SW median", [], "sw"),
-    ("notppb", "SW Median - No TP or BP", "No TP and no PB: the SW median", [], "sw"),
+    ("notppb", "SW Median - No TP or BP - all SW within 0.3s", "No TP and no PB; the SW times all within 0.30 s of each "
+               "other: the SW median", [], "sw"),
+    ("notppbx", "SW Median - No TP or BP - not all SW within 0.3s", "No TP and no PB; the SW times more than 0.30 s apart, "
+                "or only one: the SW median", [], "sw"),
     ("overlap", "Overlap", "Two of the three pairs (TP-PB, TP-SW median, PB-SW median) agree within 0.30 s, the third "
                 "doesn't", ["tp", "sw", "pb"], None),
     ("badtp", "Bad TP - Rest Match", "PB and the SW median agree within 0.30 s, TP doesn't", ["sw", "tp", "pb"], None),
@@ -173,8 +176,8 @@ def _hund(t):
     return (int(m.group(1) or 0) * 60 + int(m.group(2))) * 100 + int(m.group(3)) if m else None
 
 
-def confirm_category(tp, pb, med, tol=CONFIRM_TOL):
-    """The confirmation section of a swim from its TP, PB and SW median (hundredths or None)."""
+def confirm_category(tp, pb, med, tol=CONFIRM_TOL, sw=None):
+    """The confirmation section of a swim from its TP, PB and SW median (hundredths or None), and its SW times."""
     ok = lambda a, b: a is not None and b is not None and abs(a - b) <= tol  # noqa: E731
     if tp is not None and pb is not None and med is not None:
         pairs = ok(tp, pb) + ok(tp, med) + ok(pb, med)
@@ -184,8 +187,9 @@ def confirm_category(tp, pb, med, tol=CONFIRM_TOL):
         return "nopb" if ok(tp, med) else "nomatch"
     if pb is not None and med is not None:
         return "notp" if ok(pb, med) else "notpmis"
-    if med is not None:
-        return "notppb"
+    if med is not None:   # the SW median alone: do the watches all agree (within the tolerance of each other)?
+        sw = [x for x in sw or [] if x is not None]
+        return "notppb" if len(sw) >= 2 and max(sw) - min(sw) <= tol else "notppbx"
     if tp is not None or pb is not None:   # TP and/or PB with no SW times
         return "nomatch"
     return None
@@ -2863,7 +2867,7 @@ class Gala:
             if r.get("ns") or "%s.%s" % (r.get("heat"), r.get("lane")) in no_swim:   # a no-show, or marked as no swim
                 continue
             tp, pb, med = _hund(r.get("tp")), _hund(r.get("pb")), _hund(r.get("median"))
-            cat = confirm_category(tp, pb, med)
+            cat = confirm_category(tp, pb, med, sw=[_hund(w.get("time")) for w in r.get("sw") or []])
             if not cat:
                 continue
             k = "%s.%s" % (r.get("heat"), r.get("lane"))
@@ -2883,7 +2887,7 @@ class Gala:
                    "opts": opts, "default": default}
             if opts and ln:
                 row.update(pick=ln.get("pick"), reason=ln.get("reason") or "", by=ln.get("by"), at=ln.get("at"),
-                           stale=ln.get("snap") != snap)
+                           stale=ln.get("snap") != snap, all=bool(ln.get("all")))
             elif opts and cat in AUTO_CONFIRM:   # confirmed with the default until another pick is made
                 row.update(pick=default, auto=True)
             by_sec[cat].append(row)
@@ -3077,6 +3081,30 @@ class Gala:
         reason = re.sub(r"\s+", " ", str(d.get("reason") or "")).strip()[:300]
         who = str(who or "someone")[:60]
         ev_state = lambda: self.state.setdefault("confirm", {}).setdefault("S%d:e%d" % (n, e), {})  # noqa: E731
+        if kind == "all":   # Confirm all: every swim in a section not confirmed yet, with its suggested value
+            sec = next((s for s in c["sections"] if s["key"] == str(d.get("key") or "")), None)
+            if not sec or not sec["options"]:
+                raise ValueError("that section has nothing to confirm swim by swim")
+            todo = [r for r in sec["rows"] if r["opts"] and not r.get("auto") and not (r.get("pick") and not r.get("stale"))
+                    and not (r.get("stale") and r.get("pick") != r["default"])]   # a changed pick stays for a person
+            now, changed = time.time(), []
+            with self.lock:
+                lines = ev_state().setdefault("lines", {})
+                for r in todo:
+                    value = {"tp": r["tp"], "pb": r["pb"], "sw": r["med"]}[r["default"]]
+                    lines["%s.%s" % (r["h"], r["l"])] = {
+                        "pick": r["default"], "reason": "", "value": value, "by": who, "at": now, "all": True,
+                        "snap": "%s|%s|%s|%s" % (r["tp"], r["pb"], r["med"], sec["key"])}
+                    changed.append((r, value if _hund(value) != _hund(r["final"]) else ""))
+                self.save()
+            for r, value in changed:   # a time that differs from the audit's goes into the fixes; else none is kept
+                self._confirm_fix(n, e, int(r["h"]), int(r["l"]), who, time=value, reason="")
+            changed = [(r, v) for r, v in changed if v]
+            self.log("Session %d event %d: %s: %d swim%s confirmed with the suggested value (Confirm all)%s" % (
+                n, e, sec["title"], len(todo), "" if len(todo) == 1 else "s",
+                "; the final time changes for %s" % ", ".join("heat %s lane %s" % (r["h"], r["l"]) for r, _ in changed)
+                if changed else ""))
+            return {"confirmed": len(todo), "changed": len(changed)}
         if kind == "line":
             row = next((r for s in c["sections"] for r in s["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
             sec = next((s for s in c["sections"] for r in s["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
