@@ -1277,9 +1277,11 @@ class Gala:
                 fixes = self._cached("qf", os.path.join(self.sdir(n, "reports"), qf_file["name"]), _read_fixes)
                 tf = os.path.join(self.sdir(n, "reports"), "Event %02d times.json" % e)
                 tmap = self._cached("times", tf, _read_times) if os.path.exists(tf) else None
+                # Only what is flagged now: a check the re-check or a regenerate settled (or that is no longer a Quick
+                # OCR fix) leaves the list, ticked or not. The history is still kept in state.json.
                 fixes = [dict(f, row=self.sheet_row(n, e, f["heat"], f["lane"], ocr),
                               times=(tmap or {}).get("%s.%s" % (f["heat"], f["lane"])) or f.get("times"))
-                         for f in self.qf_history(n, e, fixes or [])]
+                         for f in self.qf_history(n, e, fixes or []) if not f.get("cleared")]
                 # Times for every swim (TP, PB...) come from a check run by the portal: run one if there are none yet.
                 if tmap is None and fixes and (n, e) not in self.rechecks and self.plugin_script("audit_report.py") \
                         and lanes_done.get(e):

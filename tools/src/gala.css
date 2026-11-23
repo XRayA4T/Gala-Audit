@@ -181,3 +181,4 @@ table.cfrows td.cfact{min-width:220px}
 table.cfrows td.cfact input[name=reason]{max-width:16em}
 ul.cff{margin:0;padding-left:16px}
 .cfchg{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:4px}
+table.cfrows td.cfbig{color:#b45309;background:rgba(180,83,9,.12);font-weight:700}

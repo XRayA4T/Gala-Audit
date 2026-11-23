@@ -491,14 +491,19 @@ function cfRow(s,e,sec,r){
   const cls=o===picked?'cfpick':(!picked&&o===r.default&&opts.length?'cfsug':'');
   return opts.includes(o)?`<td class="t ${cls}"><label><input type="radio" form="${fid}" name="pick" value="${o}"${o===sel?' checked':''}${r.pick&&!r.stale&&!r.auto?' disabled':''}> ${esc(v)}</label></td>`:`<td class="t ${cls}">${esc(v)}</td>`};
  const lead=`<td>${esc(r.l)}</td><td>${esc(r.h)}</td><td>${esc(r.name||'–')}${r.dq?' <span class="sm gwarn">DQ</span>':''}${r.doubt?' <span class="sm" title="The audit kept TP: the watches don\'t agree with each other">in doubt</span>':''}</td>`;
- const times=cell('tp')+cell('pb')+cell('sw')+cfSwCells(r);
+ const times=cell('tp')+cell('pb')+cell('sw')+cfSwCells(r)+cfDeltas(r);
  if(!opts.length)return `<tr>${lead}${times}</tr>`;
  const shownV=vals[picked||sel]||'',audit=r.final&&hund(r.final)!==hund(shownV)?`<div class="sm">audit: ${esc(r.final)}</div>`:'';
  const act=r.auto?`<span class="sm meta">${esc(PICK_TXT[r.default])} (default)</span> <span data-cfother hidden><input name="reason" value="" placeholder="reason (not ${esc(PICK_TXT[r.default])})" size="18"> <button type="submit" class="primary">Confirm</button></span><div class="sm" data-cfmsg></div>`
   :r.pick&&!r.stale?`<span class="ok">✓ ${esc(PICK_TXT[r.pick])}</span>${r.reason?` <span class="sm">· ${esc(r.reason)}</span>`:''}<div class="sm">${esc(r.by||'')} · ${esc(agoShort(r.at))} <button type="button" class="sm" data-cfundo>Change</button></div>`
   :`<input name="reason" value="${esc(r.reason||'')}" placeholder="reason (not ${esc(PICK_TXT[r.default])})" size="18"${sel===r.default?' hidden':''}> <button type="submit" class="primary">Confirm</button>${r.stale?'<div class="sm gwarn">the times changed since it was confirmed: confirm again</div>':''}<div class="sm" data-cfmsg></div>`;
  return `<tr class="${r.pick&&!r.stale?'done':''}">${lead}${times}<td class="cfact"><form id="${fid}" class="cffix" data-cf="${esc(k)}" data-default="${esc(r.default)}" autocomplete="off">${audit}${act}</form></td></tr>`}
-function cfHead(opts){return `<tr><th>Lane</th><th>Heat</th><th>Swimmer</th><th>TP</th><th>PB</th><th>SW median</th><th>SW1</th><th>SW2</th><th>SW3</th>${opts?'<th>Confirm</th>':''}</tr>`}
+// ΔTP/PB, ΔTP/SW, ΔPB/SW (SW: the SW median), highlighted when more than the 0.30 s tolerance apart
+function cfDeltas(r){const tp=hund(r.tp),pb=hund(r.pb),sw=hund(r.med);
+ const d=(a,b)=>{if(a==null||b==null)return '<td class="t"><span class="no">–</span></td>';const x=a-b;
+  return `<td class="t${Math.abs(x)>30?' cfbig':''}">${x>0?'+':x<0?'−':''}${(Math.abs(x)/100).toFixed(2)}</td>`};
+ return d(tp,pb)+d(tp,sw)+d(pb,sw)}
+function cfHead(opts){return `<tr><th>Lane</th><th>Heat</th><th>Swimmer</th><th>TP</th><th>PB</th><th>SW median</th><th>SW1</th><th>SW2</th><th>SW3</th><th title="TP − PB">ΔTP/PB</th><th title="TP − SW median">ΔTP/SW</th><th title="PB − SW median">ΔPB/SW</th>${opts?'<th>Confirm</th>':''}</tr>`}
 function cfSection(s,e,c,sec){
  const key='S'+s.n+':e'+e.event+':cf:'+sec.key,t=GALA.ticks[key],lock=!c.ready;
  const state=!sec.count?'<span class="meta">nothing to confirm</span>':sec.done?`<span class="ok">confirmed ✓</span> <span class="sm">${esc(t?t.by+' · '+agoShort(t.at):'')}</span>`
