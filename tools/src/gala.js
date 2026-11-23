@@ -137,7 +137,7 @@ function renderChecklist(){setTimeout(swAll,0);
  const qfKey=(e,f)=>'S'+s.n+':e'+e.event+':qf:'+f.heat+'.'+f.lane;
  const keys=['entries','sessreport','lanesprint',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','resultspdf','final'].map(k=>'S'+s.n+':'+k)
   .concat(s.events.flatMap(e=>(e.fixes||[]).map(f=>qfKey(e,f))))
-  .concat(s.events.flatMap(e=>e.confirm?[...(e.confirm.dq.count?['dq']:[]),...e.confirm.sections.filter(x=>x.count).map(x=>x.key)].map(k=>'S'+s.n+':e'+e.event+':cf:'+k):[]));
+  .concat(s.events.flatMap(e=>e.confirm?[...(e.confirm.dq.count?['dq']:[]),...(e.confirm.checks&&e.confirm.checks.count?['checks']:[]),...(e.confirm.entries&&e.confirm.entries.count?['entries']:[]),...e.confirm.sections.filter(x=>x.count).map(x=>x.key)].map(k=>'S'+s.n+':e'+e.event+':cf:'+k):[]));
  const ticked=keys.filter(k=>GALA.ticks[k]).length,pct=Math.round(100*ticked/keys.length);
  const dq=s.scans.filter(x=>x.kind==='dq'),etd=s.scans.filter(x=>x.kind==='etd');
  const ev=s.events.length?`<div class="tblwrap"><table class="cl-ev"><tr><th></th><th>Event</th><th class="c">Printed</th><th>Lane sheets</th><th class="c">Gen7 heats</th><th class="c">OCR lanes</th><th>Audit</th><th>Merge</th><th class="c">Quick OCR fixes</th><th>Status</th><th></th></tr>`
@@ -526,15 +526,57 @@ function cfDqs(s,e,c){
  const body=d.count?`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&!d.done)?' open':''}><summary class="sm">${d.count} DQ${d.count===1?'':'s'}, by heat then lane</summary>
   <div class="tblwrap"><table class="cfrows"><tr><th>Heat</th><th>Lane</th><th>Swimmer</th><th>Rule</th><th>Code</th><th>Checks</th><th>Confirm or withdraw</th></tr>${rows}</table></div></details>`:'';
  return `<div class="cfsec${d.done&&d.count?' done':''}"><div class="cfh">${box}<div><b>DQs</b> <span class="cfn">${d.count}</span> ${state}<div class="sm meta">Each DQ with its rule and code (the code can be changed): confirm it, or withdraw it with a reason.</div></div></div>${body}</div>`}
+function cfEntries(s,e,c){
+ const d=c.entries;if(!d||!d.count)return '';
+ const key='S'+s.n+':e'+e.event+':cf:entries',t=GALA.ticks[key],lock=!c.ready;
+ const state=d.done?`<span class="ok">confirmed ✓</span> <span class="sm">${esc(t?t.by+' · '+agoShort(t.at):'')}</span>`
+  :d.changed?'<span class="gwarn">changed since it was ticked: check it and tick again</span>':`<span class="${d.decided===d.count?'ok':'gwarn'}">${d.decided} of ${d.count} decided</span>`;
+ const box=`<input type="checkbox" data-tick="${esc(key)}"${t?' checked':''}${lock||(!d.can&&!t)?' disabled':''} aria-label="Confirm the swims not entered" title="${esc(lock?'Tick off the Quick OCR fixes first':!d.can?'Decide every one first':'Tick when checked')}">`;
+ const rows=d.rows.map(r=>{const k=s.n+'|'+e.event+'|'+r.h+'|'+r.l;
+  const dec=r.action==='approve'?`<span class="ok">✓ referee approves</span> <span class="sm">· ${esc(r.reason)}</span>`
+   :r.action==='noswim'?`<span class="gwarn">marked as no swim</span>${r.reason?` <span class="sm">· ${esc(r.reason)}</span>`:''}`:'';
+  const form=r.action?`${dec}<div class="sm">${esc(r.by||'')} · ${esc(agoShort(r.at))} <button type="button" class="sm" data-cfne="undo">Change</button></div>`
+   :`<input name="reason" placeholder="referee's reason (needed to approve)" size="26"> <button type="button" class="primary" data-cfne="approve">Referee approves</button> <button type="button" data-cfne="noswim">Mark as no swim</button>
+    ${r.stale?'<div class="sm gwarn">this changed since it was decided: decide again</div>':''}<div class="sm" data-cfmsg></div>`;
+  return `<tr class="${r.action?'done':''}"><td>${esc(r.h)}</td><td>${esc(r.l)}</td><td>${esc(r.name||'–')}</td><td>${esc(r.text)}</td>
+   <td class="t">${esc(r.tp||'–')}</td><td class="t">${esc(r.pb||'–')}</td><td class="t">${esc(r.med||'–')}</td><td class="t">${esc(r.final||'–')}</td>
+   <td><form class="cfdq cfne" data-cf="${esc(k)}" autocomplete="off">${form}</form></td></tr>`}).join('');
+ const body=`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&!d.done)?' open':''}><summary class="sm">${d.count} swim${d.count===1?'':'s'}, by heat then lane</summary>
+  <div class="tblwrap"><table class="cfrows"><tr><th>Heat</th><th>Lane</th><th>Swimmer</th><th>Why</th><th>TP</th><th>PB</th><th>SW median</th><th>Audit</th><th>Referee</th></tr>${rows}</table></div></details>`;
+ return `<div class="cfsec${d.done?' done':''}"><div class="cfh">${box}<div><b>Swims not entered</b> <span class="cfn">${d.count}</span> ${state}<div class="sm meta">A swimmer who swam a race they aren't entered in, including an entry scratched in Meet Manager: the referee approves it (with a reason), or it is marked as no swim (no result).</div></div></div>${body}</div>`}
+function cfChecks(s,e,c){
+ const d=c.checks;if(!d||!d.count)return '';
+ const key='S'+s.n+':e'+e.event+':cf:checks',t=GALA.ticks[key],lock=!c.ready;
+ const state=d.done?`<span class="ok">confirmed ✓</span> <span class="sm">${esc(t?t.by+' · '+agoShort(t.at):'')}</span>`
+  :d.changed?'<span class="gwarn">changed since it was ticked: check it and tick again</span>':`<span class="${d.decided===d.count?'ok':'gwarn'}">${d.decided} of ${d.count} decided</span>`;
+ const box=`<input type="checkbox" data-tick="${esc(key)}"${t?' checked':''}${lock||(!d.can&&!t)?' disabled':''} aria-label="Confirm the other checks" title="${esc(lock?'Tick off the Quick OCR fixes first':!d.can?'Decide every one first':'Tick when checked')}">`;
+ const ST={OK:'swam',NS:'no-show',DQ:'DQ'};
+ const rows=d.rows.map(r=>{const k=s.n+'|'+e.event+'|'+r.h+'|'+r.l;
+  const scans=(r.scans||[]).map(sc=>{const rel='sessions/S'+s.n+'/scans/'+sc.scan;return `<a class="sm" href="${esc(galaHref(rel))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`}).join(' ');
+  const dec=r.action==='keep'?`<span class="ok">✓ kept as it is</span>${r.reason?` <span class="sm">· ${esc(r.reason)}</span>`:''}`
+   :r.action==='change'?`<span class="gwarn">changed to ${esc(ST[r.status]||r.status)}${r.status==='DQ'?' '+esc(r.code):''}${r.time?' '+esc(r.time):''}</span> <span class="sm">· ${esc(r.reason)}</span>`:'';
+  const form=r.action?`${dec}<div class="sm">${esc(r.by||'')} · ${esc(agoShort(r.at))} <button type="button" class="sm" data-cfck="undo">Change</button></div>`
+   :`<button type="button" class="primary" data-cfck="keep">Keep as it is</button>
+    <div class="cfchg"><select name="status" aria-label="Result"><option value="">change the result to…</option><option value="OK">swam</option><option value="NS">no-show</option><option value="DQ">DQ</option></select>
+    <input name="time" placeholder="m:ss.hh" size="8" aria-label="Time"> <input name="code" list="dqcodes" placeholder="code" size="5" aria-label="DQ code">
+    <input name="reason" placeholder="reason (needed to change)" size="22"> <button type="button" data-cfck="change">Change</button></div>
+    ${r.stale?'<div class="sm gwarn">the checks changed since it was decided: decide again</div>':''}<div class="sm" data-cfmsg></div>`;
+  return `<tr class="${r.action?'done':''}"><td>${esc(r.h)}</td><td>${esc(r.l)}</td><td>${esc(r.name||'–')}</td>
+   <td><ul class="sm cff">${r.checks.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>${scans}</td>
+   <td class="t">${esc(r.inFile||'–')}</td><td class="t">${esc(r.tp||'–')}</td><td class="t">${esc(r.pb||'–')}</td><td class="t">${esc(r.med||'–')}</td>
+   <td><form class="cfdq cfck" data-cf="${esc(k)}" autocomplete="off">${form}</form></td></tr>`}).join('');
+ const body=`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&!d.done)?' open':''}><summary class="sm">${d.count} swim${d.count===1?'':'s'}, by heat then lane</summary>
+  <div class="tblwrap"><table class="cfrows"><tr><th>Heat</th><th>Lane</th><th>Swimmer</th><th>Check</th><th>Merge file</th><th>TP</th><th>PB</th><th>SW median</th><th>Keep or change</th></tr>${rows}</table></div></details>`;
+ return `<div class="cfsec${d.done?' done':''}"><div class="cfh">${box}<div><b>Other checks</b> <span class="cfn">${d.count}</span> ${state}<div class="sm meta">What isn't about reading the paperwork: several Gen7 races for a heat, the lane sheet and Gen7 disagreeing on whether a lane swam. Keep each result as it is, or change it with a reason.</div></div></div>${body}</div>`}
 function cfRows(s,e){
  const c=e.confirm;if(!c)return '';
- const secs=c.sections.filter(x=>x.key!=='nomatch'||x.count),need=secs.filter(x=>x.count).length+(c.dq.count?1:0);
- const done=secs.filter(x=>x.count&&x.done).length+(c.dq.count&&c.dq.done?1:0),key='S'+s.n+':e'+e.event+':cf';
+ const ck=c.checks||{count:0},ne=c.entries||{count:0},secs=c.sections.filter(x=>x.key!=='nomatch'||x.count),need=secs.filter(x=>x.count).length+(c.dq.count?1:0)+(ck.count?1:0)+(ne.count?1:0);
+ const done=secs.filter(x=>x.count&&x.done).length+(c.dq.count&&c.dq.done?1:0)+(ck.count&&ck.done?1:0)+(ne.count&&ne.done?1:0),key='S'+s.n+':e'+e.event+':cf';
  const head=c.complete?`<span class="ok">all confirmed ✓</span>${e.status==='audited'?' · the merge results and audit are written':' · the merge results and audit are being written'}`
   :!c.ready?'<span class="gwarn">tick off the Quick OCR fixes first</span>':`<span class="gwarn">${done} of ${need} confirmed</span> · the merge results and audit are written once all are`;
  return `<tr class="qfrow cfrow"><td></td><td colspan="10"><details data-cfd="${esc(key)}"${cfOpen(key,c.ready&&!c.complete)?' open':''}><summary>Confirmations for event ${e.event} · ${head}</summary>
   ${c.watchrule?'<div class="sm meta">This session\'s results were published with the rule before gala-ocr 1.6.13: where TP and PB agree but the SW median doesn\'t, the SW median was used. Those swims are set to SW median (“Glitch - used SW Median as it was better”).</div>':''}
-  <div class="cfwrap${c.ready?'':' locked'}">${cfDqs(s,e,c)}${secs.map(x=>cfSection(s,e,c,x)).join('')}</div></details></td></tr>`}
+  <div class="cfwrap${c.ready?'':' locked'}">${cfDqs(s,e,c)}${cfEntries(s,e,c)}${cfChecks(s,e,c)}${secs.map(x=>cfSection(s,e,c,x)).join('')}</div></details></td></tr>`}
 function cfForm(el){const f=el&&(el.form||(el.closest&&el.closest('form')));return f&&f.matches('form.cffix,form.cfdq')?f:null}
 document.addEventListener('change',ev=>{const fm=cfForm(ev.target);if(!fm||!fm.matches('.cffix'))return;fm.dataset.dirty='1';
  if(ev.target.name==='pick'){const o=fm.querySelector('[data-cfother]');if(o)o.hidden=ev.target.value===fm.dataset.default;
@@ -548,6 +590,21 @@ document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.cffix')
  const pick=([...fm.elements].find(x=>x.name==='pick'&&x.checked)||{}).value||fm.dataset.default,reason=((fm.querySelector('input[name=reason]')||{}).value||'').trim(),msg=fm.querySelector('[data-cfmsg]');
  if(pick!==fm.dataset.default&&!reason){msg.textContent='Give a reason for '+PICK_TXT[pick]+' (not '+PICK_TXT[fm.dataset.default]+')';fm.querySelector('input[name=reason]').focus();return}
  cfSend(fm,{kind:'line',pick,reason})});
+document.addEventListener('click',ev=>{const b=ev.target.closest('[data-cfne]');if(!b)return;
+ const fm=b.closest('form.cfne'),act=b.dataset.cfne,msg=fm.querySelector('[data-cfmsg]'),reason=((fm.querySelector('[name=reason]')||{}).value||'').trim();
+ if(act==='undo'){cfSend(fm,{kind:'entry',action:''});return}
+ if(act==='approve'&&!reason){msg.textContent='Give the referee\'s reason for approving it';fm.querySelector('[name=reason]').focus();return}
+ cfSend(fm,{kind:'entry',action:act,reason})});
+document.addEventListener('click',ev=>{const b=ev.target.closest('[data-cfck]');if(!b)return;
+ const fm=b.closest('form.cfck'),act=b.dataset.cfck,msg=fm.querySelector('[data-cfmsg]'),v=n=>((fm.querySelector('[name='+n+']')||{}).value||'').trim();
+ if(act==='undo'){cfSend(fm,{kind:'check',action:''});return}
+ if(act==='keep'){cfSend(fm,{kind:'check',action:'keep',reason:v('reason')});return}
+ const status=v('status'),time=v('time'),code=v('code'),reason=v('reason');
+ if(!status){msg.textContent='Pick the result: swam, no-show or DQ';return}
+ if(status==='OK'&&!/^(\d{1,2}:)?\d{1,2}\.\d{2}$/.test(time)){msg.textContent='A swim needs its time, like 1:05.32';return}
+ if(status==='DQ'&&!code){msg.textContent='A DQ needs its code';return}
+ if(!reason){msg.textContent='Give the reason the result is changed';return}
+ cfSend(fm,{kind:'check',action:'change',status,time,code,reason})});
 document.addEventListener('click',ev=>{
  const u=ev.target.closest('[data-cfundo]');if(u){cfSend(u.closest('form.cffix'),{kind:'line',pick:''});return}
  const b=ev.target.closest('[data-cfdq]');if(!b)return;const fm=b.closest('form.cfdq'),act=b.dataset.cfdq,msg=fm.querySelector('[data-cfmsg]');

@@ -2454,7 +2454,8 @@ class Gala:
                 ent = self._entries_hy3(n, tmp)
                 tpl = "-"   # entries export only: an empty merge results export is no longer used
                 mfile = os.path.join(out_dir, "Event %02d merge results %s.hy3" % (e, time.strftime("%Y-%m-%d_%H%M")))
-                ok, out = self._run_script([merge, ocr, gen7, ent, tpl, mfile, "--events", str(e)] + self._script_opts(n))
+                ok, out = self._run_script([merge, ocr, gen7, ent, tpl, mfile, "--events", str(e), "--not-entered",
+                                            os.path.join(rep, "Event %02d not entered.json" % e)] + self._script_opts(n))
                 if not ok:
                     return False, "event %d merge results: %s" % (e, out.splitlines()[-1] if out else "failed")
                 if final:
@@ -2476,7 +2477,8 @@ class Gala:
                    "--scans", scans if final else tmp,
                    "--quick-fixes", os.path.join(rep, "Event %02d quick fixes.html" % e),
                    "--times", os.path.join(rep, "Event %02d times.json" % e),
-                   "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes"] + (["--merge", mfile] if mfile else [])
+                   "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes",
+                   "--checks", os.path.join(rep, "Event %02d checks.json" % e)] + (["--merge", mfile] if mfile else [])
             ok, out = self._run_script(cmd + self._script_opts(n))
             if not ok:
                 return False, "event %d audit: %s" % (e, out.splitlines()[-1] if out else "failed")
@@ -2612,15 +2614,18 @@ class Gala:
         put them in Quick Fix, "Several Gen7 races ..."): ask on the board which race each one is, once per set of
         heats and races. The question is gala-claude's (so it hears the reply and records the race as a fix
         "<event>-<heat>": {"race": N}), to anyone."""
-        qf = os.path.join(self.sdir(n, "reports"), "Event %02d quick fixes.json" % e)
         heats = {}
-        try:
-            for r in json.load(open(qf, encoding="utf-8")):
-                for c in r.get("checks", []):
-                    if c.startswith("Several Gen7 races"):
-                        heats.setdefault(str(r["heat"]), c)
-        except (OSError, ValueError, TypeError, KeyError):
-            return
+        for name in ("Event %02d quick fixes.json" % e, "Event %02d checks.json" % e):   # checks.json: gala-ocr 1.6.15+
+            qf = os.path.join(self.sdir(n, "reports"), name)
+            if not os.path.exists(qf):
+                continue
+            try:
+                for r in json.load(open(qf, encoding="utf-8")):
+                    for c in r.get("checks", []):
+                        if c.startswith("Several Gen7 races"):
+                            heats.setdefault(str(r["heat"]), c)
+            except (OSError, ValueError, TypeError, KeyError):
+                return
         key = "S%d:races:%d" % (n, e)
         prev = self.state["asked"].get(key)
         if not heats:
@@ -2631,7 +2636,7 @@ class Gala:
         lines = ["- **Heat %s:** %s" % (h, c.split(": ", 1)[1] if ": " in c else c) for h, c in sorted(heats.items(), key=lambda x: int(x[0]))]
         body = ("Gen7 has more than one race **with times** for %s of event %d, and the lane sheets don't show which race is "
                 "the heat:\n\n%s\n\nUntil it is settled the latest race is used, and every lane of %s is in "
-                "[Event %d quick fixes](/api/gala/file?path=sessions/S%d/reports/Event%%20%02d%%20quick%%20fixes.html).\n\n"
+                "**Other checks** in the confirmations of event %d (Session %d Checklist).%.0s\n\n"
                 "**Which race is each heat?** Reply with the race number (or say how the heat was swum, e.g. a re-swim of "
                 "some lanes). gala-claude records it and the event is worked out again."
                 % ("heat " + next(iter(heats)) if len(heats) == 1 else "heats " + ", ".join(sorted(heats, key=int)), e,
@@ -3076,7 +3081,8 @@ class Gala:
         cmd = [sys.executable, "-I", script, self.sdir(n, "ocr"), self.sdir(n, "gen7"), os.path.join(tmp, "audit.html"),
                "--events", str(e), "--scans", tmp, "--quick-fixes", qf,
                "--times", os.path.join(rep, "Event %02d times.json" % e),
-               "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes"]
+               "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes",
+               "--checks", os.path.join(rep, "Event %02d checks.json" % e)]
         if ev.get("merge"):
             cmd += ["--merge", os.path.join(rep, ev["merge"])]
         cmd += self._script_opts(n)
@@ -3484,12 +3490,18 @@ class Gala:
                 return []
         times = self._cached("cf-times", tf, lst) if os.path.exists(tf) else None
         dqs = self._cached("cf-dqs", df, lst) if os.path.exists(df) else None
-        return times, dqs
+        cf = os.path.join(rep, "Event %02d checks.json" % e)
+        checks = self._cached("cf-checks", cf, lst) if os.path.exists(cf) else []
+        nf = os.path.join(rep, "Event %02d not entered.json" % e)   # merge_results --not-entered (gala-ocr 1.6.15+)
+        checks = checks + [dict(x, notEntered=True) for x in (self._cached("cf-notentered", nf, lst) if os.path.exists(nf) else [])]
+        return times, dqs, checks
 
     def confirmations(self, n, e, qf=None):
         """Event e's confirmations for the Checklist: {ready, complete, sections: [...], dq: {...}}, or None before the
         portal has worked the event out (no times file yet). qf: the event's quick fixes (qf_history) if known."""
-        times, dqs = self._confirm_rows(n, e)
+        times, dqs, checks = self._confirm_rows(n, e)
+        not_entered = [x for x in checks if x.get("notEntered")]
+        checks = [x for x in checks if not x.get("notEntered")]
         if times is None:
             return None
         if qf is None:
@@ -3501,8 +3513,9 @@ class Gala:
         lines, decided, digests = st.get("lines", {}), st.get("dq", {}), st.get("digest", {})
         watch = "S%d:watchrule" % n in ticks
         by_sec = {k: [] for k, *_ in CONFIRM_SECTIONS}
+        no_swim = {k for k, v in (st.get("entries") or {}).items() if v.get("action") == "noswim"}
         for r in times:
-            if r.get("ns"):
+            if r.get("ns") or "%s.%s" % (r.get("heat"), r.get("lane")) in no_swim:   # a no-show, or marked as no swim
                 continue
             tp, pb, med = _hund(r.get("tp")), _hund(r.get("pb")), _hund(r.get("median"))
             cat = confirm_category(tp, pb, med)
@@ -3561,7 +3574,58 @@ class Gala:
         can = bool(dq_rows) and decided_n == len(dq_rows)
         dq_done = not dq_rows or bool(tick and can and digests.get("dq") == digest)
         complete = complete and dq_done
+        # Other checks: what isn't about the reading (a scratch that swam, several Gen7 races for a heat, the lane
+        # sheet and Gen7 disagreeing on a lane): kept as it is, or the result changed with a reason.
+        others = st.get("other", {})
+        ck_rows = []
+        for x in checks:
+            k = "%s.%s" % (x.get("heat"), x.get("lane"))
+            dc = others.get(k) or {}
+            snap = " | ".join(str(c) for c in x.get("checks") or [])
+            stale = bool(dc) and dc.get("snap") != snap
+            t = x.get("times") or {}
+            ck_rows.append({"h": x.get("heat"), "l": x.get("lane"), "name": x.get("name") or "", "checks": x.get("checks") or [],
+                            "inFile": x.get("inFile") or "", "tp": t.get("tp") or "", "pb": t.get("pb") or "",
+                            "med": re.sub(r"(\.\d\d)\d+$", r"\1", str(t.get("median") or "")), "final": t.get("final") or "",
+                            "scans": x.get("scans") or [],
+                            "action": dc.get("action") if dc and not stale else None, "status": dc.get("status") or "",
+                            "time": dc.get("time") or "", "code": dc.get("code") or "", "reason": dc.get("reason") or "",
+                            "by": dc.get("by"), "at": dc.get("at"), "stale": stale})
+        ck_rows.sort(key=lambda x: (int(x["h"] or 0), int(x["l"] or 0)))
+        ck_digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["checks"]] for x in ck_rows]).encode()).hexdigest()[:12]
+        ck_n = sum(1 for x in ck_rows if x["action"])
+        tick = ticks.get("S%d:e%d:cf:checks" % (n, e))
+        ck_can = bool(ck_rows) and ck_n == len(ck_rows)
+        ck_done = not ck_rows or bool(tick and ck_can and digests.get("checks") == ck_digest)
+        complete = complete and ck_done
+        # Swims not entered: a swimmer swimming a race they aren't entered in (a scratch that swam, an entry added for
+        # a confirmed swim): the referee approves it (with a reason), or it is marked as no swim.
+        tmap = {"%s.%s" % (r.get("heat"), r.get("lane")): r for r in times}
+        decided_ne = st.get("entries", {})
+        ne_rows = []
+        for x in not_entered:
+            k = "%s.%s" % (x.get("heat"), x.get("lane"))
+            dc = decided_ne.get(k) or {}
+            stale = bool(dc) and dc.get("kind") != x.get("kind")
+            t = tmap.get(k) or {}
+            ne_rows.append({"h": x.get("heat"), "l": x.get("lane"), "name": x.get("name") or "", "kind": x.get("kind") or "",
+                            "text": x.get("text") or "", "noSwim": bool(x.get("noSwim")), "tp": t.get("tp") or "",
+                            "pb": t.get("pb") or "", "med": re.sub(r"(\.\d\d)\d+$", r"\1", str(t.get("median") or "")),
+                            "final": t.get("final") or "",
+                            "action": dc.get("action") if dc and not stale else None, "reason": dc.get("reason") or "",
+                            "by": dc.get("by"), "at": dc.get("at"), "stale": stale})
+        ne_rows.sort(key=lambda x: (int(x["h"] or 0), int(x["l"] or 0)))
+        ne_digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["kind"]] for x in ne_rows]).encode()).hexdigest()[:12]
+        ne_n = sum(1 for x in ne_rows if x["action"])
+        tick = ticks.get("S%d:e%d:cf:entries" % (n, e))
+        ne_can = bool(ne_rows) and ne_n == len(ne_rows)
+        ne_done = not ne_rows or bool(tick and ne_can and digests.get("entries") == ne_digest)
+        complete = complete and ne_done
         return {"ready": ready, "complete": complete, "sections": sections,
+                "entries": {"count": len(ne_rows), "decided": ne_n, "rows": ne_rows, "tick": tick, "can": ne_can,
+                            "done": ne_done, "changed": bool(tick and not ne_done)},
+                "checks": {"count": len(ck_rows), "decided": ck_n, "rows": ck_rows, "tick": tick, "can": ck_can,
+                           "done": ck_done, "changed": bool(tick and not ck_done)},
                 "dq": {"count": len(dq_rows), "decided": decided_n, "rows": dq_rows, "tick": tick, "can": can,
                        "done": dq_done, "changed": bool(tick and not dq_done), "known": dqs is not None},
                 "digest": digest, "watchrule": watch}
@@ -3573,7 +3637,8 @@ class Gala:
         if not c or not c["complete"]:
             return "open"
         st = self.state.get("confirm", {}).get("S%d:e%d" % (n, e), {})
-        return hashlib.sha1(json.dumps([st.get("lines", {}), st.get("dq", {})], sort_keys=True, default=str)
+        return hashlib.sha1(json.dumps([st.get("lines", {}), st.get("dq", {}), st.get("other", {}), st.get("entries", {})],
+                                       sort_keys=True, default=str)
                             .encode()).hexdigest()[:12]
 
     def _confirm_fix(self, n, e, h, ln, who, **want):
@@ -3693,6 +3758,70 @@ class Gala:
             self.log("Session %d event %d heat %d lane %d: %s" % (
                 n, e, h, ln, {"confirm": "DQ %s confirmed" % code, "withdraw": "DQ withdrawn: %s" % reason}.get(action, "DQ decision taken back")))
             return
+        if kind == "entry":
+            row = next((r for r in c["entries"]["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
+            if not row:
+                raise ValueError("no swim by a swimmer not entered in heat %d lane %d" % (h, ln))
+            action = str(d.get("action") or "")
+            if action not in ("", "approve", "noswim"):
+                raise ValueError("the referee approves it, or it is marked as no swim")
+            if action == "approve" and not reason:
+                raise ValueError("give the referee's reason for approving it")
+            with self.lock:
+                ent = ev_state().setdefault("entries", {})
+                if action:
+                    ent[k] = {"action": action, "reason": reason, "kind": row["kind"], "by": who, "at": time.time()}
+                else:
+                    ent.pop(k, None)
+                self.save()
+            self._confirm_fix(n, e, h, ln, who, status="NS" if action == "noswim" else "", reason=reason)
+            self.log("Session %d event %d heat %d lane %d: %s" % (
+                n, e, h, ln, {"approve": "swim not entered approved by the referee: %s" % reason,
+                              "noswim": "swim not entered marked as no swim" + (": " + reason if reason else "")
+                              }.get(action, "not-entered decision taken back")))
+            return
+        if kind == "check":
+            row = next((r for r in c["checks"]["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
+            if not row:
+                raise ValueError("no other check for heat %d lane %d" % (h, ln))
+            action = str(d.get("action") or "")
+            status = str(d.get("status") or "").upper()
+            t = str(d.get("time") or "").strip()
+            code = str(d.get("code") or "").strip()[:6]
+            if action not in ("", "keep", "change"):
+                raise ValueError("keep the result or change it")
+            if action == "change":
+                if status not in ("OK", "NS", "DQ"):
+                    raise ValueError("the result must be swam, no-show or DQ")
+                if status == "OK" and not _hund(t):
+                    raise ValueError("a swim needs its time, like 1:05.32")
+                if t and not re.fullmatch(r"(?:\d{1,2}:)?\d{1,2}\.\d{2}", t):
+                    raise ValueError("time must look like 1:05.32 or 32.10")
+                if status == "DQ" and not code:
+                    raise ValueError("a DQ needs its code")
+                if not reason:
+                    raise ValueError("give the reason the result is changed")
+            with self.lock:
+                oth = ev_state().setdefault("other", {})
+                if action:
+                    oth[k] = {"action": action, "status": status if action == "change" else "",
+                              "time": t if action == "change" and status != "NS" else "",
+                              "code": code if action == "change" and status == "DQ" else "", "reason": reason,
+                              "snap": " | ".join(row["checks"]), "by": who, "at": time.time()}
+                else:
+                    oth.pop(k, None)
+                self.save()
+            if action == "change":
+                self._confirm_fix(n, e, h, ln, who, status=status, time=t if status != "NS" else "",
+                                  code=code if status == "DQ" else "", reason=reason)
+            else:
+                self._confirm_fix(n, e, h, ln, who, status="", time="", code="")
+            self.log("Session %d event %d heat %d lane %d: %s" % (
+                n, e, h, ln, {"keep": "result kept as it is (%s)" % row["inFile"],
+                              "change": "result changed to %s: %s" % (
+                                  {"OK": "swam " + t, "NS": "no-show", "DQ": "DQ %s %s" % (code, t)}.get(status, status), reason)
+                              }.get(action, "other check taken back")))
+            return
         raise ValueError("unknown confirmation")
 
     def confirm_section(self, n, e, key, checked, who):
@@ -3703,6 +3832,12 @@ class Gala:
         if key == "dq":
             sec, rows = c["dq"], c["dq"]["rows"]
             digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["code"]] for x in rows]).encode()).hexdigest()[:12]
+        elif key == "checks":
+            sec, rows = c["checks"], c["checks"]["rows"]
+            digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["checks"]] for x in rows]).encode()).hexdigest()[:12]
+        elif key == "entries":
+            sec, rows = c["entries"], c["entries"]["rows"]
+            digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["kind"]] for x in rows]).encode()).hexdigest()[:12]
         else:
             sec = next((s for s in c["sections"] if s["key"] == key), None)
             if not sec:
@@ -3722,7 +3857,7 @@ class Gala:
                 dg.pop(key, None)
                 self.state["ticks"].pop("S%d:e%d:cf:%s" % (n, e, key), None)
             self.save()
-        title = "DQs" if key == "dq" else sec["title"]
+        title = {"dq": "DQs", "checks": "Other checks", "entries": "Swims not entered"}.get(key) or sec["title"]
         self.log("Session %d event %d: %s %s by %s" % (n, e, title, "confirmed" if checked else "unconfirmed", who or "someone"))
 
     def tick(self, key, checked, who, not_swum=None):
@@ -5611,6 +5746,7 @@ table.cfrows td.cfsug{outline:2px dashed var(--accent);outline-offset:-2px}
 table.cfrows td.cfact{min-width:220px}
 table.cfrows td.cfact input[name=reason]{max-width:16em}
 ul.cff{margin:0;padding-left:16px}
+.cfchg{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:4px}
 
 
 .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted)}
@@ -5919,7 +6055,7 @@ function renderChecklist(){setTimeout(swAll,0);
  const qfKey=(e,f)=>'S'+s.n+':e'+e.event+':qf:'+f.heat+'.'+f.lane;
  const keys=['entries','sessreport','lanesprint',...s.events.map(e=>'e'+e.event),'dq','etd','codes','merged','mmfinal','resultspdf','final'].map(k=>'S'+s.n+':'+k)
   .concat(s.events.flatMap(e=>(e.fixes||[]).map(f=>qfKey(e,f))))
-  .concat(s.events.flatMap(e=>e.confirm?[...(e.confirm.dq.count?['dq']:[]),...e.confirm.sections.filter(x=>x.count).map(x=>x.key)].map(k=>'S'+s.n+':e'+e.event+':cf:'+k):[]));
+  .concat(s.events.flatMap(e=>e.confirm?[...(e.confirm.dq.count?['dq']:[]),...(e.confirm.checks&&e.confirm.checks.count?['checks']:[]),...(e.confirm.entries&&e.confirm.entries.count?['entries']:[]),...e.confirm.sections.filter(x=>x.count).map(x=>x.key)].map(k=>'S'+s.n+':e'+e.event+':cf:'+k):[]));
  const ticked=keys.filter(k=>GALA.ticks[k]).length,pct=Math.round(100*ticked/keys.length);
  const dq=s.scans.filter(x=>x.kind==='dq'),etd=s.scans.filter(x=>x.kind==='etd');
  const ev=s.events.length?`<div class="tblwrap"><table class="cl-ev"><tr><th></th><th>Event</th><th class="c">Printed</th><th>Lane sheets</th><th class="c">Gen7 heats</th><th class="c">OCR lanes</th><th>Audit</th><th>Merge</th><th class="c">Quick OCR fixes</th><th>Status</th><th></th></tr>`
@@ -6308,15 +6444,57 @@ function cfDqs(s,e,c){
  const body=d.count?`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&!d.done)?' open':''}><summary class="sm">${d.count} DQ${d.count===1?'':'s'}, by heat then lane</summary>
   <div class="tblwrap"><table class="cfrows"><tr><th>Heat</th><th>Lane</th><th>Swimmer</th><th>Rule</th><th>Code</th><th>Checks</th><th>Confirm or withdraw</th></tr>${rows}</table></div></details>`:'';
  return `<div class="cfsec${d.done&&d.count?' done':''}"><div class="cfh">${box}<div><b>DQs</b> <span class="cfn">${d.count}</span> ${state}<div class="sm meta">Each DQ with its rule and code (the code can be changed): confirm it, or withdraw it with a reason.</div></div></div>${body}</div>`}
+function cfEntries(s,e,c){
+ const d=c.entries;if(!d||!d.count)return '';
+ const key='S'+s.n+':e'+e.event+':cf:entries',t=GALA.ticks[key],lock=!c.ready;
+ const state=d.done?`<span class="ok">confirmed ✓</span> <span class="sm">${esc(t?t.by+' · '+agoShort(t.at):'')}</span>`
+  :d.changed?'<span class="gwarn">changed since it was ticked: check it and tick again</span>':`<span class="${d.decided===d.count?'ok':'gwarn'}">${d.decided} of ${d.count} decided</span>`;
+ const box=`<input type="checkbox" data-tick="${esc(key)}"${t?' checked':''}${lock||(!d.can&&!t)?' disabled':''} aria-label="Confirm the swims not entered" title="${esc(lock?'Tick off the Quick OCR fixes first':!d.can?'Decide every one first':'Tick when checked')}">`;
+ const rows=d.rows.map(r=>{const k=s.n+'|'+e.event+'|'+r.h+'|'+r.l;
+  const dec=r.action==='approve'?`<span class="ok">✓ referee approves</span> <span class="sm">· ${esc(r.reason)}</span>`
+   :r.action==='noswim'?`<span class="gwarn">marked as no swim</span>${r.reason?` <span class="sm">· ${esc(r.reason)}</span>`:''}`:'';
+  const form=r.action?`${dec}<div class="sm">${esc(r.by||'')} · ${esc(agoShort(r.at))} <button type="button" class="sm" data-cfne="undo">Change</button></div>`
+   :`<input name="reason" placeholder="referee's reason (needed to approve)" size="26"> <button type="button" class="primary" data-cfne="approve">Referee approves</button> <button type="button" data-cfne="noswim">Mark as no swim</button>
+    ${r.stale?'<div class="sm gwarn">this changed since it was decided: decide again</div>':''}<div class="sm" data-cfmsg></div>`;
+  return `<tr class="${r.action?'done':''}"><td>${esc(r.h)}</td><td>${esc(r.l)}</td><td>${esc(r.name||'–')}</td><td>${esc(r.text)}</td>
+   <td class="t">${esc(r.tp||'–')}</td><td class="t">${esc(r.pb||'–')}</td><td class="t">${esc(r.med||'–')}</td><td class="t">${esc(r.final||'–')}</td>
+   <td><form class="cfdq cfne" data-cf="${esc(k)}" autocomplete="off">${form}</form></td></tr>`}).join('');
+ const body=`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&!d.done)?' open':''}><summary class="sm">${d.count} swim${d.count===1?'':'s'}, by heat then lane</summary>
+  <div class="tblwrap"><table class="cfrows"><tr><th>Heat</th><th>Lane</th><th>Swimmer</th><th>Why</th><th>TP</th><th>PB</th><th>SW median</th><th>Audit</th><th>Referee</th></tr>${rows}</table></div></details>`;
+ return `<div class="cfsec${d.done?' done':''}"><div class="cfh">${box}<div><b>Swims not entered</b> <span class="cfn">${d.count}</span> ${state}<div class="sm meta">A swimmer who swam a race they aren't entered in, including an entry scratched in Meet Manager: the referee approves it (with a reason), or it is marked as no swim (no result).</div></div></div>${body}</div>`}
+function cfChecks(s,e,c){
+ const d=c.checks;if(!d||!d.count)return '';
+ const key='S'+s.n+':e'+e.event+':cf:checks',t=GALA.ticks[key],lock=!c.ready;
+ const state=d.done?`<span class="ok">confirmed ✓</span> <span class="sm">${esc(t?t.by+' · '+agoShort(t.at):'')}</span>`
+  :d.changed?'<span class="gwarn">changed since it was ticked: check it and tick again</span>':`<span class="${d.decided===d.count?'ok':'gwarn'}">${d.decided} of ${d.count} decided</span>`;
+ const box=`<input type="checkbox" data-tick="${esc(key)}"${t?' checked':''}${lock||(!d.can&&!t)?' disabled':''} aria-label="Confirm the other checks" title="${esc(lock?'Tick off the Quick OCR fixes first':!d.can?'Decide every one first':'Tick when checked')}">`;
+ const ST={OK:'swam',NS:'no-show',DQ:'DQ'};
+ const rows=d.rows.map(r=>{const k=s.n+'|'+e.event+'|'+r.h+'|'+r.l;
+  const scans=(r.scans||[]).map(sc=>{const rel='sessions/S'+s.n+'/scans/'+sc.scan;return `<a class="sm" href="${esc(galaHref(rel))}#page=${esc(sc.page)}" target="_blank" rel="noopener">${esc(sc.label)}, page ${esc(sc.page)}</a>`}).join(' ');
+  const dec=r.action==='keep'?`<span class="ok">✓ kept as it is</span>${r.reason?` <span class="sm">· ${esc(r.reason)}</span>`:''}`
+   :r.action==='change'?`<span class="gwarn">changed to ${esc(ST[r.status]||r.status)}${r.status==='DQ'?' '+esc(r.code):''}${r.time?' '+esc(r.time):''}</span> <span class="sm">· ${esc(r.reason)}</span>`:'';
+  const form=r.action?`${dec}<div class="sm">${esc(r.by||'')} · ${esc(agoShort(r.at))} <button type="button" class="sm" data-cfck="undo">Change</button></div>`
+   :`<button type="button" class="primary" data-cfck="keep">Keep as it is</button>
+    <div class="cfchg"><select name="status" aria-label="Result"><option value="">change the result to…</option><option value="OK">swam</option><option value="NS">no-show</option><option value="DQ">DQ</option></select>
+    <input name="time" placeholder="m:ss.hh" size="8" aria-label="Time"> <input name="code" list="dqcodes" placeholder="code" size="5" aria-label="DQ code">
+    <input name="reason" placeholder="reason (needed to change)" size="22"> <button type="button" data-cfck="change">Change</button></div>
+    ${r.stale?'<div class="sm gwarn">the checks changed since it was decided: decide again</div>':''}<div class="sm" data-cfmsg></div>`;
+  return `<tr class="${r.action?'done':''}"><td>${esc(r.h)}</td><td>${esc(r.l)}</td><td>${esc(r.name||'–')}</td>
+   <td><ul class="sm cff">${r.checks.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>${scans}</td>
+   <td class="t">${esc(r.inFile||'–')}</td><td class="t">${esc(r.tp||'–')}</td><td class="t">${esc(r.pb||'–')}</td><td class="t">${esc(r.med||'–')}</td>
+   <td><form class="cfdq cfck" data-cf="${esc(k)}" autocomplete="off">${form}</form></td></tr>`}).join('');
+ const body=`<details data-cfd="${esc(key)}"${cfOpen(key,!lock&&!d.done)?' open':''}><summary class="sm">${d.count} swim${d.count===1?'':'s'}, by heat then lane</summary>
+  <div class="tblwrap"><table class="cfrows"><tr><th>Heat</th><th>Lane</th><th>Swimmer</th><th>Check</th><th>Merge file</th><th>TP</th><th>PB</th><th>SW median</th><th>Keep or change</th></tr>${rows}</table></div></details>`;
+ return `<div class="cfsec${d.done?' done':''}"><div class="cfh">${box}<div><b>Other checks</b> <span class="cfn">${d.count}</span> ${state}<div class="sm meta">What isn't about reading the paperwork: several Gen7 races for a heat, the lane sheet and Gen7 disagreeing on whether a lane swam. Keep each result as it is, or change it with a reason.</div></div></div>${body}</div>`}
 function cfRows(s,e){
  const c=e.confirm;if(!c)return '';
- const secs=c.sections.filter(x=>x.key!=='nomatch'||x.count),need=secs.filter(x=>x.count).length+(c.dq.count?1:0);
- const done=secs.filter(x=>x.count&&x.done).length+(c.dq.count&&c.dq.done?1:0),key='S'+s.n+':e'+e.event+':cf';
+ const ck=c.checks||{count:0},ne=c.entries||{count:0},secs=c.sections.filter(x=>x.key!=='nomatch'||x.count),need=secs.filter(x=>x.count).length+(c.dq.count?1:0)+(ck.count?1:0)+(ne.count?1:0);
+ const done=secs.filter(x=>x.count&&x.done).length+(c.dq.count&&c.dq.done?1:0)+(ck.count&&ck.done?1:0)+(ne.count&&ne.done?1:0),key='S'+s.n+':e'+e.event+':cf';
  const head=c.complete?`<span class="ok">all confirmed ✓</span>${e.status==='audited'?' · the merge results and audit are written':' · the merge results and audit are being written'}`
   :!c.ready?'<span class="gwarn">tick off the Quick OCR fixes first</span>':`<span class="gwarn">${done} of ${need} confirmed</span> · the merge results and audit are written once all are`;
  return `<tr class="qfrow cfrow"><td></td><td colspan="10"><details data-cfd="${esc(key)}"${cfOpen(key,c.ready&&!c.complete)?' open':''}><summary>Confirmations for event ${e.event} · ${head}</summary>
   ${c.watchrule?'<div class="sm meta">This session\'s results were published with the rule before gala-ocr 1.6.13: where TP and PB agree but the SW median doesn\'t, the SW median was used. Those swims are set to SW median (“Glitch - used SW Median as it was better”).</div>':''}
-  <div class="cfwrap${c.ready?'':' locked'}">${cfDqs(s,e,c)}${secs.map(x=>cfSection(s,e,c,x)).join('')}</div></details></td></tr>`}
+  <div class="cfwrap${c.ready?'':' locked'}">${cfDqs(s,e,c)}${cfEntries(s,e,c)}${cfChecks(s,e,c)}${secs.map(x=>cfSection(s,e,c,x)).join('')}</div></details></td></tr>`}
 function cfForm(el){const f=el&&(el.form||(el.closest&&el.closest('form')));return f&&f.matches('form.cffix,form.cfdq')?f:null}
 document.addEventListener('change',ev=>{const fm=cfForm(ev.target);if(!fm||!fm.matches('.cffix'))return;fm.dataset.dirty='1';
  if(ev.target.name==='pick'){const o=fm.querySelector('[data-cfother]');if(o)o.hidden=ev.target.value===fm.dataset.default;
@@ -6330,6 +6508,21 @@ document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.cffix')
  const pick=([...fm.elements].find(x=>x.name==='pick'&&x.checked)||{}).value||fm.dataset.default,reason=((fm.querySelector('input[name=reason]')||{}).value||'').trim(),msg=fm.querySelector('[data-cfmsg]');
  if(pick!==fm.dataset.default&&!reason){msg.textContent='Give a reason for '+PICK_TXT[pick]+' (not '+PICK_TXT[fm.dataset.default]+')';fm.querySelector('input[name=reason]').focus();return}
  cfSend(fm,{kind:'line',pick,reason})});
+document.addEventListener('click',ev=>{const b=ev.target.closest('[data-cfne]');if(!b)return;
+ const fm=b.closest('form.cfne'),act=b.dataset.cfne,msg=fm.querySelector('[data-cfmsg]'),reason=((fm.querySelector('[name=reason]')||{}).value||'').trim();
+ if(act==='undo'){cfSend(fm,{kind:'entry',action:''});return}
+ if(act==='approve'&&!reason){msg.textContent='Give the referee\'s reason for approving it';fm.querySelector('[name=reason]').focus();return}
+ cfSend(fm,{kind:'entry',action:act,reason})});
+document.addEventListener('click',ev=>{const b=ev.target.closest('[data-cfck]');if(!b)return;
+ const fm=b.closest('form.cfck'),act=b.dataset.cfck,msg=fm.querySelector('[data-cfmsg]'),v=n=>((fm.querySelector('[name='+n+']')||{}).value||'').trim();
+ if(act==='undo'){cfSend(fm,{kind:'check',action:''});return}
+ if(act==='keep'){cfSend(fm,{kind:'check',action:'keep',reason:v('reason')});return}
+ const status=v('status'),time=v('time'),code=v('code'),reason=v('reason');
+ if(!status){msg.textContent='Pick the result: swam, no-show or DQ';return}
+ if(status==='OK'&&!/^(\d{1,2}:)?\d{1,2}\.\d{2}$/.test(time)){msg.textContent='A swim needs its time, like 1:05.32';return}
+ if(status==='DQ'&&!code){msg.textContent='A DQ needs its code';return}
+ if(!reason){msg.textContent='Give the reason the result is changed';return}
+ cfSend(fm,{kind:'check',action:'change',status,time,code,reason})});
 document.addEventListener('click',ev=>{
  const u=ev.target.closest('[data-cfundo]');if(u){cfSend(u.closest('form.cffix'),{kind:'line',pick:''});return}
  const b=ev.target.closest('[data-cfdq]');if(!b)return;const fm=b.closest('form.cfdq'),act=b.dataset.cfdq,msg=fm.querySelector('[data-cfmsg]');

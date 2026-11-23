@@ -1786,7 +1786,8 @@ class Gala:
                 ent = self._entries_hy3(n, tmp)
                 tpl = "-"   # entries export only: an empty merge results export is no longer used
                 mfile = os.path.join(out_dir, "Event %02d merge results %s.hy3" % (e, time.strftime("%Y-%m-%d_%H%M")))
-                ok, out = self._run_script([merge, ocr, gen7, ent, tpl, mfile, "--events", str(e)] + self._script_opts(n))
+                ok, out = self._run_script([merge, ocr, gen7, ent, tpl, mfile, "--events", str(e), "--not-entered",
+                                            os.path.join(rep, "Event %02d not entered.json" % e)] + self._script_opts(n))
                 if not ok:
                     return False, "event %d merge results: %s" % (e, out.splitlines()[-1] if out else "failed")
                 if final:
@@ -1808,7 +1809,8 @@ class Gala:
                    "--scans", scans if final else tmp,
                    "--quick-fixes", os.path.join(rep, "Event %02d quick fixes.html" % e),
                    "--times", os.path.join(rep, "Event %02d times.json" % e),
-                   "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes"] + (["--merge", mfile] if mfile else [])
+                   "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes",
+                   "--checks", os.path.join(rep, "Event %02d checks.json" % e)] + (["--merge", mfile] if mfile else [])
             ok, out = self._run_script(cmd + self._script_opts(n))
             if not ok:
                 return False, "event %d audit: %s" % (e, out.splitlines()[-1] if out else "failed")
@@ -1944,15 +1946,18 @@ class Gala:
         put them in Quick Fix, "Several Gen7 races ..."): ask on the board which race each one is, once per set of
         heats and races. The question is gala-claude's (so it hears the reply and records the race as a fix
         "<event>-<heat>": {"race": N}), to anyone."""
-        qf = os.path.join(self.sdir(n, "reports"), "Event %02d quick fixes.json" % e)
         heats = {}
-        try:
-            for r in json.load(open(qf, encoding="utf-8")):
-                for c in r.get("checks", []):
-                    if c.startswith("Several Gen7 races"):
-                        heats.setdefault(str(r["heat"]), c)
-        except (OSError, ValueError, TypeError, KeyError):
-            return
+        for name in ("Event %02d quick fixes.json" % e, "Event %02d checks.json" % e):   # checks.json: gala-ocr 1.6.15+
+            qf = os.path.join(self.sdir(n, "reports"), name)
+            if not os.path.exists(qf):
+                continue
+            try:
+                for r in json.load(open(qf, encoding="utf-8")):
+                    for c in r.get("checks", []):
+                        if c.startswith("Several Gen7 races"):
+                            heats.setdefault(str(r["heat"]), c)
+            except (OSError, ValueError, TypeError, KeyError):
+                return
         key = "S%d:races:%d" % (n, e)
         prev = self.state["asked"].get(key)
         if not heats:
@@ -1963,7 +1968,7 @@ class Gala:
         lines = ["- **Heat %s:** %s" % (h, c.split(": ", 1)[1] if ": " in c else c) for h, c in sorted(heats.items(), key=lambda x: int(x[0]))]
         body = ("Gen7 has more than one race **with times** for %s of event %d, and the lane sheets don't show which race is "
                 "the heat:\n\n%s\n\nUntil it is settled the latest race is used, and every lane of %s is in "
-                "[Event %d quick fixes](/api/gala/file?path=sessions/S%d/reports/Event%%20%02d%%20quick%%20fixes.html).\n\n"
+                "**Other checks** in the confirmations of event %d (Session %d Checklist).%.0s\n\n"
                 "**Which race is each heat?** Reply with the race number (or say how the heat was swum, e.g. a re-swim of "
                 "some lanes). gala-claude records it and the event is worked out again."
                 % ("heat " + next(iter(heats)) if len(heats) == 1 else "heats " + ", ".join(sorted(heats, key=int)), e,
@@ -2408,7 +2413,8 @@ class Gala:
         cmd = [sys.executable, "-I", script, self.sdir(n, "ocr"), self.sdir(n, "gen7"), os.path.join(tmp, "audit.html"),
                "--events", str(e), "--scans", tmp, "--quick-fixes", qf,
                "--times", os.path.join(rep, "Event %02d times.json" % e),
-               "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes"]
+               "--dqs", os.path.join(rep, "Event %02d dqs.json" % e), "--ocr-fixes",
+               "--checks", os.path.join(rep, "Event %02d checks.json" % e)]
         if ev.get("merge"):
             cmd += ["--merge", os.path.join(rep, ev["merge"])]
         cmd += self._script_opts(n)
@@ -2816,12 +2822,18 @@ class Gala:
                 return []
         times = self._cached("cf-times", tf, lst) if os.path.exists(tf) else None
         dqs = self._cached("cf-dqs", df, lst) if os.path.exists(df) else None
-        return times, dqs
+        cf = os.path.join(rep, "Event %02d checks.json" % e)
+        checks = self._cached("cf-checks", cf, lst) if os.path.exists(cf) else []
+        nf = os.path.join(rep, "Event %02d not entered.json" % e)   # merge_results --not-entered (gala-ocr 1.6.15+)
+        checks = checks + [dict(x, notEntered=True) for x in (self._cached("cf-notentered", nf, lst) if os.path.exists(nf) else [])]
+        return times, dqs, checks
 
     def confirmations(self, n, e, qf=None):
         """Event e's confirmations for the Checklist: {ready, complete, sections: [...], dq: {...}}, or None before the
         portal has worked the event out (no times file yet). qf: the event's quick fixes (qf_history) if known."""
-        times, dqs = self._confirm_rows(n, e)
+        times, dqs, checks = self._confirm_rows(n, e)
+        not_entered = [x for x in checks if x.get("notEntered")]
+        checks = [x for x in checks if not x.get("notEntered")]
         if times is None:
             return None
         if qf is None:
@@ -2833,8 +2845,9 @@ class Gala:
         lines, decided, digests = st.get("lines", {}), st.get("dq", {}), st.get("digest", {})
         watch = "S%d:watchrule" % n in ticks
         by_sec = {k: [] for k, *_ in CONFIRM_SECTIONS}
+        no_swim = {k for k, v in (st.get("entries") or {}).items() if v.get("action") == "noswim"}
         for r in times:
-            if r.get("ns"):
+            if r.get("ns") or "%s.%s" % (r.get("heat"), r.get("lane")) in no_swim:   # a no-show, or marked as no swim
                 continue
             tp, pb, med = _hund(r.get("tp")), _hund(r.get("pb")), _hund(r.get("median"))
             cat = confirm_category(tp, pb, med)
@@ -2893,7 +2906,58 @@ class Gala:
         can = bool(dq_rows) and decided_n == len(dq_rows)
         dq_done = not dq_rows or bool(tick and can and digests.get("dq") == digest)
         complete = complete and dq_done
+        # Other checks: what isn't about the reading (a scratch that swam, several Gen7 races for a heat, the lane
+        # sheet and Gen7 disagreeing on a lane): kept as it is, or the result changed with a reason.
+        others = st.get("other", {})
+        ck_rows = []
+        for x in checks:
+            k = "%s.%s" % (x.get("heat"), x.get("lane"))
+            dc = others.get(k) or {}
+            snap = " | ".join(str(c) for c in x.get("checks") or [])
+            stale = bool(dc) and dc.get("snap") != snap
+            t = x.get("times") or {}
+            ck_rows.append({"h": x.get("heat"), "l": x.get("lane"), "name": x.get("name") or "", "checks": x.get("checks") or [],
+                            "inFile": x.get("inFile") or "", "tp": t.get("tp") or "", "pb": t.get("pb") or "",
+                            "med": re.sub(r"(\.\d\d)\d+$", r"\1", str(t.get("median") or "")), "final": t.get("final") or "",
+                            "scans": x.get("scans") or [],
+                            "action": dc.get("action") if dc and not stale else None, "status": dc.get("status") or "",
+                            "time": dc.get("time") or "", "code": dc.get("code") or "", "reason": dc.get("reason") or "",
+                            "by": dc.get("by"), "at": dc.get("at"), "stale": stale})
+        ck_rows.sort(key=lambda x: (int(x["h"] or 0), int(x["l"] or 0)))
+        ck_digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["checks"]] for x in ck_rows]).encode()).hexdigest()[:12]
+        ck_n = sum(1 for x in ck_rows if x["action"])
+        tick = ticks.get("S%d:e%d:cf:checks" % (n, e))
+        ck_can = bool(ck_rows) and ck_n == len(ck_rows)
+        ck_done = not ck_rows or bool(tick and ck_can and digests.get("checks") == ck_digest)
+        complete = complete and ck_done
+        # Swims not entered: a swimmer swimming a race they aren't entered in (a scratch that swam, an entry added for
+        # a confirmed swim): the referee approves it (with a reason), or it is marked as no swim.
+        tmap = {"%s.%s" % (r.get("heat"), r.get("lane")): r for r in times}
+        decided_ne = st.get("entries", {})
+        ne_rows = []
+        for x in not_entered:
+            k = "%s.%s" % (x.get("heat"), x.get("lane"))
+            dc = decided_ne.get(k) or {}
+            stale = bool(dc) and dc.get("kind") != x.get("kind")
+            t = tmap.get(k) or {}
+            ne_rows.append({"h": x.get("heat"), "l": x.get("lane"), "name": x.get("name") or "", "kind": x.get("kind") or "",
+                            "text": x.get("text") or "", "noSwim": bool(x.get("noSwim")), "tp": t.get("tp") or "",
+                            "pb": t.get("pb") or "", "med": re.sub(r"(\.\d\d)\d+$", r"\1", str(t.get("median") or "")),
+                            "final": t.get("final") or "",
+                            "action": dc.get("action") if dc and not stale else None, "reason": dc.get("reason") or "",
+                            "by": dc.get("by"), "at": dc.get("at"), "stale": stale})
+        ne_rows.sort(key=lambda x: (int(x["h"] or 0), int(x["l"] or 0)))
+        ne_digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["kind"]] for x in ne_rows]).encode()).hexdigest()[:12]
+        ne_n = sum(1 for x in ne_rows if x["action"])
+        tick = ticks.get("S%d:e%d:cf:entries" % (n, e))
+        ne_can = bool(ne_rows) and ne_n == len(ne_rows)
+        ne_done = not ne_rows or bool(tick and ne_can and digests.get("entries") == ne_digest)
+        complete = complete and ne_done
         return {"ready": ready, "complete": complete, "sections": sections,
+                "entries": {"count": len(ne_rows), "decided": ne_n, "rows": ne_rows, "tick": tick, "can": ne_can,
+                            "done": ne_done, "changed": bool(tick and not ne_done)},
+                "checks": {"count": len(ck_rows), "decided": ck_n, "rows": ck_rows, "tick": tick, "can": ck_can,
+                           "done": ck_done, "changed": bool(tick and not ck_done)},
                 "dq": {"count": len(dq_rows), "decided": decided_n, "rows": dq_rows, "tick": tick, "can": can,
                        "done": dq_done, "changed": bool(tick and not dq_done), "known": dqs is not None},
                 "digest": digest, "watchrule": watch}
@@ -2905,7 +2969,8 @@ class Gala:
         if not c or not c["complete"]:
             return "open"
         st = self.state.get("confirm", {}).get("S%d:e%d" % (n, e), {})
-        return hashlib.sha1(json.dumps([st.get("lines", {}), st.get("dq", {})], sort_keys=True, default=str)
+        return hashlib.sha1(json.dumps([st.get("lines", {}), st.get("dq", {}), st.get("other", {}), st.get("entries", {})],
+                                       sort_keys=True, default=str)
                             .encode()).hexdigest()[:12]
 
     def _confirm_fix(self, n, e, h, ln, who, **want):
@@ -3025,6 +3090,70 @@ class Gala:
             self.log("Session %d event %d heat %d lane %d: %s" % (
                 n, e, h, ln, {"confirm": "DQ %s confirmed" % code, "withdraw": "DQ withdrawn: %s" % reason}.get(action, "DQ decision taken back")))
             return
+        if kind == "entry":
+            row = next((r for r in c["entries"]["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
+            if not row:
+                raise ValueError("no swim by a swimmer not entered in heat %d lane %d" % (h, ln))
+            action = str(d.get("action") or "")
+            if action not in ("", "approve", "noswim"):
+                raise ValueError("the referee approves it, or it is marked as no swim")
+            if action == "approve" and not reason:
+                raise ValueError("give the referee's reason for approving it")
+            with self.lock:
+                ent = ev_state().setdefault("entries", {})
+                if action:
+                    ent[k] = {"action": action, "reason": reason, "kind": row["kind"], "by": who, "at": time.time()}
+                else:
+                    ent.pop(k, None)
+                self.save()
+            self._confirm_fix(n, e, h, ln, who, status="NS" if action == "noswim" else "", reason=reason)
+            self.log("Session %d event %d heat %d lane %d: %s" % (
+                n, e, h, ln, {"approve": "swim not entered approved by the referee: %s" % reason,
+                              "noswim": "swim not entered marked as no swim" + (": " + reason if reason else "")
+                              }.get(action, "not-entered decision taken back")))
+            return
+        if kind == "check":
+            row = next((r for r in c["checks"]["rows"] if "%s.%s" % (r["h"], r["l"]) == k), None)
+            if not row:
+                raise ValueError("no other check for heat %d lane %d" % (h, ln))
+            action = str(d.get("action") or "")
+            status = str(d.get("status") or "").upper()
+            t = str(d.get("time") or "").strip()
+            code = str(d.get("code") or "").strip()[:6]
+            if action not in ("", "keep", "change"):
+                raise ValueError("keep the result or change it")
+            if action == "change":
+                if status not in ("OK", "NS", "DQ"):
+                    raise ValueError("the result must be swam, no-show or DQ")
+                if status == "OK" and not _hund(t):
+                    raise ValueError("a swim needs its time, like 1:05.32")
+                if t and not re.fullmatch(r"(?:\d{1,2}:)?\d{1,2}\.\d{2}", t):
+                    raise ValueError("time must look like 1:05.32 or 32.10")
+                if status == "DQ" and not code:
+                    raise ValueError("a DQ needs its code")
+                if not reason:
+                    raise ValueError("give the reason the result is changed")
+            with self.lock:
+                oth = ev_state().setdefault("other", {})
+                if action:
+                    oth[k] = {"action": action, "status": status if action == "change" else "",
+                              "time": t if action == "change" and status != "NS" else "",
+                              "code": code if action == "change" and status == "DQ" else "", "reason": reason,
+                              "snap": " | ".join(row["checks"]), "by": who, "at": time.time()}
+                else:
+                    oth.pop(k, None)
+                self.save()
+            if action == "change":
+                self._confirm_fix(n, e, h, ln, who, status=status, time=t if status != "NS" else "",
+                                  code=code if status == "DQ" else "", reason=reason)
+            else:
+                self._confirm_fix(n, e, h, ln, who, status="", time="", code="")
+            self.log("Session %d event %d heat %d lane %d: %s" % (
+                n, e, h, ln, {"keep": "result kept as it is (%s)" % row["inFile"],
+                              "change": "result changed to %s: %s" % (
+                                  {"OK": "swam " + t, "NS": "no-show", "DQ": "DQ %s %s" % (code, t)}.get(status, status), reason)
+                              }.get(action, "other check taken back")))
+            return
         raise ValueError("unknown confirmation")
 
     def confirm_section(self, n, e, key, checked, who):
@@ -3035,6 +3164,12 @@ class Gala:
         if key == "dq":
             sec, rows = c["dq"], c["dq"]["rows"]
             digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["code"]] for x in rows]).encode()).hexdigest()[:12]
+        elif key == "checks":
+            sec, rows = c["checks"], c["checks"]["rows"]
+            digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["checks"]] for x in rows]).encode()).hexdigest()[:12]
+        elif key == "entries":
+            sec, rows = c["entries"], c["entries"]["rows"]
+            digest = hashlib.sha1(json.dumps([[x["h"], x["l"], x["kind"]] for x in rows]).encode()).hexdigest()[:12]
         else:
             sec = next((s for s in c["sections"] if s["key"] == key), None)
             if not sec:
@@ -3054,7 +3189,7 @@ class Gala:
                 dg.pop(key, None)
                 self.state["ticks"].pop("S%d:e%d:cf:%s" % (n, e, key), None)
             self.save()
-        title = "DQs" if key == "dq" else sec["title"]
+        title = {"dq": "DQs", "checks": "Other checks", "entries": "Swims not entered"}.get(key) or sec["title"]
         self.log("Session %d event %d: %s %s by %s" % (n, e, title, "confirmed" if checked else "unconfirmed", who or "someone"))
 
     def tick(self, key, checked, who, not_swum=None):
