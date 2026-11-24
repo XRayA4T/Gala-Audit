@@ -153,10 +153,11 @@ CONFIRM_SECTIONS = [
     ("allmatch", "All Match", "TP, PB and the SW median agree within 0.30 s: TP", ["tp", "sw", "pb"], "tp"),
     ("nopb", "All Match NO PB", "No PB; TP and the SW median agree within 0.30 s: TP", ["tp", "sw"], "tp"),
     ("notp", "All Match NO TP", "No TP; PB and the SW median agree within 0.30 s: the SW median", [], "sw"),
-    ("notppb", "SW Median - No TP or BP - all SW within 0.3s", "No TP and no PB; the SW times all within 0.30 s of each "
-               "other: the SW median", [], "sw"),
-    ("notppbx", "SW Median - No TP or BP - not all SW within 0.3s", "No TP and no PB; the SW times more than 0.30 s apart, "
-                "or only one: the SW median", [], "sw"),
+    ("notppb", "SW Median - No TP or BP - all SW within 0.3s of Median", "No TP and no PB; every SW time within 0.30 s of "
+               "the SW median: the SW median", [], "sw"),
+    ("notppbx", "SW Median - No TP or BP - not all SW within 0.3s of Median", "No TP and no PB; an SW time more than "
+                "0.30 s from the SW median, or only one SW time: confirm the SW median, or override it with a time and "
+                "a reason", ["sw"], None),
     ("overlap", "Overlap", "Two of the three pairs (TP-PB, TP-SW median, PB-SW median) agree within 0.30 s, the third "
                 "doesn't", ["tp", "sw", "pb"], None),
     ("badtp", "Bad TP - Rest Match", "PB and the SW median agree within 0.30 s, TP doesn't", ["sw", "tp", "pb"], None),
@@ -165,7 +166,9 @@ CONFIRM_SECTIONS = [
     ("notpmis", "NO TP - SW Median - BP Mismatch", "No TP; PB and the SW median don't agree within 0.30 s", ["sw", "pb"], None),
     ("nomatch", "No Match", "No two of TP, PB and the SW median agree within 0.30 s", ["sw", "tp", "pb"], None),
 ]
-PICK_NAME = {"tp": "TP", "pb": "PB", "sw": "SW median"}
+PICK_NAME = {"tp": "TP", "pb": "PB", "sw": "SW median", "time": "Override"}
+# Sections whose swims can be given a time typed in (pick "time", with a reason) in place of TP, PB or the SW median.
+OVERRIDE = {"notppbx"}
 # Sections whose swims start confirmed with the first option; another pick (with a reason) can be made per swim.
 AUTO_CONFIRM = {"allmatch", "nopb"}
 
@@ -174,6 +177,22 @@ def _hund(t):
     """'1:05.32' or '32.10' -> hundredths (None if it isn't a time)."""
     m = re.fullmatch(r"\s*(?:(\d{1,2}):)?(\d{1,2})\.(\d{2})\d*\s*", str(t or ""))
     return (int(m.group(1) or 0) * 60 + int(m.group(2))) * 100 + int(m.group(3)) if m else None
+
+
+def _hstr(h):
+    """Hundredths -> '1:05.32' or '35.10'."""
+    m, rest = divmod(int(h), 6000)
+    return ("%d:%02d.%02d" % (m, rest // 100, rest % 100)) if m else "%d.%02d" % (rest // 100, rest % 100)
+
+
+def sw_median(times):
+    """The SW median of times in hundredths, as the final time takes it: the middle one, or for an even count the
+    mean of the middle two with the thousandths dropped."""
+    v = sorted(times)
+    if not v:
+        return None
+    k = len(v) // 2
+    return v[k] if len(v) % 2 else (v[k - 1] + v[k]) // 2
 
 
 def confirm_category(tp, pb, med, tol=CONFIRM_TOL, sw=None):
@@ -187,9 +206,9 @@ def confirm_category(tp, pb, med, tol=CONFIRM_TOL, sw=None):
         return "nopb" if ok(tp, med) else "nomatch"
     if pb is not None and med is not None:
         return "notp" if ok(pb, med) else "notpmis"
-    if med is not None:   # the SW median alone: do the watches all agree (within the tolerance of each other)?
+    if med is not None:   # the SW median alone: is every watch within the tolerance of their median?
         sw = [x for x in sw or [] if x is not None]
-        return "notppb" if len(sw) >= 2 and max(sw) - min(sw) <= tol else "notppbx"
+        return "notppb" if len(sw) >= 2 and all(abs(x - med) <= tol for x in sw) else "notppbx"
     if tp is not None or pb is not None:   # TP and/or PB with no SW times
         return "nomatch"
     return None
@@ -2884,10 +2903,11 @@ class Gala:
                    "doubt": bool(r.get("doubt")),
                    "sw": [[w.get("column"), w.get("time") or "", w.get("written") or "", w.get("confidence") or ""]
                           for w in r.get("sw") or []],
-                   "opts": opts, "default": default}
+                   "opts": opts, "default": default, "override": cat in OVERRIDE}
             if opts and ln:
                 row.update(pick=ln.get("pick"), reason=ln.get("reason") or "", by=ln.get("by"), at=ln.get("at"),
-                           stale=ln.get("snap") != snap, all=bool(ln.get("all")))
+                           stale=ln.get("snap") != snap, all=bool(ln.get("all")),
+                           value=ln.get("value") or "", watches=ln.get("watches"))
             elif opts and cat in AUTO_CONFIRM:   # confirmed with the default until another pick is made
                 row.update(pick=default, auto=True)
             by_sec[cat].append(row)
@@ -3111,18 +3131,43 @@ class Gala:
             if not row or not row["opts"]:
                 raise ValueError("heat %d lane %d has nothing to confirm" % (h, ln))
             pick = str(d.get("pick") or "")
-            if pick and pick not in row["opts"]:
+            typed, watches = str(d.get("time") or "").strip(), None
+            if pick == "time":   # an override: the SW times edited or deleted (the SW median of what is left), with a reason
+                if not row.get("override"):
+                    raise ValueError("heat %d lane %d's time can't be overridden here" % (h, ln))
+                ok_t = lambda t: _hund(t) is not None and re.fullmatch(r"(\d{1,2}:)?\d{1,2}\.\d{2}", t)  # noqa: E731
+                if isinstance(d.get("watches"), dict):
+                    watches = {}
+                    for col in ("1", "2", "3"):
+                        t = str(d["watches"].get(col) or "").strip()
+                        if t and not ok_t(t):
+                            raise ValueError("SW%s: type the time like 1:05.32 or 35.10, or clear it to delete it" % col)
+                        watches[col] = t
+                    left = [_hund(t) for t in watches.values() if t]
+                    if not left:
+                        raise ValueError("keep at least one SW time")
+                    was = {str(w[0]): re.sub(r"(\.\d\d)\d+$", r"\1", w[1] or "") for w in row["sw"]}
+                    if all(_hund(watches[c]) == _hund(was.get(c, "")) for c in watches):
+                        raise ValueError("no SW time was changed: confirm the SW median instead")
+                    typed = _hstr(sw_median(left))
+                elif not ok_t(typed):
+                    raise ValueError("type the time like 1:05.32 or 35.10")
+                if not reason:
+                    raise ValueError("give the reason for overriding the time")
+            elif pick and pick not in row["opts"]:
                 raise ValueError("pick one of %s" % ", ".join(PICK_NAME[o] for o in row["opts"]))
             if pick and pick != row["default"] and not reason:
                 raise ValueError("give a reason for %s (not %s)" % (PICK_NAME[pick], PICK_NAME[row["default"]]))
             if sec["key"] in AUTO_CONFIRM and pick == row["default"]:
                 pick = ""   # back to the default these sections start with: nothing to keep
-            value = {"tp": row["tp"], "pb": row["pb"], "sw": row["med"]}.get(pick, "")
+            value = typed if pick == "time" else {"tp": row["tp"], "pb": row["pb"], "sw": row["med"]}.get(pick, "")
             with self.lock:
                 lines = ev_state().setdefault("lines", {})
                 if pick:
                     lines[k] = {"pick": pick, "reason": reason, "value": value, "by": who, "at": time.time(),
                                 "snap": "%s|%s|%s|%s" % (row["tp"], row["pb"], row["med"], sec["key"])}
+                    if watches is not None:
+                        lines[k]["watches"] = watches
                     if d.get("preset"):
                         lines[k]["preset"] = True
                 else:

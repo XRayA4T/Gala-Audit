@@ -479,7 +479,7 @@ async function rsRestore(name,hasQ){const s=(GALA&&GALA.summary)||{};
 document.addEventListener('toggle',e=>{const d=e.target;if(d&&d.matches&&d.matches('details[data-qpd]'))QP_OPEN[d.dataset.qpd]={open:d.open,ticked:d.dataset.ticked==='1'}},true);
 // ---- confirmations: after an event's Quick OCR fixes are ticked off, its DQs and times are confirmed, section by
 // section; the merge results and audit are written once all are. Each swim's values: TP, PB, SW median, every SW time.
-const CF_OPEN={},PICK_TXT={tp:'TP',pb:'PB',sw:'SW median'};
+const CF_OPEN={},PICK_TXT={tp:'TP',pb:'PB',sw:'SW median',time:'Override'};
 document.addEventListener('toggle',ev=>{const d=ev.target;if(d.matches&&d.matches('details[data-cfd]'))CF_OPEN[d.dataset.cfd]=d.open},true);
 function cfOpen(key,dflt){return CF_OPEN[key]??dflt}
 function cfSwCells(r){const by={};r.sw.forEach(w=>by[w[0]]=w);
@@ -495,9 +495,17 @@ function cfRow(s,e,sec,r){
  if(!opts.length)return `<tr>${lead}${times}</tr>`;
  const shownV=vals[picked||sel]||'',audit=r.final&&hund(r.final)!==hund(shownV)?`<div class="sm">audit: ${esc(r.final)}</div>`:'';
  const act=r.auto?`<span class="sm meta">${esc(PICK_TXT[r.default])} (default)</span> <span data-cfother hidden><input name="reason" value="" placeholder="reason (not ${esc(PICK_TXT[r.default])})" size="18"> <button type="submit" class="primary">Confirm</button></span><div class="sm" data-cfmsg></div>`
-  :r.pick&&!r.stale?`<span class="ok">✓ ${esc(PICK_TXT[r.pick])}</span>${r.reason?` <span class="sm">· ${esc(r.reason)}</span>`:''}<div class="sm">${esc(r.by||'')} · ${esc(agoShort(r.at))} <button type="button" class="sm" data-cfundo>Change</button></div>`
-  :`<input name="reason" value="${esc(r.reason||'')}" placeholder="reason (not ${esc(PICK_TXT[r.default])})" size="18"${sel===r.default?' hidden':''}> <button type="submit" class="primary">Confirm</button>${r.stale?'<div class="sm gwarn">the times changed since it was confirmed: confirm again</div>':''}<div class="sm" data-cfmsg></div>`;
+  :r.pick&&!r.stale?`<span class="ok">✓ ${esc(PICK_TXT[r.pick])}${r.pick==='time'?' '+esc(r.value||''):''}</span>${r.pick==='time'&&cfWatchChanges(r)?`<div class="sm">${esc(cfWatchChanges(r))}</div>`:''}${r.reason?` <span class="sm">· ${esc(r.reason)}</span>`:''}<div class="sm">${esc(r.by||'')} · ${esc(agoShort(r.at))} <button type="button" class="sm" data-cfundo>Change</button></div>`
+  :(r.override?cfOverride(r):'')
+  +`<input name="reason" value="${esc(r.reason||'')}" placeholder="reason (not ${esc(PICK_TXT[r.default])})" size="18"${sel===r.default?' hidden':''}> <button type="submit" class="primary">Confirm</button>${r.stale?'<div class="sm gwarn">the times changed since it was confirmed: confirm again</div>':''}<div class="sm" data-cfmsg></div>`;
  return `<tr class="${r.pick&&!r.stale?'done':''}">${lead}${times}<td class="cfact"><form id="${fid}" class="cffix" data-cf="${esc(k)}" data-default="${esc(r.default)}" autocomplete="off">${audit}${act}</form></td></tr>`}
+// Override (some sections): every SW time can be edited, or cleared to delete it; the SW median of what is left is the time.
+function cfSwMedian(v){v=v.filter(x=>x!=null).sort((a,b)=>a-b);if(!v.length)return null;const k=v.length>>1;return v.length%2?v[k]:Math.floor((v[k-1]+v[k])/2)}
+function cfHstr(h){const m=Math.floor(h/6000),r=h%6000,s=Math.floor(r/100),c=String(r%100).padStart(2,'0');return m?m+':'+String(s).padStart(2,'0')+'.'+c:s+'.'+c}
+function cfOverride(r){const by={};r.sw.forEach(w=>by[w[0]]=(w[1]||'').replace(/(\.\d\d)\d+$/,'$1'));const was=(r.pick==='time'&&r.watches)||{};
+ return `<div class="sm cfov"><label><input type="radio" name="pick" value="time"${r.pick==='time'?' checked':''}> override the SW times</label> <span class="meta">(edit, or clear one to delete it)</span><div>${[1,2,3].map(c=>`SW${c} <input name="sw${c}" value="${esc(c in was?was[c]:by[c]||'')}" data-orig="${esc(by[c]||'')}" placeholder="–" size="7" aria-label="SW${c}">`).join(' ')} → median <b data-cfmed>${esc(r.med||'–')}</b></div></div>`}
+function cfWatchChanges(r){if(!r.watches)return '';const by={};r.sw.forEach(w=>by[w[0]]=(w[1]||'').replace(/(\.\d\d)\d+$/,'$1'));
+ return [1,2,3].map(c=>{const a=by[c]||'',b=r.watches[c]||'';return hund(a)===hund(b)?'':!b?'SW'+c+' '+a+' deleted':!a?'SW'+c+' '+b+' added':'SW'+c+' '+a+' → '+b}).filter(Boolean).join(', ')}
 // ΔTP/PB, ΔTP/SW, ΔPB/SW (SW: the SW median), highlighted when more than the 0.30 s tolerance apart
 function cfDeltas(r){const tp=hund(r.tp),pb=hund(r.pb),sw=hund(r.med);
  const d=(a,b)=>{if(a==null||b==null)return '<td class="t"><span class="no">–</span></td>';const x=a-b;
@@ -591,14 +599,22 @@ document.addEventListener('change',ev=>{const fm=cfForm(ev.target);if(!fm||!fm.m
  if(ev.target.name==='pick'){const o=fm.querySelector('[data-cfother]');if(o)o.hidden=ev.target.value===fm.dataset.default;
   const r=fm.querySelector('input[name=reason]');if(r){if(!o)r.hidden=ev.target.value===fm.dataset.default;if(ev.target.value!==fm.dataset.default)r.focus()}
   const tr=ev.target.closest('tr');tr.querySelectorAll('td.cfpick,td.cfsug').forEach(td=>td.classList.remove('cfpick','cfsug'));ev.target.closest('td').classList.add('cfsug')}});
-document.addEventListener('input',ev=>{const fm=cfForm(ev.target);if(fm)fm.dataset.dirty='1'});
+document.addEventListener('input',ev=>{const fm=cfForm(ev.target);if(!fm)return;fm.dataset.dirty='1';
+ if(/^sw[123]$/.test(ev.target.name)&&fm.matches('.cffix')){const rb=fm.querySelector('input[name=pick][value=time]');   // editing an SW time picks the override
+  if(rb&&!rb.checked){rb.checked=true;rb.dispatchEvent(new Event('change',{bubbles:true}));ev.target.focus()}
+  const v=[1,2,3].map(c=>hund((fm.querySelector('input[name=sw'+c+']')||{}).value||'')),m=cfSwMedian(v),out=fm.querySelector('[data-cfmed]');
+  if(out)out.textContent=m==null?'–':cfHstr(m)}});
 function cfSend(fm,body){const [n,event,heat,lane]=fm.dataset.cf.split('|'),msg=fm.querySelector('[data-cfmsg]');
  return galaPost('/api/gala/confirm',Object.assign({session:+n,event:+event,heat:+heat,lane:+lane},body)).then(()=>{delete fm.dataset.dirty;document.activeElement&&document.activeElement.blur();galaSig='';loadGala()})
   .catch(err=>{if(msg)msg.textContent=err.message;else galaNotice(err.message,'error')})}
 document.addEventListener('submit',ev=>{const fm=ev.target.closest('form.cffix');if(!fm)return;ev.preventDefault();
  const pick=([...fm.elements].find(x=>x.name==='pick'&&x.checked)||{}).value||fm.dataset.default,reason=((fm.querySelector('input[name=reason]')||{}).value||'').trim(),msg=fm.querySelector('[data-cfmsg]');
+ const watches={};
+ if(pick==='time'){for(const c of [1,2,3]){const el=fm.querySelector('input[name=sw'+c+']'),t=(el&&el.value||'').trim();
+   if(t&&!/^(\d{1,2}:)?\d{1,2}\.\d{2}$/.test(t)){msg.textContent='SW'+c+': type the time like 1:05.32 or 35.10, or clear it to delete it';el.focus();return}watches[c]=t}
+  if(!Object.values(watches).some(Boolean)){msg.textContent='Keep at least one SW time';return}}
  if(pick!==fm.dataset.default&&!reason){msg.textContent='Give a reason for '+PICK_TXT[pick]+' (not '+PICK_TXT[fm.dataset.default]+')';fm.querySelector('input[name=reason]').focus();return}
- cfSend(fm,{kind:'line',pick,reason})});
+ cfSend(fm,Object.assign({kind:'line',pick,reason},pick==='time'?{watches}:{}))});
 document.addEventListener('click',async ev=>{const b=ev.target.closest('[data-cfall]');if(!b)return;
  const [n,event,key]=b.dataset.cfall.split('|'),s=(GALA.sessions||[]).find(x=>x.n===+n),e=s&&s.events.find(x=>x.event===+event);
  const sec=e&&e.confirm&&e.confirm.sections.find(x=>x.key===key);if(!sec)return;
