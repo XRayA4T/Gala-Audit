@@ -182,9 +182,9 @@ if [ -n "$TERM_PORT" ]; then
   done
   W=""; ttyd --help 2>&1 | grep -q -- '--writable' && W="-W"          # ttyd 1.7+ is read-only unless -W
   RO=(-r); tmux -V | awk '{v=$2+0; exit !(v>=3.2)}' && RO=(-f read-only,ignore-size)   # a watcher doesn't resize Claude's screen
-  nohup ttyd -i 127.0.0.1 -p "$TERM_PORT" -b /terminal/rw $W tmux -L "$SOCK" attach -t "$SESSION" > .portal/ttyd.log 2>&1 &
+  nohup ttyd -i 127.0.0.1 -p "$TERM_PORT" -b /terminal/rw -t disableLeaveAlert=true $W tmux -L "$SOCK" attach -t "$SESSION" > .portal/ttyd.log 2>&1 &
   echo $! > .portal/ttyd.pid
-  nohup ttyd -i 127.0.0.1 -p "$TERM_RO_PORT" -b /terminal/ro tmux -L "$SOCK" attach "${RO[@]}" -t "$SESSION" > .portal/ttyd-ro.log 2>&1 &
+  nohup ttyd -i 127.0.0.1 -p "$TERM_RO_PORT" -b /terminal/ro -t disableLeaveAlert=true tmux -L "$SOCK" attach "${RO[@]}" -t "$SESSION" > .portal/ttyd-ro.log 2>&1 &
   echo $! > .portal/ttyd-ro.pid
 fi
 

@@ -4650,6 +4650,8 @@ class Handler(BaseHTTPRequestHandler):
                 hd, sep, body = data.partition(b"\r\n\r\n")
                 if sep and b"text/html" in hd.lower() and b"</body>" in body:
                     body = body.replace(b"</body>", b"<script>" + TERM_COPY_JS.encode() + b"</script></body>", 1)
+                    body = re.sub(rb"<head[^>]*>", lambda m: m.group(0) + b"<script>" + TERM_NO_LEAVE_JS.encode()
+                                  + b"</script>", body, count=1)
                     hd = re.sub(rb"(?im)^content-length:.*$", b"Content-Length: %d" % len(body), hd)
                 data = hd + sep + body
                 if by_query and not by_cookie and b"\r\n" in data:
@@ -5207,6 +5209,16 @@ def lighten(hex_colour, amount=0.45):
 # OSC 52, which ttyd's page ignores. The board adds a handler to the page it serves: the text goes to the clipboard
 # when the browser allows it (an https:// or localhost page), and otherwise a "Copy" button appears, since a click
 # lets any page copy.
+# No "Leave site?" prompt when the terminal window is closed (ttyd asks while connected): this runs before
+# ttyd's own script, and drops the beforeunload handlers it adds.
+TERM_NO_LEAVE_JS = r"""
+(function(){var add=window.addEventListener;
+ window.addEventListener=function(t){if(t==='beforeunload')return;return add.apply(this,arguments)};
+ try{Object.defineProperty(window,'onbeforeunload',{configurable:true,get:function(){return null},set:function(){}})}catch(e){}
+})();
+"""
+
+
 TERM_COPY_JS = r"""
 (function(){
  var bound=null,box=null,pending='';
